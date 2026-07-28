@@ -12,7 +12,7 @@ use emelex::{
 };
 
 use super::{
-	hub_cmd::{download, trait_summary, wait_for_hub},
+	hub_cmd::{download_revision, trait_summary, wait_for_hub},
 	output,
 	style::{Palette, bytes},
 };
@@ -310,22 +310,31 @@ async fn onboard(
 				}
 				OnboardingSelection::Candidate(selected) => {
 					let id = candidates[selected].id.clone();
+					let revision = candidates[selected].revision.clone();
 					let reference = ModelRef::Hub(id.clone());
-					let installed =
-						match download(emelex, &id, false, stdout_palette, stderr_palette).await {
-							Ok(installed) => installed,
-							Err(error) if candidate_certification_failed(&error) => {
-								certification_failed = true;
-								report_candidate_certification_failure(
-									&reference,
-									&error,
-									stderr_palette,
-								)?;
-								candidates.remove(selected);
-								continue;
-							}
-							Err(error) => return Err(error),
-						};
+					let installed = match download_revision(
+						emelex,
+						&id,
+						&revision,
+						false,
+						stdout_palette,
+						stderr_palette,
+					)
+					.await
+					{
+						Ok(installed) => installed,
+						Err(error) if candidate_certification_failed(&error) => {
+							certification_failed = true;
+							report_candidate_certification_failure(
+								&reference,
+								&error,
+								stderr_palette,
+							)?;
+							candidates.remove(selected);
+							continue;
+						}
+						Err(error) => return Err(error),
+					};
 					match validate_traits(&installed, required) {
 						Ok(()) => break 'pages (installed, reference),
 						Err(error) => {

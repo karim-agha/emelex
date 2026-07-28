@@ -60,13 +60,19 @@ Markdown and resets terminal styling before returning the cancellation error.
 
 `hub capabilities` is the source of truth for explicit remote filters. Every
 CLI search also applies Hugging Face's MLX catalog scope and local Metal/storage
-fit. Human results use compact multi-line model cards; skipped-candidate
-diagnostics collapse to a count unless `--verbose` is present, while `--json`
-retains the complete structured page. Downloads report files, bounded
-percentage progress, retries, and verification; Ctrl-C cooperatively cancels
-transfer, hashing, or retry waits before returning. An independently scheduled
-signal watcher sets the same cancellation flag during synchronous local
-inspection/load phases, and a final checkpoint precedes publication.
+fit. Human results use compact multi-line model cards showing exact-revision
+download state and validated quantization. Because every result is already
+MLX-scoped, cards omit a redundant runtime row and show MTP separately when
+advertised. On a human terminal, arrow keys navigate a compact selector for the
+current result page and Enter downloads the selected revision; Escape or `q`
+leaves the results without downloading. Redirected and `--json` searches never
+prompt. Skipped-candidate diagnostics collapse to a count unless `--verbose`
+is present, while `--json` retains the complete structured page. Downloads
+report files, bounded percentage progress, retries, and verification; Ctrl-C
+cooperatively cancels transfer, hashing, or retry waits before returning. An
+independently scheduled signal watcher sets the same cancellation flag during
+synchronous local inspection/load phases, and a final checkpoint precedes
+publication.
 
 `hub auth login` reads the token from a hidden prompt. `--token-stdin` switches
 to one bounded UTF-8 line on stdin; `--json` login requires this non-interactive

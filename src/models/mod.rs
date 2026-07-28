@@ -29,7 +29,7 @@ use crate::{
 	model::{
 		CompatibilityReport, HubModelId, InspectionError, InstalledModel, LocalModelName,
 		ManifestError, ModelFile, ModelManifest, ModelRef, ModelSnapshotId, ModelSource,
-		VerificationStatus, WorkloadProfile, inspect_directory,
+		ResolvedRevision, VerificationStatus, WorkloadProfile, inspect_directory,
 	},
 };
 
@@ -446,6 +446,26 @@ impl ModelManager {
 		Ok(self.inventory()?.models)
 	}
 
+	/// List healthy installed Hub snapshot identities without inspecting local imports.
+	///
+	/// The scan is cancellation-safe when its future is dropped and never hashes
+	/// caller-owned linked models. Corrupt Hub candidates are omitted.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the managed Hub store root cannot be traversed or
+	/// the blocking inventory task fails.
+	pub async fn installed_hub_snapshots(&self) -> Result<Vec<ModelSnapshotId>, ModelsError> {
+		let mut operation = DownloadOperationGuard::new(None);
+		let manager = self.clone();
+		let cancellation = operation.cancellation().clone();
+		let result = tokio::task::spawn_blocking(move || manager.scan_hub_snapshots(&cancellation))
+			.await
+			.map_err(blocking_model_task_error)?;
+		operation.finish();
+		result
+	}
+
 	/// List healthy snapshots while retaining diagnostics for corrupt entries.
 	///
 	/// # Errors
@@ -517,6 +537,47 @@ impl ModelManager {
 		})
 	}
 
+	fn scan_hub_snapshots(
+		&self,
+		cancellation: &DownloadCancellation,
+	) -> Result<Vec<ModelSnapshotId>, ModelsError> {
+		check_download_cancellation(Some(cancellation))?;
+		let root = self.home.models_dir().join("hub");
+		let metadata = match fs::symlink_metadata(&root) {
+			Ok(metadata) => metadata,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+			Err(source) => {
+				return Err(ModelsError::Io { path: root, source });
+			}
+		};
+		if !metadata.is_dir() || metadata.file_type().is_symlink() {
+			return Err(ModelsError::UnsafeInstall(root));
+		}
+		fs::read_dir(&root).map_err(|source| ModelsError::Io {
+			path: root.clone(),
+			source,
+		})?;
+		let mut snapshots = BTreeSet::new();
+		for entry in WalkDir::new(&root).follow_links(false).max_depth(5) {
+			check_download_cancellation(Some(cancellation))?;
+			let Ok(entry) = entry else {
+				continue;
+			};
+			if entry.file_type().is_file() && entry.file_name() == MANIFEST_NAME {
+				let Some(directory) = entry.path().parent() else {
+					continue;
+				};
+				if let Ok(installed) = self.load_installed_at(directory)
+					&& matches!(installed.snapshot_id(), ModelSnapshotId::Hub { .. })
+				{
+					snapshots.insert(installed.snapshot_id().clone());
+				}
+			}
+		}
+		check_download_cancellation(Some(cancellation))?;
+		Ok(snapshots.into_iter().collect())
+	}
+
 	/// Resolve the newest installed snapshot for a stable reference.
 	///
 	/// # Errors
@@ -561,7 +622,7 @@ impl ModelManager {
 	) -> Result<InstalledModel, ModelsError> {
 		let mut operation = DownloadOperationGuard::new(None);
 		let result = self
-			.download_inner(id, reporter, None, Some(operation.cancellation()))
+			.download_inner(id, None, reporter, None, Some(operation.cancellation()))
 			.await;
 		operation.finish();
 		result
@@ -583,10 +644,74 @@ impl ModelManager {
 	) -> Result<InstalledModel, ModelsError> {
 		let mut operation = DownloadOperationGuard::new(cancellation);
 		let result = self
-			.download_inner(id, None, observer, Some(operation.cancellation()))
+			.download_inner(id, None, None, observer, Some(operation.cancellation()))
 			.await;
 		operation.finish();
 		result
+	}
+
+	/// Download the exact Hub revision selected by an earlier discovery result.
+	///
+	/// A healthy local copy of `revision` is revalidated and reused before Hub
+	/// access. Otherwise the current Hub plan must still resolve to `revision`;
+	/// a change fails as candidate-local certification instead of silently
+	/// downloading a model different from the one shown to the caller.
+	///
+	/// # Errors
+	///
+	/// Returns [`ModelsError::Certification`] when the Hub revision changed or
+	/// another candidate-local certification step fails. Transport, observer,
+	/// cancellation, storage, policy, task, panic, and global runtime failures
+	/// retain their specific variants.
+	pub async fn download_revision_controlled(
+		&self,
+		id: &HubModelId,
+		revision: &ResolvedRevision,
+		observer: Option<&DownloadObserver>,
+		cancellation: Option<&DownloadCancellation>,
+	) -> Result<InstalledModel, ModelsError> {
+		let mut operation = DownloadOperationGuard::new(cancellation);
+		let result = self
+			.download_inner(
+				id,
+				Some(revision),
+				None,
+				observer,
+				Some(operation.cancellation()),
+			)
+			.await;
+		operation.finish();
+		result
+	}
+
+	async fn reuse_hub_revision_controlled(
+		&self,
+		id: &HubModelId,
+		revision: &ResolvedRevision,
+		cancellation: Option<&DownloadCancellation>,
+	) -> Result<Option<InstalledModel>, ModelsError> {
+		let destination = self.hub_destination(id, revision.as_str());
+		let reference = ModelRef::Hub(id.clone());
+		let expected_snapshot = ModelSnapshotId::Hub {
+			id: id.clone(),
+			revision: revision.clone(),
+		};
+		let mutation_lock = self.snapshot_mutation_lock_controlled(cancellation).await?;
+		let manager = self.clone();
+		let revision = revision.clone();
+		tokio::task::spawn_blocking(move || {
+			let _mutation_lock = mutation_lock;
+			manager.reuse_existing_locked(
+				&destination,
+				&reference,
+				Some(&revision),
+				&expected_snapshot,
+				ModelSourceKind::Hub,
+				None,
+			)
+		})
+		.await
+		.map_err(blocking_model_task_error)?
 	}
 
 	#[allow(
@@ -596,17 +721,29 @@ impl ModelManager {
 	async fn download_inner(
 		&self,
 		id: &HubModelId,
+		expected_revision: Option<&ResolvedRevision>,
 		reporter: Option<&DownloadReporter>,
 		observer: Option<&DownloadObserver>,
 		cancellation: Option<&DownloadCancellation>,
 	) -> Result<InstalledModel, ModelsError> {
 		check_download_cancellation(cancellation)?;
+		if let Some(expected_revision) = expected_revision
+			&& let Some(existing) = self
+				.reuse_hub_revision_controlled(id, expected_revision, cancellation)
+				.await?
+		{
+			check_download_cancellation(cancellation)?;
+			return Ok(existing);
+		}
 		let plan = self
 			.hub
 			.plan(id)
 			.await
 			.map_err(mark_hub_candidate_certification_error)?;
 		check_download_cancellation(cancellation)?;
+		if let Some(expected_revision) = expected_revision {
+			ensure_download_revision(id, expected_revision, &plan.model().revision)?;
+		}
 		let fit = plan.model().fit.as_ref().ok_or_else(|| {
 			mark_candidate_certification_error(ModelsError::Incompatible(vec![
 				"Hub plan lacks an exact residency estimate for this invocation".to_string(),
@@ -621,6 +758,13 @@ impl ModelManager {
 				)]),
 			));
 		}
+		if let Some(existing) = self
+			.reuse_hub_revision_controlled(id, &plan.model().revision, cancellation)
+			.await?
+		{
+			check_download_cancellation(cancellation)?;
+			return Ok(existing);
+		}
 		let temp_dir = self.home.temp_dir();
 		let total_bytes = plan.total_bytes();
 		tokio::task::spawn_blocking(move || preflight_disk(&temp_dir, total_bytes))
@@ -629,33 +773,6 @@ impl ModelManager {
 		check_download_cancellation(cancellation)?;
 		let reference = ModelRef::Hub(id.clone());
 		let destination = self.hub_destination(id, plan.model().revision.as_str());
-		let expected_snapshot = ModelSnapshotId::Hub {
-			id: id.clone(),
-			revision: plan.model().revision.clone(),
-		};
-		let mutation_lock = self.snapshot_mutation_lock_controlled(cancellation).await?;
-		let manager = self.clone();
-		let existing_destination = destination.clone();
-		let existing_reference = reference.clone();
-		let existing_revision = plan.model().revision.clone();
-		let existing_snapshot = expected_snapshot.clone();
-		let existing = tokio::task::spawn_blocking(move || {
-			let _mutation_lock = mutation_lock;
-			manager.reuse_existing_locked(
-				&existing_destination,
-				&existing_reference,
-				Some(&existing_revision),
-				&existing_snapshot,
-				ModelSourceKind::Hub,
-				None,
-			)
-		})
-		.await
-		.map_err(blocking_model_task_error)??;
-		if let Some(existing) = existing {
-			check_download_cancellation(cancellation)?;
-			return Ok(existing);
-		}
 		let manager = self.clone();
 		let staging = tokio::task::spawn_blocking(move || manager.create_staging("hub"))
 			.await
@@ -3369,6 +3486,19 @@ pub enum ModelsError {
 	/// their original variants and must not be downgraded to this error.
 	#[error("model candidate certification failed: {0}")]
 	Certification(#[source] Box<Self>),
+	/// A selected Hub result no longer resolves to the displayed revision.
+	#[error(
+		"Hub model {model} changed revision during selection: expected {expected}, found {actual}; \
+		 search again"
+	)]
+	HubRevisionChanged {
+		/// Stable Hub model ID.
+		model: HubModelId,
+		/// Revision displayed to the caller.
+		expected: ResolvedRevision,
+		/// Revision resolved immediately before download.
+		actual: ResolvedRevision,
+	},
 	/// Model is not installed.
 	#[error("model is not installed: {0}")]
 	NotInstalled(ModelRef),
@@ -3471,7 +3601,8 @@ fn mark_candidate_certification_error(error: ModelsError) -> ModelsError {
 			| InspectionError::Layout { .. },
 		)
 		| ModelsError::Incompatible(_)
-		| ModelsError::Manifest(_) => true,
+		| ModelsError::Manifest(_)
+		| ModelsError::HubRevisionChanged { .. } => true,
 		ModelsError::Client(error) => matches!(
 			error,
 			Error::ModelLoad { .. }
@@ -3486,6 +3617,23 @@ fn mark_candidate_certification_error(error: ModelsError) -> ModelsError {
 	} else {
 		error
 	}
+}
+
+fn ensure_download_revision(
+	model: &HubModelId,
+	expected: &ResolvedRevision,
+	actual: &ResolvedRevision,
+) -> Result<(), ModelsError> {
+	if expected == actual {
+		return Ok(());
+	}
+	Err(mark_candidate_certification_error(
+		ModelsError::HubRevisionChanged {
+			model: model.clone(),
+			expected: expected.clone(),
+			actual: actual.clone(),
+		},
+	))
 }
 
 fn mark_hub_candidate_certification_error(error: HubError) -> ModelsError {

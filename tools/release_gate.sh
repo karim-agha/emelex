@@ -120,10 +120,10 @@ for override_name in "${native_build_overrides[@]}"; do
 done
 release_deployment_target="26.5"
 
-allow_dirty=()
+allow_dirty_argument=""
 if (($# > 0)); then
 	if [[ $# == 1 && $1 == "--allow-dirty" ]]; then
-		allow_dirty=(--allow-dirty)
+		allow_dirty_argument="--allow-dirty"
 	else
 		echo "usage: tools/release_gate.sh [--allow-dirty]" >&2
 		exit 2
@@ -238,7 +238,7 @@ release_cargo() {
 
 cd "$release_driver"
 release_cargo clean --manifest-path "$repository/Cargo.toml" --target-dir "$repository/target"
-release_cargo package --manifest-path "$repository/Cargo.toml" --locked --offline --target "$target_triple" --target-dir "$repository/target" "${allow_dirty[@]}"
+release_cargo package --manifest-path "$repository/Cargo.toml" --locked --offline --target "$target_triple" --target-dir "$repository/target" ${allow_dirty_argument:+"$allow_dirty_argument"}
 release_cargo build --manifest-path "$repository/Cargo.toml" --release --locked --offline --target "$target_triple" --target-dir "$repository/target"
 cd "$repository"
 PYTHONDONTWRITEBYTECODE=1 python3 tools/release_audit.py --repository "$repository"

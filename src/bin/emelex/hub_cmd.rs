@@ -1,7 +1,7 @@
 //! Hugging Face discovery and download presentation.
 
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	future::Future,
 	io::{self, IsTerminal as _},
 	sync::{Arc, Mutex},
@@ -13,9 +13,12 @@ use emelex::{
 	Emelex,
 	hub::{
 		DownloadCancellation, DownloadControl, DownloadEvent, DownloadObserver, HubDiagnostic,
-		HubModel, HubSearch, REMOTE_FILTERS,
+		HubModel, HubQuantization, HubQuantizationMode, HubSearch, REMOTE_FILTERS,
 	},
-	model::{HubModelId, InstalledModel, Modality, ModelTraits, MtpSupport, Task},
+	model::{
+		HubModelId, InstalledModel, Modality, ModelSnapshotId, ModelTraits, MtpSupport,
+		ResolvedRevision, Task,
+	},
 };
 
 use super::{
@@ -117,6 +120,18 @@ async fn search(
 	if json {
 		return output::json_line(&page);
 	}
+	let installed_hub = if page.items.is_empty() {
+		InstalledHubIndex::new()
+	} else {
+		let snapshots = wait_for_hub("checking downloaded models", false, async {
+			models
+				.installed_hub_snapshots()
+				.await
+				.context("list installed Hub snapshots")
+		})
+		.await?;
+		installed_hub_index(&snapshots)
+	};
 	if page.items.is_empty() {
 		output::stdout_line(empty_search_message(page.next_cursor.is_some()))?;
 	} else {
@@ -124,7 +139,8 @@ async fn search(
 			if index > 0 {
 				output::stdout_line("")?;
 			}
-			output::stdout_line(&render_search_model(model, stdout_palette))?;
+			let status = search_install_status(&model.id, &model.revision, &installed_hub);
+			output::stdout_line(&render_search_model(model, status, stdout_palette))?;
 		}
 	}
 	if verbose && !page.diagnostics.is_empty() {
@@ -142,42 +158,229 @@ async fn search(
 	if let Some(cursor) = &page.next_cursor {
 		output::stderr_line(&stderr_palette.dim(&next_cursor_line(cursor)))?;
 	}
+	if search_selection_enabled(
+		json,
+		[
+			io::stdin().is_terminal(),
+			io::stdout().is_terminal(),
+			io::stderr().is_terminal(),
+		],
+	) && !page.items.is_empty()
+	{
+		select_search_result(
+			emelex,
+			&page.items,
+			&installed_hub,
+			stdout_palette,
+			stderr_palette,
+		)
+		.await?;
+	}
 	Ok(())
 }
 
-fn render_search_model(model: &HubModel, palette: Palette) -> String {
+async fn select_search_result(
+	emelex: &Emelex,
+	items: &[HubModel],
+	installed: &InstalledHubIndex,
+	stdout_palette: Palette,
+	stderr_palette: Palette,
+) -> anyhow::Result<()> {
+	let (_, terminal_columns) = dialoguer::console::Term::stderr().size();
+	let label_width = usize::from(terminal_columns).saturating_sub(4).max(1);
+	let labels = items
+		.iter()
+		.map(|model| {
+			search_selection_label(
+				&model.id,
+				model.quantization,
+				search_install_status(&model.id, &model.revision, installed),
+				label_width,
+			)
+		})
+		.collect::<Vec<_>>();
+	let selected = dialoguer::Select::new()
+		.with_prompt("Choose a model to download")
+		.items(&labels)
+		.default(0)
+		.report(false)
+		.interact_opt()
+		.context("choose Hub model")?;
+	if let Some(selected) = selected {
+		let model = items
+			.get(selected)
+			.context("Hub selection returned an invalid result index")?;
+		download_revision(
+			emelex,
+			&model.id,
+			&model.revision,
+			false,
+			stdout_palette,
+			stderr_palette,
+		)
+		.await?;
+	}
+	Ok(())
+}
+
+type InstalledHubIndex = BTreeMap<HubModelId, BTreeSet<ResolvedRevision>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchInstallStatus {
+	Downloaded,
+	DifferentRevision,
+	NotDownloaded,
+}
+
+impl SearchInstallStatus {
+	const fn label(self) -> &'static str {
+		match self {
+			Self::Downloaded => "downloaded",
+			Self::DifferentRevision => "different revision downloaded",
+			Self::NotDownloaded => "not downloaded",
+		}
+	}
+
+	const fn selector_label(self) -> &'static str {
+		match self {
+			Self::Downloaded => "downloaded",
+			Self::DifferentRevision => "other revision",
+			Self::NotDownloaded => "not downloaded",
+		}
+	}
+
+	const fn selector_code(self) -> &'static str {
+		match self {
+			Self::Downloaded => "D",
+			Self::DifferentRevision => "R",
+			Self::NotDownloaded => "N",
+		}
+	}
+}
+
+fn installed_hub_index(installed: &[ModelSnapshotId]) -> InstalledHubIndex {
+	let mut index = InstalledHubIndex::new();
+	for installed in installed {
+		let ModelSnapshotId::Hub { id, revision } = installed else {
+			continue;
+		};
+		index
+			.entry(id.clone())
+			.or_default()
+			.insert(revision.clone());
+	}
+	index
+}
+
+fn search_install_status(
+	id: &HubModelId,
+	revision: &ResolvedRevision,
+	installed: &InstalledHubIndex,
+) -> SearchInstallStatus {
+	match installed.get(id) {
+		Some(revisions) if revisions.contains(revision) => SearchInstallStatus::Downloaded,
+		Some(_) => SearchInstallStatus::DifferentRevision,
+		None => SearchInstallStatus::NotDownloaded,
+	}
+}
+
+const fn search_selection_enabled(
+	json: bool,
+	[stdin_is_terminal, stdout_is_terminal, stderr_is_terminal]: [bool; 3],
+) -> bool {
+	!json && stdin_is_terminal && stdout_is_terminal && stderr_is_terminal
+}
+
+fn search_selection_label(
+	id: &HubModelId,
+	quantization: HubQuantization,
+	status: SearchInstallStatus,
+	max_width: usize,
+) -> String {
+	const MIN_ID_WIDTH: usize = 12;
+	let full_prefix = format!(
+		"[{:<14}] [{:<14}] ",
+		status.selector_label(),
+		compact_quantization(quantization),
+	);
+	let status_prefix = format!("[{}] ", status.selector_label());
+	let code_prefix = format!("[{}] ", status.selector_code());
+	let prefix = [
+		full_prefix.as_str(),
+		status_prefix.as_str(),
+		code_prefix.as_str(),
+	]
+	.into_iter()
+	.find(|prefix| dialoguer::console::measure_text_width(prefix) + MIN_ID_WIDTH <= max_width)
+	.unwrap_or("");
+	let id_width = max_width.saturating_sub(dialoguer::console::measure_text_width(prefix));
+	let id = truncate_middle_ascii(id.as_str(), id_width);
+	format!("{prefix}{id}")
+}
+
+fn truncate_middle_ascii(value: &str, width: usize) -> String {
+	if value.len() <= width {
+		return value.to_string();
+	}
+	if width == 0 {
+		return String::new();
+	}
+	if width == 1 {
+		return "…".to_string();
+	}
+	let retained = width - 1;
+	let head = retained.div_ceil(2);
+	let tail = retained / 2;
+	format!("{}…{}", &value[..head], &value[value.len() - tail..])
+}
+
+fn render_search_model(model: &HubModel, status: SearchInstallStatus, palette: Palette) -> String {
 	let sizing = model.traits.sizing.as_ref();
 	render_search_card(
-		model.id.as_str(),
-		sizing.and_then(|sizing| sizing.weights_bytes),
-		model.fit.as_ref().map(|fit| {
-			(
-				fit.required_bytes,
-				fit.budget_bytes,
-				fit.workload.batch_size(),
-				fit.workload.context_tokens(),
-			)
-		}),
-		sizing.and_then(|sizing| sizing.max_context_tokens),
-		&model.traits,
+		&SearchCardData {
+			id: model.id.as_str(),
+			status,
+			quantization: model.quantization,
+			weights_bytes: sizing.and_then(|sizing| sizing.weights_bytes),
+			memory: model.fit.as_ref().map(|fit| {
+				(
+					fit.required_bytes,
+					fit.budget_bytes,
+					fit.workload.batch_size(),
+					fit.workload.context_tokens(),
+				)
+			}),
+			max_context_tokens: sizing.and_then(|sizing| sizing.max_context_tokens),
+			traits: &model.traits,
+		},
 		palette,
 	)
 }
 
-fn render_search_card(
-	id: &str,
+struct SearchCardData<'a> {
+	id: &'a str,
+	status: SearchInstallStatus,
+	quantization: HubQuantization,
 	weights_bytes: Option<u64>,
 	memory: Option<(u64, u64, usize, usize)>,
 	max_context_tokens: Option<usize>,
-	traits: &ModelTraits,
-	palette: Palette,
-) -> String {
-	let id = output::terminal_safe_inline(id);
+	traits: &'a ModelTraits,
+}
+
+fn render_search_card(card: &SearchCardData<'_>, palette: Palette) -> String {
+	let id = output::terminal_safe_inline(card.id);
+	let status = match card.status {
+		SearchInstallStatus::Downloaded => palette.green(card.status.label()),
+		SearchInstallStatus::DifferentRevision => palette.yellow(card.status.label()),
+		SearchInstallStatus::NotDownloaded => palette.dim(card.status.label()),
+	};
 	let mut lines = vec![
 		palette.cyan(&id),
-		search_field("Weights", &optional_bytes(weights_bytes)),
+		search_field("Status", &status),
+		search_field("Quant", &quantization_summary(card.quantization)),
+		search_field("Weights", &optional_bytes(card.weights_bytes)),
 	];
-	if let Some((required, budget, batch_size, context_tokens)) = memory {
+	if let Some((required, budget, batch_size, context_tokens)) = card.memory {
 		lines.push(search_field(
 			"Memory",
 			&format!("{} required", bytes(required)),
@@ -193,9 +396,9 @@ fn render_search_card(
 	}
 	lines.push(search_field(
 		"Context",
-		&format!("{} max", optional_tokens(max_context_tokens)),
+		&format!("{} max", optional_tokens(card.max_context_tokens)),
 	));
-	lines.extend(search_capability_lines(traits));
+	lines.extend(search_capability_lines(card.traits));
 	lines.join("\n")
 }
 
@@ -203,20 +406,54 @@ fn search_field(label: &str, value: &str) -> String {
 	format!("  {label:<7} {value}")
 }
 
-fn search_capability_lines(traits: &ModelTraits) -> Vec<String> {
-	let mut runtime = Vec::new();
-	if traits.mlx {
-		runtime.push("MLX");
-	}
-	let mtp = match traits.mtp {
-		MtpSupport::Absent => None,
-		MtpSupport::Advertised => Some("MTP advertised"),
-		MtpSupport::RuntimeVerified => Some("MTP verified"),
-		_ => Some("MTP"),
+fn quantization_summary(quantization: HubQuantization) -> String {
+	let (mut summary, has_layer_overrides) = match quantization {
+		HubQuantization::NotConfigured => return "not configured".to_string(),
+		HubQuantization::Configured(config) => {
+			let summary = match config.mode() {
+				HubQuantizationMode::Affine => {
+					format!(
+						"{}-bit affine · group {}",
+						config.bits(),
+						config.group_size()
+					)
+				}
+				HubQuantizationMode::Mxfp4 => {
+					format!("MXFP4 · group {}", config.group_size())
+				}
+				HubQuantizationMode::Mxfp8 => {
+					format!("MXFP8 · group {}", config.group_size())
+				}
+				HubQuantizationMode::Nvfp4 => {
+					format!("NVFP4 · group {}", config.group_size())
+				}
+				_ => "unknown".to_string(),
+			};
+			(summary, config.has_layer_overrides())
+		}
+		_ => return "unknown".to_string(),
 	};
-	if let Some(mtp) = mtp {
-		runtime.push(mtp);
+	if has_layer_overrides {
+		summary.push_str(" · layer overrides");
 	}
+	summary
+}
+
+fn compact_quantization(quantization: HubQuantization) -> String {
+	match quantization {
+		HubQuantization::NotConfigured => "not configured".to_string(),
+		HubQuantization::Configured(config) => match config.mode() {
+			HubQuantizationMode::Affine => format!("{}-bit", config.bits()),
+			HubQuantizationMode::Mxfp4 => "MXFP4".to_string(),
+			HubQuantizationMode::Mxfp8 => "MXFP8".to_string(),
+			HubQuantizationMode::Nvfp4 => "NVFP4".to_string(),
+			_ => "unknown".to_string(),
+		},
+		_ => "unknown".to_string(),
+	}
+}
+
+fn search_capability_lines(traits: &ModelTraits) -> Vec<String> {
 	let mut tasks = Vec::new();
 	for task in &traits.tasks {
 		let label = match task {
@@ -246,11 +483,13 @@ fn search_capability_lines(traits: &ModelTraits) -> Vec<String> {
 		}
 	}
 	let mut lines = Vec::new();
-	for (label, values) in [
-		("Runtime", runtime.as_slice()),
-		("Tasks", tasks.as_slice()),
-		("Inputs", inputs.as_slice()),
-	] {
+	match traits.mtp {
+		MtpSupport::Absent => {}
+		MtpSupport::Advertised => lines.push(search_field("MTP", "advertised")),
+		MtpSupport::RuntimeVerified => lines.push(search_field("MTP", "verified")),
+		_ => lines.push(search_field("MTP", "unknown")),
+	}
+	for (label, values) in [("Tasks", tasks.as_slice()), ("Inputs", inputs.as_slice())] {
 		if !values.is_empty() {
 			lines.extend(wrap_search_values(label, values));
 		}
@@ -508,13 +747,52 @@ pub(crate) async fn download(
 	stdout_palette: Palette,
 	stderr_palette: Palette,
 ) -> anyhow::Result<InstalledModel> {
+	download_selected(emelex, model, None, json, stdout_palette, stderr_palette).await
+}
+
+pub(crate) async fn download_revision(
+	emelex: &Emelex,
+	model: &HubModelId,
+	revision: &ResolvedRevision,
+	json: bool,
+	stdout_palette: Palette,
+	stderr_palette: Palette,
+) -> anyhow::Result<InstalledModel> {
+	download_selected(
+		emelex,
+		model,
+		Some(revision),
+		json,
+		stdout_palette,
+		stderr_palette,
+	)
+	.await
+}
+
+async fn download_selected(
+	emelex: &Emelex,
+	model: &HubModelId,
+	revision: Option<&ResolvedRevision>,
+	json: bool,
+	stdout_palette: Palette,
+	stderr_palette: Palette,
+) -> anyhow::Result<InstalledModel> {
 	let (observer, output_error) = download_observer(json, stderr_palette);
 	let cancellation = DownloadCancellation::default();
 	let models = emelex.models().context("initialize model manager")?;
 	let watcher = DownloadCancellationWatcher::spawn(cancellation.clone(), tokio::signal::ctrl_c());
-	let result = models
-		.download_controlled(model, Some(&observer), Some(&cancellation))
-		.await;
+	let result = match revision {
+		Some(revision) => {
+			models
+				.download_revision_controlled(model, revision, Some(&observer), Some(&cancellation))
+				.await
+		}
+		None => {
+			models
+				.download_controlled(model, Some(&observer), Some(&cancellation))
+				.await
+		}
+	};
 	watcher.finish().await?;
 	let observer_error = output_error
 		.lock()
@@ -774,6 +1052,22 @@ fn optional_tokens(value: Option<usize>) -> String {
 mod tests {
 	use super::*;
 
+	fn configured_quantization(
+		mode: &str,
+		bits: u8,
+		group_size: u16,
+		has_layer_overrides: bool,
+	) -> HubQuantization {
+		serde_json::from_value(serde_json::json!({
+			"kind": "configured",
+			"mode": mode,
+			"bits": bits,
+			"group_size": group_size,
+			"has_layer_overrides": has_layer_overrides
+		}))
+		.expect("valid Hub quantization")
+	}
+
 	#[test]
 	fn search_card_is_compact_human_readable_and_complete() {
 		let mut traits = ModelTraits::default();
@@ -785,20 +1079,26 @@ mod tests {
 		traits.mtp = MtpSupport::Advertised;
 
 		let rendered = render_search_card(
-			"mlx-community/Qwen3.5-4B-4bit",
-			Some(4_u64 << 30),
-			Some((6_u64 << 30, 16_u64 << 30, 1, 16_384)),
-			Some(32_768),
-			&traits,
+			&SearchCardData {
+				id: "mlx-community/Qwen3.5-4B-4bit",
+				status: SearchInstallStatus::NotDownloaded,
+				quantization: configured_quantization("affine", 4, 64, false),
+				weights_bytes: Some(4_u64 << 30),
+				memory: Some((6_u64 << 30, 16_u64 << 30, 1, 16_384)),
+				max_context_tokens: Some(32_768),
+				traits: &traits,
+			},
 			Palette::stdout(crate::style::ColorMode::Never),
 		);
 
 		assert_eq!(
 			rendered,
-			"mlx-community/Qwen3.5-4B-4bit\n  Weights 4.0 GiB\n  Memory  6.0 GiB required\n          \
-			 at batch 1 · 16.4k tokens\n  Budget  16 GiB Metal\n  Context 32.8k max\n  Runtime MLX \
-			 · MTP advertised\n  Tasks   text generation · chat · tools\n  Inputs  image"
+			"mlx-community/Qwen3.5-4B-4bit\n  Status  not downloaded\n  Quant   4-bit affine · \
+			 group 64\n  Weights 4.0 GiB\n  Memory  6.0 GiB required\n          at batch 1 · 16.4k \
+			 tokens\n  Budget  16 GiB Metal\n  Context 32.8k max\n  MTP     advertised\n  Tasks   text \
+			 generation · chat · tools\n  Inputs  image"
 		);
+		assert!(!rendered.contains("Runtime"));
 		assert!(
 			rendered
 				.lines()
@@ -809,21 +1109,114 @@ mod tests {
 	#[test]
 	fn search_card_handles_unknowns_and_neutralizes_untrusted_id() {
 		let rendered = render_search_card(
-			"owner/model\nforged\trow\u{202e}",
-			None,
-			None,
-			None,
-			&ModelTraits::default(),
+			&SearchCardData {
+				id: "owner/model\nforged\trow\u{202e}",
+				status: SearchInstallStatus::Downloaded,
+				quantization: HubQuantization::Unknown,
+				weights_bytes: None,
+				memory: None,
+				max_context_tokens: None,
+				traits: &ModelTraits::default(),
+			},
 			Palette::stdout(crate::style::ColorMode::Never),
 		);
 
 		assert_eq!(
 			rendered,
-			"owner/model\u{240a}forged\u{2409}row\u{fffd}\n  Weights unknown\n  Memory  \
-			 requirement unknown\n  Budget  unknown\n  Context unknown max\n  Details capabilities \
-			 unknown"
+			"owner/model\u{240a}forged\u{2409}row\u{fffd}\n  Status  downloaded\n  Quant   \
+			 unknown\n  Weights unknown\n  Memory  requirement unknown\n  Budget  unknown\n  Context unknown \
+			 max\n  Details capabilities unknown"
 		);
-		assert_eq!(rendered.lines().count(), 6);
+		assert_eq!(rendered.lines().count(), 8);
+	}
+
+	#[test]
+	fn quantization_summary_preserves_named_mode_and_layer_overrides() {
+		let quantization = configured_quantization("mxfp4", 4, 32, true);
+
+		assert_eq!(
+			quantization_summary(quantization),
+			"MXFP4 · group 32 · layer overrides"
+		);
+		assert_eq!(compact_quantization(quantization), "MXFP4");
+	}
+
+	#[test]
+	fn installed_status_distinguishes_current_different_and_missing_snapshots() {
+		let id = HubModelId::parse("owner/model").expect("valid Hub ID");
+		let current = ResolvedRevision::parse("a".repeat(40)).expect("valid revision");
+		let different = ResolvedRevision::parse("b".repeat(40)).expect("valid revision");
+		let mut installed = InstalledHubIndex::new();
+
+		assert_eq!(
+			search_install_status(&id, &current, &installed),
+			SearchInstallStatus::NotDownloaded
+		);
+		installed.entry(id.clone()).or_default().insert(different);
+		assert_eq!(
+			search_install_status(&id, &current, &installed),
+			SearchInstallStatus::DifferentRevision
+		);
+		installed
+			.entry(id.clone())
+			.or_default()
+			.insert(current.clone());
+		assert_eq!(
+			search_install_status(&id, &current, &installed),
+			SearchInstallStatus::Downloaded
+		);
+	}
+
+	#[test]
+	fn search_selection_label_stays_on_one_narrow_terminal_row() {
+		let id = HubModelId::parse("a".repeat(96)).expect("maximum-length Hub ID");
+
+		let label = search_selection_label(
+			&id,
+			HubQuantization::NotConfigured,
+			SearchInstallStatus::DifferentRevision,
+			40,
+		);
+
+		assert!(dialoguer::console::measure_text_width(&label) <= 40);
+		assert!(label.starts_with("[other revision"));
+		assert!(label.contains('…'));
+	}
+
+	#[test]
+	fn narrow_selection_labels_preserve_distinguishing_id_suffixes() {
+		let first = HubModelId::parse(format!("org/{}first", "a".repeat(80)))
+			.expect("maximum-length first Hub ID");
+		let second = HubModelId::parse(format!("org/{}second", "a".repeat(80)))
+			.expect("maximum-length second Hub ID");
+
+		let first_label = search_selection_label(
+			&first,
+			HubQuantization::NotConfigured,
+			SearchInstallStatus::DifferentRevision,
+			24,
+		);
+		let second_label = search_selection_label(
+			&second,
+			HubQuantization::NotConfigured,
+			SearchInstallStatus::DifferentRevision,
+			24,
+		);
+
+		assert_ne!(first_label, second_label);
+		assert!(first_label.ends_with("first"));
+		assert!(second_label.ends_with("second"));
+		assert!(dialoguer::console::measure_text_width(&first_label) <= 24);
+		assert!(dialoguer::console::measure_text_width(&second_label) <= 24);
+	}
+
+	#[test]
+	fn search_selection_requires_human_terminal_streams() {
+		assert!(search_selection_enabled(false, [true, true, true]));
+		assert!(!search_selection_enabled(true, [true, true, true]));
+		assert!(!search_selection_enabled(false, [false, true, true]));
+		assert!(!search_selection_enabled(false, [true, false, true]));
+		assert!(!search_selection_enabled(false, [true, true, false]));
 	}
 
 	#[test]

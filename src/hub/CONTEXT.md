@@ -46,6 +46,11 @@
 - Search ranking survives concurrent metadata preflight.
 - `HubSearch::mlx_library` maps the website's MLX-library selection to the Hub
   API's `filter=mlx` parameter without modifying optional user search text.
+- Every fully inspected `HubModel` carries exact-revision quantization
+  configuration parsed from `quantization` or `quantization_config`. Absence
+  means not configured, not an inferred floating-point dtype. Configured
+  summaries preserve mode, bits, group size, and whether per-layer overrides
+  exist; they never claim uniform tensor quantization.
 - Profiled CLI searches reject candidates whose exact selected runtime
   transfer plus `max(64 MiB, 5%)` exceeds available Emelex Home filesystem
   space. Search probes availability before accepting ranked page members, so

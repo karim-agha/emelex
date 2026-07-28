@@ -540,6 +540,15 @@ class ReleaseAuditTests(unittest.TestCase):
         self.assertIn('"AWS_LC_SYS_USE_SYSTEM=0"', gate)
         self.assertIn('cd "$release_driver"', gate)
 
+    def test_release_gate_clean_mode_is_bash_three_nounset_safe(self) -> None:
+        gate = Path(__file__).with_name("release_gate.sh").read_text()
+        self.assertIn('allow_dirty_argument=""', gate)
+        self.assertIn(
+            '${allow_dirty_argument:+"$allow_dirty_argument"}',
+            gate,
+        )
+        self.assertNotIn("allow_dirty=()", gate)
+
     def test_release_gate_rejects_representative_native_overrides(self) -> None:
         gate = Path(__file__).with_name("release_gate.sh")
         clean_environment = os.environ.copy()

@@ -32,7 +32,7 @@ fn run() -> Result<(), String> {
 	let target_arch = required_env("CARGO_CFG_TARGET_ARCH")?;
 	if target_os != "macos" || target_arch != "aarch64" {
 		return Err(format!(
-			"unsupported target {target_arch}-{target_os}; Emelex 1.0 supports \
+			"unsupported target {target_arch}-{target_os}; Emelex supports \
 			 only aarch64-apple-darwin"
 		));
 	}

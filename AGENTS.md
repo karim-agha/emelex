@@ -14,12 +14,13 @@ dotfolders.
 
 - Context: `agents/CONTEXT.md`
 - Skills: `agents/skills/`
-- Optional temporary worktrees: `agents/worktrees/`
+- Worktrees: `agents/worktrees/`
 - Module context: `src/<module>/README.md` and `src/<module>/CONTEXT.md`
 
-Use `agents/worktrees/` when a task benefits from checkout isolation. Commits
-from an isolated worktree are normal; never add the `agents/worktrees/`
-directory itself or harness-generated build state to repository contents.
+All repository changes must be made from an isolated worktree under
+`agents/worktrees/`; never edit the primary checkout directly. Commits from an
+isolated worktree are normal; never add the `agents/worktrees/` directory
+itself or harness-generated build state to repository contents.
 
 ## Non-negotiables
 

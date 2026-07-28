@@ -28,10 +28,15 @@ typed conflict; remove that exact snapshot before re-importing.
 Candidate-specific failures from planning and certification are surfaced as
 `ModelsError::Certification`, allowing an interactive catalog explorer to
 offer another candidate. These include a repository becoming private or
-incompatible between search and plan, plan fit rejection, static artifact
-rejection, model load rejection, and bounded probe rejection. Network,
-cancellation, storage, effective-policy configuration, task-join, panic, and
-global runtime failures keep their original typed variants and remain fatal.
+incompatible between search and plan, the selected revision changing before
+download, plan fit rejection, static artifact rejection, model load rejection,
+and bounded probe rejection. Interactive discovery uses
+`download_revision_controlled` so it never silently installs a revision
+different from the result shown. A healthy exact snapshot is revalidated under
+the mutation lock and reused before any Hub plan or disk preflight, so selecting
+an already-downloaded result remains offline-safe. Network, cancellation, storage,
+effective-policy configuration, task-join, panic, and global runtime failures
+keep their original typed variants and remain fatal.
 
 Hub storage encodes repository arity explicitly:
 `models/hub/unnamespaced/<repo>/<revision>` or
@@ -59,6 +64,10 @@ healthy snapshot or fully revalidates the selected external target;
 accepts only that exact `ModelSnapshotId`; a stable reference cannot remove
 whichever revision happens to be newest. Linked-model removal deletes only the
 managed record and never modifies the external target.
+
+`installed_hub_snapshots` is the cancellation-safe status path for interactive
+Hub discovery. It scans only managed Hub installs, omits corrupt candidates,
+and never hashes caller-owned linked imports.
 
 Owned loads validate the exact runtime inventory and either hash every file or
 use a descriptor-bound stamp whose metadata still matches. Linked loads never

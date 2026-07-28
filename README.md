@@ -5,7 +5,7 @@ Silicon. It loads MLX checkpoints directly, explores compatible models across
 the Hugging Face catalog, manages owned snapshots and explicit external-model
 links, and provides a self-contained coding-agent chat harness.
 
-Emelex 1.0 supports Apple Silicon on macOS 26.5 or newer.
+Emelex supports Apple Silicon on macOS 26.5 or newer.
 
 ## Quick start
 
@@ -13,11 +13,15 @@ Emelex 1.0 supports Apple Silicon on macOS 26.5 or newer.
 cargo install --locked --path .
 emelex hub search qwen --require interaction:tools
 emelex hub capabilities
-emelex hub download mlx-community/Qwen3.5-4B-4bit
 emelex model import /path/to/checkpoint --name local-name
 cd your-project
 emelex chat
 ```
+
+On a terminal, Hub search shows downloaded state and quantization for each
+result. Use arrow keys and Enter to download one; Escape or `q` keeps the
+results without downloading. `emelex hub download [NAMESPACE/]REPO` remains
+available for direct, non-interactive installs.
 
 All owned data defaults to `~/.emelex`. Override it with `--home PATH`, the
 library builder, or `EMELEX_HOME`.

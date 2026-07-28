@@ -50,6 +50,10 @@ working-set budget. Unknown architectures, missing `model_type`, unsupported
 or ambiguous layouts, and profiled models that exceed the budget fail closed.
 CLI Hub discovery also applies Hugging Face's MLX catalog filter and removes
 downloads that do not fit currently available Emelex Home filesystem space.
+Human search cards report validated exact-revision quantization and distinguish
+the current downloaded revision, a different installed revision, and no
+installed revision before offering arrow-key selection and exact-revision
+download.
 
 Global `<home>/config.toml` may contain optional `[hub].token`; project
 configuration may not. The token is secret resolution state, not part of the

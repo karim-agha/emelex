@@ -376,7 +376,7 @@ fn ensure_supported_platform() -> Result<(), RuntimeError> {
 #[cfg(not(target_os = "macos"))]
 fn ensure_supported_platform() -> Result<(), RuntimeError> {
 	Err(RuntimeError::UnsupportedPlatform(
-		"Emelex 1.0 requires Apple Silicon macOS".to_string(),
+		"Emelex requires Apple Silicon macOS".to_string(),
 	))
 }
 

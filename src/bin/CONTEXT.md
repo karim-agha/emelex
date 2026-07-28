@@ -67,10 +67,18 @@
   its displayed syntax and accepted remote predicates cannot drift apart.
 - Every CLI Hub search enables `HubSearch::mlx_library` independently of user
   text and uses the model-manager client's local Metal/storage fit. Human
-  results render as labeled vertical cards: the memory row names its evaluated
-  workload separately from the model's maximum context, and capability groups
-  wrap with hanging indentation. Default diagnostics show only a count, verbose
-  diagnostics group by sanitized candidate ID, and JSON stays complete.
+  results render as labeled vertical cards: local status comes from one
+  verified inventory pass and distinguishes the exact revision, a different
+  installed revision, and no installed revision. Quantization comes only from
+  validated exact-revision config. The memory row names its evaluated workload
+  separately from the model's maximum context, capability groups wrap with
+  hanging indentation, and the MLX-only search does not repeat a runtime row.
+  A human stdin/stdout/stderr terminal gets an arrow-key selector for the
+  current page; Enter revalidates and downloads that displayed revision, while
+  Escape or `q` exits successfully.
+  Redirected or JSON searches never read selection input. Default diagnostics
+  show only a count, verbose diagnostics group by sanitized candidate ID, and
+  JSON stays complete.
 - Preferred local import uses singular `model import PATH`, with an optional
   `--name`; other lifecycle commands remain plural `models`. Import defaults to
   an owned immutable copy. Move publishes before selectively retiring only

@@ -571,6 +571,32 @@ fn inventory_reports_missing_model_store_root() {
 	assert!(matches!(error, ModelsError::Io { path, .. } if path == manager.home.models_dir()));
 }
 
+#[tokio::test]
+async fn hub_snapshot_inventory_lists_exact_owned_revisions() {
+	let (_directory, manager) = manager(Config::default());
+	let hub = install_test_snapshot(&manager.home).expect("test Hub snapshot");
+
+	let snapshots = manager
+		.installed_hub_snapshots()
+		.await
+		.expect("Hub snapshot inventory");
+
+	assert_eq!(snapshots, vec![hub.snapshot_id().clone()]);
+}
+
+#[test]
+fn hub_snapshot_inventory_observes_preexisting_cancellation() {
+	let (_directory, manager) = manager(Config::default());
+	let cancellation = DownloadCancellation::default();
+	cancellation.cancel();
+
+	let error = manager
+		.scan_hub_snapshots(&cancellation)
+		.expect_err("cancelled inventory must stop");
+
+	assert!(matches!(error, ModelsError::Hub(HubError::Cancelled)));
+}
+
 #[test]
 fn installed_manifest_tampering_invalidates_verification_stamp() {
 	let (_directory, manager) = manager(Config::default());
@@ -894,4 +920,47 @@ fn certification_boundary_wraps_only_candidate_local_failures() {
 		mark_hub_candidate_certification_error(HubError::Cancelled),
 		ModelsError::Hub(HubError::Cancelled)
 	));
+}
+
+#[test]
+fn exact_revision_download_rejects_catalog_drift_as_candidate_local() {
+	let model = HubModelId::parse("owner/model").expect("valid Hub ID");
+	let expected = ResolvedRevision::parse("a".repeat(40)).expect("valid expected revision");
+	let actual = ResolvedRevision::parse("b".repeat(40)).expect("valid actual revision");
+
+	ensure_download_revision(&model, &expected, &expected).expect("matching revision");
+	let error = ensure_download_revision(&model, &expected, &actual)
+		.expect_err("different revision must fail");
+
+	assert!(matches!(
+		error,
+		ModelsError::Certification(inner)
+			if matches!(
+				*inner,
+				ModelsError::HubRevisionChanged {
+					model: ref changed_model,
+					expected: ref changed_expected,
+					actual: ref changed_actual,
+				} if changed_model == &model
+					&& changed_expected == &expected
+					&& changed_actual == &actual
+			)
+	));
+}
+
+#[tokio::test]
+async fn exact_revision_download_reuses_healthy_snapshot_without_hub_access() {
+	let (_directory, manager) = manager(Config::default());
+	let installed = install_test_snapshot(&manager.home).expect("test snapshot");
+	let ModelSnapshotId::Hub { id, revision } = installed.snapshot_id().clone() else {
+		panic!("test snapshot must be a Hub snapshot");
+	};
+
+	let reused = manager
+		.download_revision_controlled(&id, &revision, None, None)
+		.await
+		.expect("healthy exact snapshot must be reusable offline");
+
+	assert_eq!(reused.path(), installed.path());
+	assert_eq!(reused.snapshot_id(), installed.snapshot_id());
 }

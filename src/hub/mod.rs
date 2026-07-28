@@ -231,6 +231,127 @@ struct SearchCursor {
 	scope: String,
 }
 
+/// Quantization mode reported by an exact Hub revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HubQuantizationMode {
+	/// Grouped affine quantization.
+	Affine,
+	/// Microscaling four-bit floating point.
+	Mxfp4,
+	/// Microscaling eight-bit floating point.
+	Mxfp8,
+	/// NVIDIA four-bit floating point.
+	Nvfp4,
+}
+
+/// Exact-revision quantization configuration reported by the Hub.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HubQuantization {
+	/// Quantization was not inspected, including older serialized records.
+	#[default]
+	Unknown,
+	/// No quantization section is configured.
+	NotConfigured,
+	/// Quantization defaults are configured for layers carrying quantization tensors.
+	Configured(HubQuantizationConfig),
+}
+
+/// Validated exact-revision quantization defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct HubQuantizationConfig {
+	mode: HubQuantizationMode,
+	bits: u8,
+	group_size: u16,
+	has_layer_overrides: bool,
+}
+
+impl HubQuantizationConfig {
+	fn new(
+		mode: HubQuantizationMode,
+		bits: u8,
+		group_size: u16,
+		has_layer_overrides: bool,
+	) -> crate::engine::error::Result<Self> {
+		crate::engine::quant::validate_params(
+			crate::engine::quant::QuantParams {
+				group_size: i32::from(group_size),
+				bits: i32::from(bits),
+				mode: match mode {
+					HubQuantizationMode::Affine => crate::engine::ops::QuantMode::Affine,
+					HubQuantizationMode::Mxfp4 => crate::engine::ops::QuantMode::Mxfp4,
+					HubQuantizationMode::Mxfp8 => crate::engine::ops::QuantMode::Mxfp8,
+					HubQuantizationMode::Nvfp4 => crate::engine::ops::QuantMode::Nvfp4,
+				},
+			},
+			"Hub quantization",
+		)?;
+		Ok(Self {
+			mode,
+			bits,
+			group_size,
+			has_layer_overrides,
+		})
+	}
+
+	/// Default quantization mode.
+	pub const fn mode(self) -> HubQuantizationMode {
+		self.mode
+	}
+
+	/// Default bits per quantized weight.
+	pub const fn bits(self) -> u8 {
+		self.bits
+	}
+
+	/// Default quantization group size.
+	pub const fn group_size(self) -> u16 {
+		self.group_size
+	}
+
+	/// Whether any per-layer overrides are configured.
+	pub const fn has_layer_overrides(self) -> bool {
+		self.has_layer_overrides
+	}
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum HubQuantizationWire {
+	Unknown,
+	NotConfigured,
+	Configured {
+		mode: HubQuantizationMode,
+		bits: u8,
+		group_size: u16,
+		has_layer_overrides: bool,
+	},
+}
+
+impl<'de> Deserialize<'de> for HubQuantization {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		match HubQuantizationWire::deserialize(deserializer)? {
+			HubQuantizationWire::Unknown => Ok(Self::Unknown),
+			HubQuantizationWire::NotConfigured => Ok(Self::NotConfigured),
+			HubQuantizationWire::Configured {
+				mode,
+				bits,
+				group_size,
+				has_layer_overrides,
+			} => HubQuantizationConfig::new(mode, bits, group_size, has_layer_overrides)
+				.map(Self::Configured)
+				.map_err(serde::de::Error::custom),
+		}
+	}
+}
+
 /// One Hub model returned by discovery or inspection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -251,6 +372,9 @@ pub struct HubModel {
 	pub license: Option<String>,
 	/// Generic capabilities with evidence.
 	pub traits: ModelTraits,
+	/// Exact-revision quantization configuration.
+	#[serde(default)]
+	pub quantization: HubQuantization,
 	/// Whether remote static compatibility and any configured machine fit passed.
 	pub compatible: bool,
 	/// Root file names advertised by the repository.
@@ -1992,6 +2116,7 @@ fn model_from_wire(wire: &ModelWire, authenticated: bool) -> Result<HubModel, Hu
 		library: wire.library_name.clone(),
 		license,
 		traits,
+		quantization: HubQuantization::Unknown,
 		files,
 		compatible: false,
 		diagnostics: Vec::new(),
@@ -2266,9 +2391,13 @@ fn enrich_remote_model(
 	{
 		diagnostics.push(format!("unsupported model configuration: {error}"));
 	}
-	if let Err(error) = crate::engine::quant::Quantization::from_config(&artifacts.config) {
-		diagnostics.push(format!("unsupported quantization: {error}"));
-	}
+	let quantization = match hub_quantization_from_config(&artifacts.config) {
+		Ok(quantization) => quantization,
+		Err(error) => {
+			diagnostics.push(format!("unsupported quantization: {error}"));
+			HubQuantization::Unknown
+		}
+	};
 	let statically_compatible = diagnostics.is_empty();
 	let download_bytes = validate_download_files(files)?;
 	let weights_bytes = files
@@ -2514,11 +2643,41 @@ fn enrich_remote_model(
 			None => true,
 		};
 	model.traits = traits;
+	model.quantization = quantization;
 	model.fit = fit;
 	model.diagnostics = diagnostics;
 	model.files = files.iter().map(|file| file.path.clone()).collect();
 	model.download_bytes = Some(download_bytes);
 	Ok(())
+}
+
+fn hub_quantization_from_config(
+	config: &serde_json::Value,
+) -> crate::engine::error::Result<HubQuantization> {
+	let quantization = crate::engine::quant::Quantization::from_config(config)?;
+	let Some(default) = quantization.default else {
+		return Ok(HubQuantization::NotConfigured);
+	};
+	let bits = u8::try_from(default.bits).map_err(|_| {
+		crate::engine::error::Error::Config(format!(
+			"quantization bits {} cannot be represented in Hub metadata",
+			default.bits
+		))
+	})?;
+	let group_size = u16::try_from(default.group_size).map_err(|_| {
+		crate::engine::error::Error::Config(format!(
+			"quantization group size {} cannot be represented in Hub metadata",
+			default.group_size
+		))
+	})?;
+	let mode = match default.mode {
+		crate::engine::ops::QuantMode::Affine => HubQuantizationMode::Affine,
+		crate::engine::ops::QuantMode::Mxfp4 => HubQuantizationMode::Mxfp4,
+		crate::engine::ops::QuantMode::Mxfp8 => HubQuantizationMode::Mxfp8,
+		crate::engine::ops::QuantMode::Nvfp4 => HubQuantizationMode::Nvfp4,
+	};
+	HubQuantizationConfig::new(mode, bits, group_size, !quantization.per_layer.is_empty())
+		.map(HubQuantization::Configured)
 }
 
 fn resolved_chat_templates(
@@ -4291,6 +4450,7 @@ mod tests {
 			library: Some("mlx".to_string()),
 			license: None,
 			traits,
+			quantization: HubQuantization::Unknown,
 			compatible: true,
 			files: vec![
 				"config.json".to_string(),
@@ -5338,6 +5498,7 @@ mod tests {
 
 		assert!(model.compatible);
 		assert!(model.traits.mlx);
+		assert_eq!(model.quantization, HubQuantization::NotConfigured);
 		assert_eq!(model.fit, None);
 		let sizing = model.traits.sizing.as_ref().expect("static sizing");
 		assert_eq!(sizing.weights_bytes, Some(1 << 20));
@@ -5366,6 +5527,71 @@ mod tests {
 					.any(|evidence| evidence.trait_key == key)
 			);
 		}
+	}
+
+	#[test]
+	fn static_enrichment_reports_validated_quantization_defaults_and_overrides() {
+		let wire = wire();
+		let mut artifacts = artifacts();
+		artifacts
+			.config
+			.as_object_mut()
+			.expect("config object")
+			.insert(
+				"quantization".to_string(),
+				serde_json::json!({
+					"bits": 4,
+					"group_size": 64,
+					"mode": "affine",
+					"model.layers.0.self_attn.q_proj": {
+						"bits": 8,
+						"group_size": 64,
+						"mode": "affine"
+					}
+				}),
+			);
+		let mut model = model_from_wire(&wire, false).expect("valid wire model");
+
+		enrich_remote_model(&mut model, &wire, &artifacts, &enrichment_files(), None)
+			.expect("valid static enrichment");
+
+		assert_eq!(
+			model.quantization,
+			HubQuantization::Configured(
+				HubQuantizationConfig::new(HubQuantizationMode::Affine, 4, 64, true)
+					.expect("valid quantization"),
+			)
+		);
+	}
+
+	#[test]
+	fn hub_quantization_deserialization_rejects_unsupported_parameters() {
+		let valid = serde_json::json!({
+			"kind": "configured",
+			"mode": "mxfp4",
+			"bits": 4,
+			"group_size": 32,
+			"has_layer_overrides": true
+		});
+		let parsed = serde_json::from_value::<HubQuantization>(valid.clone())
+			.expect("valid quantization must deserialize");
+		assert_eq!(
+			serde_json::to_value(parsed).expect("valid quantization must serialize"),
+			valid
+		);
+
+		let invalid = serde_json::json!({
+			"kind": "configured",
+			"mode": "affine",
+			"bits": 7,
+			"group_size": 64,
+			"has_layer_overrides": false
+		});
+
+		let error = serde_json::from_value::<HubQuantization>(invalid)
+			.expect_err("unsupported quantization must not deserialize");
+
+		assert!(error.to_string().contains("unsupported parameters"));
 	}
 
 	#[test]

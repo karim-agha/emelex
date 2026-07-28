@@ -40,6 +40,12 @@ Emelex Home filesystem with the same safety margin used before transfer.
 Storage is probed for each search and rejected candidates do not consume the
 rank-preserving result-page limit. Download rechecks live space.
 
+Every inspected `HubModel` reports exact-revision quantization configuration.
+The typed summary distinguishes an uninspected value, no configured
+quantization, and validated mode/bits/group defaults. It also records whether
+per-layer overrides exist without claiming every tensor uses one uniform
+scheme.
+
 The opaque composite cursor carries a bounded printable upstream cursor plus
 an intra-page offset and is scoped to normalized query, MLX catalog selection,
 trait filters, a domain-separated credential fingerprint, and the client's

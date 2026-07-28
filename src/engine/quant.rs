@@ -212,7 +212,7 @@ fn optional_i32(value: Option<&Value>, path: &str) -> Result<Option<i32>> {
 		.map_err(|_| Error::Config(format!("{path} is outside the supported i32 range")))
 }
 
-fn validate_params(params: QuantParams, path: &str) -> Result<QuantParams> {
+pub(crate) fn validate_params(params: QuantParams, path: &str) -> Result<QuantParams> {
 	let valid = match params.mode {
 		QuantMode::Affine => {
 			matches!(params.group_size, 32 | 64 | 128)

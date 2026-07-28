@@ -9,9 +9,12 @@
 - Candidate-specific planning and certification failures have a dedicated
   `ModelsError::Certification` boundary. Only static JSON/config/layout
   rejection, candidate privacy/compatibility/fit changes during planning,
-  manifest validation, and narrow model load/probe failures enter it. Network,
-  cancellation, transfer/hash/storage, effective policy, task-join, panic,
-  Emelex Home, and global runtime failures do not.
+  selected-revision drift, manifest validation, and narrow model load/probe
+  failures enter it. Interactive catalog downloads pin the revision shown and
+  reuse a healthy exact snapshot before Hub access; otherwise they fail rather
+  than substituting a newer plan. Network, cancellation, transfer/hash/storage,
+  effective policy, task-join, panic, Emelex Home, and global runtime failures
+  do not.
 - Controlled Hub installs checkpoint cancellation around local verification,
   inspection, load probing, manifest creation, and publication. Staged hashes
   use cancellable async chunks; the final checkpoint precedes the atomic rename.
@@ -29,6 +32,8 @@
   join. Descriptor hashing uses cancellable async chunks.
 - Inventory skips corrupt or unavailable candidates and retains bounded
   per-entry diagnostics.
+- Interactive Hub status uses a cancellation-safe Hub-only snapshot scan. It
+  does not inspect or hash caller-owned linked imports.
 - Owned snapshot paths and all link records stay under the selected Emelex
   Home. A link record may name one canonical caller-owned external target.
 - Hub snapshot paths carry an explicit `unnamespaced` or `namespaced`

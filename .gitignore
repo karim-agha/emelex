@@ -1,5 +1,6 @@
 /target/
 /dist/
+/vendor/fmt/support/.cxx/
 /agents/worktrees/*
 !/agents/worktrees/.gitkeep
 *.profraw
