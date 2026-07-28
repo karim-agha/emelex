@@ -88,6 +88,10 @@
   to `DownloadIdleTimeout`; a reqwest inner timeout must not race into the
   generic request-error surface. Already-persisted partial bytes remain staged.
 - Every completed file has an Emelex-computed SHA-256.
+- `TransferStarted` and `TransferCompleted` observer events bracket all file
+  events with the immutable plan's exact file and byte totals. Completion means
+  every planned file is verified and staged, not that model certification or
+  publication has finished.
 - Fallible observers and cancellation are checked during transfer, hashing,
   and retry waits.
 - File hashing is async and future-owned. Dropping the download drops its

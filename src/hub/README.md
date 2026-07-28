@@ -94,3 +94,8 @@ detached multi-gigabyte hash worker running. Header, error-body, and successful
 body stalls share one deterministic per-file idle classification even when
 reqwest's inner read timer wins the race with Emelex's cancellation-aware
 timer; resumable partial bytes remain staged.
+Observer lifecycles bracket the file events with exact planned file and byte
+totals after staging validation and after every file is verified and staged.
+Those totals include resumable prefixes, allowing callers to present truthful
+aggregate completion without mistaking transfer completion for final model
+certification or publication.

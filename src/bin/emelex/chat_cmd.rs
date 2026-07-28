@@ -38,12 +38,13 @@ use tokio::io::unix::AsyncFd;
 use super::{
 	args::{ChatArgs, ResumeTarget, ThinkingArg},
 	generate_cmd::{
-		await_with_cancellation, finish_human_streams, prompt as resolve_prompt, render_agent_event,
+		await_with_cancellation, finish_human_streams, prompt as resolve_prompt,
+		render_agent_event, usage_footer,
 	},
 	markdown::MarkdownStream,
 	media::{self, Attachment},
 	model_select, output,
-	style::{Palette, tokens},
+	style::Palette,
 	web_search::DuckDuckGoSearch,
 };
 
@@ -708,22 +709,18 @@ async fn run_claimed(
 ) -> anyhow::Result<()> {
 	let mut needs_title = durable.session().title.is_none();
 	let mut recalled_context = recalled_knowledge_context(store, emelex.invocation_root(), config)?;
-	if !json {
+	if interactive {
 		let workspace_display = durable.session().workspace.display().to_string();
-		let workspace = output::terminal_safe_inline(&workspace_display);
 		let model_reference = durable
 			.session()
 			.model_reference
 			.as_ref()
 			.map_or_else(|| "unbound model".to_string(), ToString::to_string);
-		let model = output::terminal_safe_inline(&model_reference);
-		output::stderr_line(&stderr_palette.dim(&format!(
-			"session {} · {} · {}",
-			durable.session().id,
-			workspace,
-			model
-		)))?;
-		output::stderr_line(&stderr_palette.dim("chat session — /quit to exit (or Ctrl-C)"))?;
+		let header = chat_header(durable.session().id, &workspace_display, &model_reference);
+		output::stderr_line(&stderr_palette.bold(&header[0]))?;
+		for line in &header[1..] {
+			output::stderr_line(&stderr_palette.dim(line))?;
+		}
 	}
 	let mut attachments = Vec::new();
 	let mut initial = args.prompt;
@@ -760,6 +757,18 @@ async fn run_claimed(
 		stderr_palette,
 	)
 	.await
+}
+
+fn chat_header(session_id: uuid::Uuid, workspace: &str, model_reference: &str) -> [String; 5] {
+	let workspace = output::terminal_safe_inline(workspace);
+	let model = output::terminal_safe_inline(model_reference);
+	[
+		"Emelex chat".to_string(),
+		format!("  Model      {model}"),
+		format!("  Workspace  {workspace}"),
+		format!("  Session    {session_id}"),
+		"  /help for commands · /quit or Ctrl-C to exit".to_string(),
+	]
 }
 
 #[expect(
@@ -961,7 +970,7 @@ fn report_history_warning(
 	if !*reported {
 		*reported = true;
 		output::stderr_line(&palette.yellow(&format!(
-			"warning: prompt history unavailable: {}",
+			"! Prompt history unavailable · {}",
 			output::terminal_safe_inline(&format!("{error:#}"))
 		)))?;
 	}
@@ -986,7 +995,10 @@ fn report_recoverable_input_error(error: anyhow::Error, palette: Palette) -> any
 	{
 		return Err(error);
 	}
-	output::stderr_line(&palette.red(&output::terminal_safe_inline(&format!("{error:#}"))))
+	output::stderr_line(&palette.red(&format!(
+		"× {}",
+		output::terminal_safe_inline(&format!("{error:#}"))
+	)))
 }
 
 fn generation_options(config: &Config, effective_max_tokens: usize) -> GenerationOptions {
@@ -1082,7 +1094,7 @@ async fn run_one(
 			}))?;
 		} else if failed_after_checkpoint {
 			output::stderr_line(&stderr_palette.yellow(
-				"turn failed after tool checkpoint; recorded results or side effects may have occurred",
+				"! Turn failed after a tool checkpoint · recorded results or side effects may exist",
 			))?;
 		}
 	}
@@ -1111,19 +1123,18 @@ async fn run_one(
 				if !turn.response.text.ends_with('\n') {
 					output::stdout_line("")?;
 				}
-				output::stderr_line(&stderr_palette.dim(&format!(
-					"[↑{} ↓{}, {} cached · {} round(s)]",
-					tokens(turn.usage.prompt_tokens),
-					tokens(turn.usage.completion_tokens),
-					tokens(turn.usage.cached_tokens),
-					turn.model_rounds
+				output::stderr_line(&stderr_palette.dim(&usage_footer(
+					turn.usage.prompt_tokens,
+					turn.usage.cached_tokens,
+					turn.usage.completion_tokens,
+					Some(turn.model_rounds),
 				)))?;
 			}
 			Ok(())
 		}
 		Err(DurableSessionError::Agent(emelex::agent::AgentError::Cancelled)) => {
 			if !json {
-				output::stderr_line(&stderr_palette.dim("^C turn cancelled"))?;
+				output::stderr_line(&stderr_palette.dim("Turn cancelled."))?;
 			}
 			Ok(())
 		}
@@ -1623,6 +1634,24 @@ mod tests {
 			slash_parts("/AtTaCh ./image.png"),
 			("/attach".to_string(), "./image.png")
 		);
+	}
+
+	#[test]
+	fn chat_header_is_scannable_and_sanitizes_dynamic_values() {
+		let header = chat_header(
+			uuid::Uuid::nil(),
+			"/tmp/work\u{1b}]0;workspace\u{7}\nforged",
+			"org/model\u{202e}",
+		);
+		let rendered = header.join("\n");
+
+		assert_eq!(header[0], "Emelex chat");
+		assert!(header[1].starts_with("  Model      "));
+		assert!(header[2].starts_with("  Workspace  "));
+		assert!(header[3].contains("00000000-0000-0000-0000-000000000000"));
+		assert_eq!(header[4], "  /help for commands · /quit or Ctrl-C to exit");
+		assert_terminal_neutral(&rendered);
+		assert_eq!(rendered.lines().count(), header.len());
 	}
 
 	#[test]

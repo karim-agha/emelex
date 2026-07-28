@@ -21,7 +21,7 @@ pub(crate) fn run(
 		HubAuthCommand::Login { token_stdin } => {
 			login(home, token_stdin, json, stdout_palette, stderr_palette)
 		}
-		HubAuthCommand::Status => status(home, json),
+		HubAuthCommand::Status => status(home, json, stdout_palette),
 		HubAuthCommand::Logout => logout(home, json, stdout_palette, stderr_palette),
 	}
 }
@@ -61,14 +61,18 @@ fn login(
 			"source": effective.source,
 		}));
 	}
-	output::stdout_line(&stdout_palette.green("stored Hugging Face token"))?;
+	output::stdout_line(&format!(
+		"{} {}",
+		stdout_palette.green("✓ Stored"),
+		stdout_palette.bold("Hugging Face token")
+	))?;
 	if let Some(warning) = effective.stored_token_warning() {
-		output::stderr_line(&stderr_palette.yellow(warning))?;
+		output::stderr_line(&stderr_palette.yellow(&format!("! {warning}")))?;
 	}
 	Ok(())
 }
 
-fn status(home: &EmelexHome, json: bool) -> anyhow::Result<()> {
+fn status(home: &EmelexHome, json: bool, palette: Palette) -> anyhow::Result<()> {
 	let effective = effective_auth_with_environment(home, environment_auth())?;
 	if json {
 		output::json_line(&serde_json::json!({
@@ -77,7 +81,7 @@ fn status(home: &EmelexHome, json: bool) -> anyhow::Result<()> {
 			"stored": effective.stored,
 		}))
 	} else {
-		output::stdout_line(effective.human_status())
+		output::stdout_line(&effective.render_human_status(palette))
 	}
 }
 
@@ -97,9 +101,13 @@ fn logout(
 			"source": effective.source,
 		}));
 	}
-	output::stdout_line(&stdout_palette.green("removed stored Hugging Face token"))?;
+	output::stdout_line(&format!(
+		"{} {}",
+		stdout_palette.green("✓ Removed"),
+		stdout_palette.bold("stored Hugging Face token")
+	))?;
 	if let Some(warning) = effective.environment_warning() {
-		output::stderr_line(&stderr_palette.yellow(warning))?;
+		output::stderr_line(&stderr_palette.yellow(&format!("! {warning}")))?;
 	}
 	Ok(())
 }
@@ -157,21 +165,43 @@ struct EffectiveAuth {
 }
 
 impl EffectiveAuth {
-	fn human_status(self) -> &'static str {
+	fn render_human_status(self, palette: Palette) -> String {
 		match (self.authenticated, self.source) {
-			(true, "environment") => "authenticated by HF_TOKEN",
-			(true, "stored") => "authenticated by stored Hugging Face token",
-			(false, "anonymous") => "anonymous; empty HF_TOKEN suppresses the stored token",
+			(true, "environment") => format!(
+				"{}  {}",
+				palette.green("✓ Authenticated"),
+				palette.dim("Hugging Face Hub · HF_TOKEN")
+			),
+			(true, "stored") => format!(
+				"{}  {}",
+				palette.green("✓ Authenticated"),
+				palette.dim("Hugging Face Hub · stored token")
+			),
+			(false, "anonymous") => format!(
+				"{}  {}",
+				palette.yellow("! Anonymous"),
+				"empty HF_TOKEN suppresses the stored token"
+			),
 			(false, "invalid_environment") => {
-				"invalid HF_TOKEN; Hub commands will fail until it is unset or replaced"
+				format!(
+					"{}  {}",
+					palette.red("× Authentication blocked"),
+					"HF_TOKEN is invalid; unset or replace it"
+				)
 			}
-			_ => "anonymous; no Hugging Face token configured",
+			_ => format!(
+				"{}  {}",
+				palette.yellow("! Anonymous"),
+				"no Hugging Face token configured"
+			),
 		}
 	}
 
 	const fn stored_token_warning(self) -> Option<&'static str> {
 		match self.environment {
-			EnvironmentAuth::Set => Some("HF_TOKEN remains active and takes precedence"),
+			EnvironmentAuth::Set => {
+				Some("HF_TOKEN remains active and takes precedence over the stored token")
+			}
 			EnvironmentAuth::Empty => Some("empty HF_TOKEN keeps Hub access anonymous"),
 			EnvironmentAuth::Invalid => Some("invalid HF_TOKEN prevents use of the stored token"),
 			EnvironmentAuth::Absent => None,
@@ -211,6 +241,7 @@ fn effective_auth_with_environment(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::style::ColorMode;
 
 	#[test]
 	fn stdin_token_accepts_one_line_ending_only() {
@@ -235,16 +266,20 @@ mod tests {
 
 	#[test]
 	fn effective_status_copy_is_secret_free() {
+		let palette = Palette::stdout(ColorMode::Never);
 		let status = EffectiveAuth {
 			authenticated: true,
 			source: "environment",
 			stored: true,
 			environment: EnvironmentAuth::Set,
 		};
-		assert_eq!(status.human_status(), "authenticated by HF_TOKEN");
+		assert_eq!(
+			status.render_human_status(palette),
+			"✓ Authenticated  Hugging Face Hub · HF_TOKEN"
+		);
 		assert_eq!(
 			status.stored_token_warning(),
-			Some("HF_TOKEN remains active and takes precedence")
+			Some("HF_TOKEN remains active and takes precedence over the stored token")
 		);
 
 		let invalid = EffectiveAuth {
@@ -254,8 +289,34 @@ mod tests {
 			environment: EnvironmentAuth::Invalid,
 		};
 		assert_eq!(
-			invalid.human_status(),
-			"invalid HF_TOKEN; Hub commands will fail until it is unset or replaced"
+			invalid.render_human_status(palette),
+			"× Authentication blocked  HF_TOKEN is invalid; unset or replace it"
+		);
+	}
+
+	#[test]
+	fn anonymous_status_distinguishes_missing_and_suppressing_environment() {
+		let palette = Palette::stdout(ColorMode::Never);
+		let missing = EffectiveAuth {
+			authenticated: false,
+			source: "none",
+			stored: false,
+			environment: EnvironmentAuth::Absent,
+		};
+		assert_eq!(
+			missing.render_human_status(palette),
+			"! Anonymous  no Hugging Face token configured"
+		);
+
+		let suppressed = EffectiveAuth {
+			authenticated: false,
+			source: "anonymous",
+			stored: true,
+			environment: EnvironmentAuth::Empty,
+		};
+		assert_eq!(
+			suppressed.render_human_status(palette),
+			"! Anonymous  empty HF_TOKEN suppresses the stored token"
 		);
 	}
 }

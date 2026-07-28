@@ -1,6 +1,7 @@
 //! One-shot raw and agent generation.
 
 use std::{
+	fmt::Write as _,
 	future::Future,
 	io::{IsTerminal as _, Read},
 	sync::Arc,
@@ -294,11 +295,11 @@ async fn run_raw(
 	output::stdout(&markdown.finish())?;
 	output::stderr_line(&format!(
 		"\n{}",
-		stderr_palette.dim(&format!(
-			"{} prompt · {} cached · {} generated",
-			tokens(response.usage.prompt_tokens),
-			tokens(response.usage.cached_tokens),
-			tokens(response.usage.completion_tokens)
+		stderr_palette.dim(&usage_footer(
+			response.usage.prompt_tokens,
+			response.usage.cached_tokens,
+			response.usage.completion_tokens,
+			None,
 		))
 	))?;
 	Ok(())
@@ -375,16 +376,34 @@ async fn run_agent(
 	if !json {
 		output::stderr_line(&format!(
 			"\n{}",
-			stderr_palette.dim(&format!(
-				"{} prompt · {} cached · {} generated · {} round(s)",
-				tokens(turn.usage.prompt_tokens),
-				tokens(turn.usage.cached_tokens),
-				tokens(turn.usage.completion_tokens),
-				turn.model_rounds
+			stderr_palette.dim(&usage_footer(
+				turn.usage.prompt_tokens,
+				turn.usage.cached_tokens,
+				turn.usage.completion_tokens,
+				Some(turn.model_rounds),
 			))
 		))?;
 	}
 	Ok(())
+}
+
+pub(crate) fn usage_footer(
+	prompt_tokens: u64,
+	cached_tokens: u64,
+	completion_tokens: u64,
+	model_rounds: Option<usize>,
+) -> String {
+	let mut footer = format!(
+		"↑ {} prompt · ↺ {} cached · ↓ {} generated",
+		tokens(prompt_tokens),
+		tokens(cached_tokens),
+		tokens(completion_tokens)
+	);
+	if let Some(rounds) = model_rounds {
+		let label = if rounds == 1 { "round" } else { "rounds" };
+		let _ = write!(&mut footer, " · {rounds} {label}");
+	}
+	footer
 }
 
 pub(crate) async fn await_with_cancellation<F, S, T>(
@@ -447,37 +466,60 @@ pub(crate) fn render_agent_event(
 			output::stderr(&reasoning.push(&text))?;
 		}
 		AgentEvent::ToolCall { call, .. } => {
-			let name = output::terminal_safe_inline(&call.name);
+			let name = human_tool_name(&call.name);
 			let arguments = serde_json::to_string(&call.arguments)
 				.context("encode tool-call arguments for terminal preview")?;
 			let arguments = bounded_tool_event_preview(&arguments);
 			let arguments = output::terminal_safe_inline(&arguments);
-			output::stderr_line(&stderr_palette.dim(&format!("⚙ {name} {arguments}")))?;
-		}
-		AgentEvent::ToolStarted { tool_name, .. } => {
-			let tool_name = output::terminal_safe_inline(tool_name);
-			output::stderr_line(&stderr_palette.dim(&format!("running {tool_name}…")))?;
+			output::stderr_line(&stderr_palette.dim(&format!("→ {name}  {arguments}")))?;
 		}
 		AgentEvent::ToolCompleted {
 			tool_name, output, ..
 		} if output.is_error => {
-			let tool_name = super::output::terminal_safe_inline(tool_name);
+			let tool_name = human_tool_name(tool_name);
 			let content = bounded_tool_event_preview(&output.content);
 			let content = super::output::terminal_safe_inline(&content);
-			output::stderr_line(&stderr_palette.yellow(&format!("{tool_name}: {content}")))?;
+			output::stderr_line(
+				&stderr_palette.yellow(&format!("! {tool_name} failed · {content}")),
+			)?;
 		}
 		AgentEvent::ApprovalResolved { decision, .. } => {
-			let formatted = format!("{decision:?}");
-			let decision = output::terminal_safe_inline(&formatted);
-			output::stderr_line(&stderr_palette.dim(&format!("approval: {decision}")))?;
+			let copy = approval_decision_copy(decision);
+			if matches!(decision, emelex::agent::ApprovalDecision::AllowOnce) {
+				output::stderr_line(&stderr_palette.green(&copy))?;
+			} else {
+				output::stderr_line(&stderr_palette.yellow(&copy))?;
+			}
 		}
 		AgentEvent::TurnFailed { message, .. } => {
 			let message = output::terminal_safe_inline(message);
-			output::stderr_line(&stderr_palette.red(&message))?;
+			output::stderr_line(&stderr_palette.red(&format!("× Turn failed · {message}")))?;
 		}
 		_ => {}
 	}
 	Ok(())
+}
+
+fn human_tool_name(value: &str) -> String {
+	let value = output::terminal_safe_inline(value);
+	let words = value.replace(['_', '-'], " ");
+	let mut chars = words.chars();
+	let Some(first) = chars.next() else {
+		return "Tool".to_string();
+	};
+	first.to_uppercase().chain(chars).collect::<String>()
+}
+
+fn approval_decision_copy(decision: &emelex::agent::ApprovalDecision) -> String {
+	match decision {
+		emelex::agent::ApprovalDecision::AllowOnce => "✓ Approved once".to_string(),
+		emelex::agent::ApprovalDecision::Deny { reason } => {
+			let reason = bounded_tool_event_preview(reason);
+			let reason = output::terminal_safe_inline(&reason);
+			format!("! Not approved · {reason}")
+		}
+		_ => "Approval resolved".to_string(),
+	}
 }
 
 fn bounded_tool_event_preview(value: &str) -> String {
@@ -563,6 +605,40 @@ mod tests {
 		assert!(preview.contains("bytes omitted"));
 		assert!(preview.contains(&hex::encode(Sha256::digest(payload.as_bytes()))));
 		assert!(!preview.contains('終'));
+	}
+
+	#[test]
+	fn usage_footer_has_one_stable_shape_and_correct_round_grammar() {
+		assert_eq!(
+			usage_footer(1_500, 240, 42, None),
+			"↑ 1.5k prompt · ↺ 240 cached · ↓ 42 generated"
+		);
+		assert_eq!(
+			usage_footer(1_500, 240, 42, Some(1)),
+			"↑ 1.5k prompt · ↺ 240 cached · ↓ 42 generated · 1 round"
+		);
+		assert_eq!(
+			usage_footer(1_500, 240, 42, Some(2)),
+			"↑ 1.5k prompt · ↺ 240 cached · ↓ 42 generated · 2 rounds"
+		);
+	}
+
+	#[test]
+	fn human_event_labels_are_calm_and_terminal_safe() {
+		assert_eq!(human_tool_name("web_search"), "Web search");
+		assert_eq!(human_tool_name(""), "Tool");
+
+		let allowed = approval_decision_copy(&emelex::agent::ApprovalDecision::AllowOnce);
+		assert_eq!(allowed, "✓ Approved once");
+
+		let denied = approval_decision_copy(&emelex::agent::ApprovalDecision::Deny {
+			reason: "unsafe\u{1b}]0;title\u{7}\nforged".to_string(),
+		});
+		assert!(denied.starts_with("! Not approved · "));
+		assert!(!denied.contains("Deny"));
+		assert!(!denied.contains('\u{1b}'));
+		assert!(!denied.contains('\u{7}'));
+		assert!(!denied.contains('\n'));
 	}
 
 	#[tokio::test]

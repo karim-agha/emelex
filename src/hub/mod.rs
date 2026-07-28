@@ -531,6 +531,13 @@ impl DownloadPlan {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum DownloadEvent {
+	/// Planned transfer began after staging validation.
+	TransferStarted {
+		/// Number of planned files.
+		files: usize,
+		/// Aggregate planned bytes, including resumable prefixes.
+		total: u64,
+	},
 	/// File transfer started or resumed.
 	FileStarted {
 		/// Relative file.
@@ -564,6 +571,13 @@ pub enum DownloadEvent {
 		path: String,
 		/// Computed SHA-256.
 		sha256: String,
+	},
+	/// Every planned file was transferred, verified, and staged.
+	TransferCompleted {
+		/// Number of transferred files.
+		files: usize,
+		/// Aggregate transferred bytes, including resumable prefixes.
+		total: u64,
 	},
 }
 
@@ -1488,11 +1502,25 @@ impl HubClient {
 		tokio::task::spawn_blocking(move || validate_download_staging(&staging_path))
 			.await
 			.map_err(blocking_hub_task_error)??;
+		emit(
+			callbacks,
+			&DownloadEvent::TransferStarted {
+				files: plan.files().len(),
+				total: plan.total_bytes(),
+			},
+		)?;
 		let mut installed = Vec::with_capacity(plan.files().len());
 		for file in plan.files() {
 			check_cancelled(callbacks.cancellation)?;
 			installed.push(self.download_file(plan, file, staging, callbacks).await?);
 		}
+		emit(
+			callbacks,
+			&DownloadEvent::TransferCompleted {
+				files: plan.files().len(),
+				total: plan.total_bytes(),
+			},
+		)?;
 		Ok(installed)
 	}
 
@@ -3755,6 +3783,7 @@ mod tests {
 	use std::{
 		os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
 		process::Command,
+		sync::Mutex,
 	};
 
 	use sha2::Digest as _;
@@ -4066,6 +4095,75 @@ mod tests {
 			bytes
 		);
 		assert!(!staging.path().join("config.json.part").exists());
+	}
+
+	#[tokio::test]
+	async fn download_events_bracket_files_with_exact_transfer_totals() {
+		let bytes = b"abcdef";
+		let server = loopback_sequence_server(vec![
+			LoopbackBehavior::Response {
+				status: "200 OK",
+				headers: vec!["Content-Length: 6".to_string()],
+				body: bytes.to_vec(),
+			},
+			LoopbackBehavior::Response {
+				status: "200 OK",
+				headers: vec!["Content-Length: 1".to_string()],
+				body: b"t".to_vec(),
+			},
+			LoopbackBehavior::Response {
+				status: "200 OK",
+				headers: vec!["Content-Length: 1".to_string()],
+				body: b"w".to_vec(),
+			},
+		])
+		.await;
+		let client = loopback_client(&server.endpoint);
+		let staging = download_staging();
+		let (mut plan, _) = test_download_plan("config.json", bytes);
+		let (_, tokenizer) = test_download_plan("tokenizer.json", b"t");
+		let (_, weights) = test_download_plan("model.safetensors", b"w");
+		plan.files.extend([tokenizer, weights]);
+		plan.total_bytes = 8;
+		let events = Arc::new(Mutex::new(Vec::new()));
+		let observed = Arc::clone(&events);
+		let observer: DownloadObserver = Arc::new(move |event| {
+			let label = match event {
+				DownloadEvent::TransferStarted { files, total } => {
+					format!("started:{files}:{total}")
+				}
+				DownloadEvent::FileStarted { path, .. } => format!("file:{path}"),
+				DownloadEvent::Progress { .. } => "progress".to_string(),
+				DownloadEvent::FileVerified { path, .. } => format!("verified:{path}"),
+				DownloadEvent::TransferCompleted { files, total } => {
+					format!("completed:{files}:{total}")
+				}
+				_ => return Ok(DownloadControl::Continue),
+			};
+			observed
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.push(label);
+			Ok(DownloadControl::Continue)
+		});
+
+		client
+			.download_controlled(&plan, staging.path(), Some(&observer), None)
+			.await
+			.expect("download");
+
+		let events = events
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.clone();
+		assert_eq!(events.first().map(String::as_str), Some("started:3:8"));
+		assert_eq!(events.last().map(String::as_str), Some("completed:3:8"));
+		assert!(
+			events
+				.windows(2)
+				.any(|events| events == ["progress", "verified:config.json"])
+		);
+		server.task.await.expect("server task");
 	}
 
 	#[tokio::test]

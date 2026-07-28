@@ -30,6 +30,7 @@ pub(crate) mod model_select;
 pub(crate) mod models_cmd;
 pub(crate) mod output;
 pub(crate) mod style;
+pub(crate) mod terminal_ui;
 pub(crate) mod web_search;
 
 use anyhow::Context as _;
@@ -64,7 +65,7 @@ async fn main() -> ExitCode {
 fn format_human_error(error: &anyhow::Error, palette: style::Palette) -> String {
 	let formatted = format!("{error:#}");
 	let error = output::terminal_safe_inline(&formatted);
-	palette.red(&error)
+	format!("{} {error}", palette.red("error:"))
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {

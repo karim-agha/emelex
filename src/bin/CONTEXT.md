@@ -73,12 +73,23 @@
   validated exact-revision config. The memory row names its evaluated workload
   separately from the model's maximum context, capability groups wrap with
   hanging indentation, and the MLX-only search does not repeat a runtime row.
-  A human stdin/stdout/stderr terminal gets an arrow-key selector for the
-  current page; Enter revalidates and downloads that displayed revision, while
-  Escape or `q` exits successfully.
+  A human stdin/stdout/stderr terminal turns those same results into one
+  stdout-owned inline viewport; it must never append a second selector list.
+  The selected card carries a visible rail, frames fit the current terminal
+  height, reserve one cursor row, and stay below its wrap column. Enter
+  revalidates and downloads that displayed revision; Escape or `q` exits
+  successfully; raw Ctrl-C becomes the explicit interrupt action. Buffered
+  redraws recompute prior-frame height at the current terminal width, preserve
+  scrollback, and restore cursor visibility on every exit path.
   Redirected or JSON searches never read selection input. Default diagnostics
   show only a count, verbose diagnostics group by sanitized candidate ID, and
   JSON stays complete.
+- Human TTY downloads start in a truthful preparing phase, consume exact
+  transfer lifecycle totals, coalesce state into an independently animated live
+  region, and remain in finalizing after transfer until certification and
+  publication return. Resumed prefixes contribute to completion but not
+  throughput. Redirected output is deterministic and excludes chunk-level
+  progress; existing JSON event records remain byte-compatible.
 - Preferred local import uses singular `model import PATH`, with an optional
   `--name`; other lifecycle commands remain plural `models`. Import defaults to
   an owned immutable copy. Move publishes before selectively retiring only

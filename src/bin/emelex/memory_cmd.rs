@@ -5,7 +5,7 @@ use std::{os::unix::fs::MetadataExt as _, path::Path, time::Duration};
 use anyhow::{Context as _, bail};
 use emelex::{
 	Emelex,
-	memory::{Knowledge, MaintenanceOptions, MemoryJobKind, MemoryStore, Session},
+	memory::{Knowledge, MaintenanceOptions, MemoryJobKind, MemoryStatus, MemoryStore, Session},
 };
 
 use super::{
@@ -30,7 +30,7 @@ pub(crate) async fn run(
 		} => output::export_stream(destination.as_deref(), |writer| {
 			write_workspace_export(emelex, store, writer)
 		}),
-		MemoryCommand::Gc => maintain(emelex, store, json),
+		MemoryCommand::Gc => maintain(emelex, store, json, palette, stderr_palette),
 		MemoryCommand::Work { max_jobs } => {
 			super::memory_worker::run(
 				emelex,
@@ -50,7 +50,7 @@ pub(crate) async fn run(
 			if json {
 				output::json_line(&serde_json::json!({"retried_memory_job": job}))
 			} else {
-				output::stdout_line(&format!("queued {job} for retry"))
+				output::stdout_line(&success_with_id(palette, "Retry queued", &job.to_string()))
 			}
 		}
 		MemoryCommand::Sessions { command } => sessions(emelex, store, command, json, palette),
@@ -58,7 +58,13 @@ pub(crate) async fn run(
 	}
 }
 
-fn maintain(emelex: &Emelex, store: &MemoryStore, json: bool) -> anyhow::Result<()> {
+fn maintain(
+	emelex: &Emelex,
+	store: &MemoryStore,
+	json: bool,
+	palette: Palette,
+	stderr_palette: Palette,
+) -> anyhow::Result<()> {
 	let days = u64::from(emelex.config().memory.retention_days);
 	let age = Duration::from_secs(
 		days.checked_mul(24 * 60 * 60)
@@ -72,26 +78,40 @@ fn maintain(emelex: &Emelex, store: &MemoryStore, json: bool) -> anyhow::Result<
 	if json {
 		output::json_line(&report)
 	} else {
-		output::stdout_line(&format!(
-			"recovered {} claim(s); removed {} session(s), {} Knowledge entries, \
-			 {} version(s), and {} asset(s){}",
-			report
-				.session_claims_recovered
-				.saturating_add(report.compactions_recovered)
-				.saturating_add(report.distillations_recovered),
-			report.sessions_removed,
-			report.knowledge_removed,
-			report.versions_removed,
-			report
-				.assets
-				.cataloged_files
-				.saturating_add(report.assets.orphan_files),
-			if report.wal_busy {
-				"; WAL checkpoint remained busy"
-			} else {
-				""
-			}
-		))
+		let claims_recovered = report
+			.session_claims_recovered
+			.saturating_add(report.compactions_recovered)
+			.saturating_add(report.distillations_recovered);
+		let assets_removed = report
+			.assets
+			.cataloged_files
+			.saturating_add(report.assets.orphan_files);
+		output::stdout_line(&palette.green("✓ Memory maintenance complete"))?;
+		output::stdout_line(&status_row(
+			"Recovered",
+			&counted(claims_recovered, "claim", "claims"),
+		))?;
+		output::stdout_line(&status_row(
+			"Removed",
+			&format!(
+				"{} · {} · {} · {}",
+				counted(report.sessions_removed, "session", "sessions"),
+				counted(
+					report.knowledge_removed,
+					"Knowledge entry",
+					"Knowledge entries"
+				),
+				counted(report.versions_removed, "version", "versions"),
+				counted(assets_removed, "asset", "assets")
+			),
+		))?;
+		if report.wal_busy {
+			output::stderr_line(
+				&stderr_palette
+					.yellow("! WAL checkpoint busy; retry after other memory work finishes"),
+			)?;
+		}
+		Ok(())
 	}
 }
 
@@ -100,34 +120,67 @@ fn status(store: &MemoryStore, json: bool, palette: Palette) -> anyhow::Result<(
 	if json {
 		return output::json_line(&status);
 	}
-	for line in [
-		format!("database       {}", bytes(status.database_bytes)),
-		format!("sessions       {}", status.sessions),
-		format!("events         {}", status.events),
-		format!("Knowledge      {}", status.knowledge),
-		format!("tombstoned     {}", status.tombstoned_knowledge),
-		format!(
-			"compactions    {}",
-			palette.cyan(&status.pending_compactions.to_string())
-		),
-		format!(
-			"failed compact {}",
-			palette.red(&status.failed_compactions.to_string())
-		),
-		format!("distillations  {}", status.pending_distillations),
-		format!(
-			"failed distill {}",
-			palette.red(&status.failed_distillations.to_string())
-		),
-		format!(
-			"assets          {} ({})",
-			status.assets,
-			bytes(status.asset_bytes)
-		),
-	] {
+	for line in render_status(&status, palette) {
 		output::stdout_line(&line)?;
 	}
 	Ok(())
+}
+
+fn render_status(status: &MemoryStatus, palette: Palette) -> Vec<String> {
+	vec![
+		palette.bold("Memory"),
+		status_row("Database", &bytes(status.database_bytes)),
+		status_row("Sessions", &status.sessions.to_string()),
+		status_row("Events", &status.events.to_string()),
+		status_row("Knowledge", &status.knowledge.to_string()),
+		status_row("Tombstoned", &status.tombstoned_knowledge.to_string()),
+		status_row(
+			"Assets",
+			&format!(
+				"{} · {}",
+				counted_u64(status.assets, "asset", "assets"),
+				bytes(status.asset_bytes)
+			),
+		),
+		String::new(),
+		palette.bold("Work queue"),
+		status_row(
+			"Compactions",
+			&queue_summary(
+				status.pending_compactions,
+				status.failed_compactions,
+				palette,
+			),
+		),
+		status_row(
+			"Distillations",
+			&queue_summary(
+				status.pending_distillations,
+				status.failed_distillations,
+				palette,
+			),
+		),
+	]
+}
+
+fn status_row(label: &str, value: &str) -> String {
+	format!("  {label:<15}{value}")
+}
+
+fn queue_summary(pending: u64, failed: u64, palette: Palette) -> String {
+	let pending_copy = format!("{pending} pending");
+	let pending_copy = if pending == 0 {
+		palette.dim(&pending_copy)
+	} else {
+		palette.yellow(&pending_copy)
+	};
+	let failed_copy = format!("{failed} failed");
+	let failed_copy = if failed == 0 {
+		palette.dim(&failed_copy)
+	} else {
+		palette.red(&failed_copy)
+	};
+	format!("{pending_copy} · {failed_copy}")
 }
 
 fn failures(store: &MemoryStore, limit: usize, json: bool, palette: Palette) -> anyhow::Result<()> {
@@ -137,6 +190,10 @@ fn failures(store: &MemoryStore, limit: usize, json: bool, palette: Palette) -> 
 	if json {
 		return output::json_line(&failures);
 	}
+	if failures.is_empty() {
+		return output::stdout_line("No failed memory jobs.");
+	}
+	output::stdout_line(&palette.bold("Failed memory jobs"))?;
 	for failure in failures {
 		let kind = match failure.kind {
 			MemoryJobKind::Compaction => "compaction",
@@ -144,14 +201,18 @@ fn failures(store: &MemoryStore, limit: usize, json: bool, palette: Palette) -> 
 			_ => "unknown",
 		};
 		output::stdout_line(&format!(
-			"{}  {kind:<12}  {} failure(s)  {}  {}",
+			"  {}  {kind} · {} · {}",
 			palette.red(&failure.id.to_string()),
-			failure.failures,
+			counted_u32(failure.failures, "failure", "failures"),
 			failure.failed_at,
-			output::terminal_safe_inline(&failure.error)
 		))?;
+		output::stdout_line(&failure_detail_line(&failure.error))?;
 	}
 	Ok(())
+}
+
+fn failure_detail_line(error: &str) -> String {
+	format!("    {}", output::terminal_safe_inline(error))
 }
 
 fn sessions(
@@ -170,6 +231,9 @@ fn sessions(
 			if json {
 				output::json_line(&page)
 			} else {
+				if page.items.is_empty() {
+					return output::stdout_line(sessions_empty_message(all));
+				}
 				for session in page.items {
 					output::stdout_line(&format!(
 						"{}  {}  {}",
@@ -203,41 +267,15 @@ fn sessions(
 			session,
 			all,
 			accept_unknown_effects,
-		} => {
-			let session_record = scoped_session(emelex, store, session, all)?;
-			let recovery_workspace = if all {
-				session_record.workspace.as_path()
-			} else {
-				emelex.invocation_root()
-			};
-			let report = store
-				.recover_interrupted_agent_turn(session, recovery_workspace, accept_unknown_effects)
-				.with_context(|| format!("recover interrupted agent turn for session {session}"))?;
-			if json {
-				output::json_line(&serde_json::json!({
-					"type": if report.interrupted_turn {
-						"interrupted_agent_turn_recovered"
-					} else {
-						"interrupted_tool_batch_recovered"
-					},
-					"report": report,
-				}))
-			} else if report.interrupted_turn {
-				output::stdout_line(&format!(
-					"recovered interrupted agent turn {}",
-					report.session_id
-				))
-			} else {
-				output::stdout_line(&format!(
-					"recovered {}: {} exact, {} uncertain, {} not executed; no tool was \
-					 re-invoked",
-					report.session_id,
-					report.exact_results,
-					report.uncertain_results,
-					report.not_executed_results
-				))
-			}
-		}
+		} => recover_session(
+			emelex,
+			store,
+			session,
+			all,
+			accept_unknown_effects,
+			json,
+			palette,
+		),
 		SessionsCommand::Delete { session, all } => {
 			scoped_session(emelex, store, session, all)?;
 			store
@@ -246,9 +284,77 @@ fn sessions(
 			if json {
 				output::json_line(&serde_json::json!({"deleted_session": session}))
 			} else {
-				output::stdout_line(&format!("deleted {session}"))
+				output::stdout_line(&success_with_id(
+					palette,
+					"Session deleted",
+					&session.to_string(),
+				))
 			}
 		}
+	}
+}
+
+fn recover_session(
+	emelex: &Emelex,
+	store: &MemoryStore,
+	session: uuid::Uuid,
+	all_workspaces: bool,
+	accept_unknown_effects: bool,
+	json: bool,
+	palette: Palette,
+) -> anyhow::Result<()> {
+	let session_record = scoped_session(emelex, store, session, all_workspaces)?;
+	let recovery_workspace = if all_workspaces {
+		session_record.workspace.as_path()
+	} else {
+		emelex.invocation_root()
+	};
+	let report = store
+		.recover_interrupted_agent_turn(session, recovery_workspace, accept_unknown_effects)
+		.with_context(|| format!("recover interrupted agent turn for session {session}"))?;
+	if json {
+		return output::json_line(&serde_json::json!({
+			"type": if report.interrupted_turn {
+				"interrupted_agent_turn_recovered"
+			} else {
+				"interrupted_tool_batch_recovered"
+			},
+			"report": report,
+		}));
+	}
+	if report.interrupted_turn {
+		return output::stdout_line(&success_with_id(
+			palette,
+			"Agent turn recovered",
+			&report.session_id.to_string(),
+		));
+	}
+	output::stdout_line(&success_with_id(
+		palette,
+		"Tool batch recovered",
+		&report.session_id.to_string(),
+	))?;
+	output::stdout_line(&format!(
+		"  {} · {} · {}; no tools re-run",
+		counted(report.exact_results, "exact result", "exact results"),
+		counted(
+			report.uncertain_results,
+			"uncertain result",
+			"uncertain results"
+		),
+		counted(
+			report.not_executed_results,
+			"result not executed",
+			"results not executed"
+		)
+	))
+}
+
+const fn sessions_empty_message(all_workspaces: bool) -> &'static str {
+	if all_workspaces {
+		"No sessions found."
+	} else {
+		"No sessions in this workspace."
 	}
 }
 
@@ -265,13 +371,18 @@ fn knowledge(
 			let page = store
 				.knowledge_for_workspace(workspace, None, limit)
 				.context("list workspace Knowledge")?;
-			present_knowledge(&page.items, json, palette)
+			present_knowledge(
+				&page.items,
+				json,
+				palette,
+				"No Knowledge entries in this workspace.",
+			)
 		}
 		KnowledgeCommand::Search { query, limit } => {
 			let items = store
 				.search_knowledge(workspace, &query, limit)
 				.context("search workspace Knowledge")?;
-			present_knowledge(&items, json, palette)
+			present_knowledge(&items, json, palette, "No Knowledge matched this search.")
 		}
 		KnowledgeCommand::Show { knowledge } => {
 			let entry = workspace_knowledge(store, workspace, knowledge)?;
@@ -296,25 +407,25 @@ fn knowledge(
 			store
 				.activate_knowledge(workspace, knowledge, version)
 				.context("activate Knowledge version")?;
-			mutation_result(json, "activated", knowledge)
+			mutation_result(json, palette, "activated", knowledge)
 		}
 		KnowledgeCommand::Pin { knowledge } => {
 			store
 				.set_knowledge_pinned(workspace, knowledge, true)
 				.context("pin Knowledge")?;
-			mutation_result(json, "pinned", knowledge)
+			mutation_result(json, palette, "pinned", knowledge)
 		}
 		KnowledgeCommand::Unpin { knowledge } => {
 			store
 				.set_knowledge_pinned(workspace, knowledge, false)
 				.context("unpin Knowledge")?;
-			mutation_result(json, "unpinned", knowledge)
+			mutation_result(json, palette, "unpinned", knowledge)
 		}
 		KnowledgeCommand::Forget { knowledge } => {
 			store
 				.delete_knowledge(workspace, knowledge)
 				.context("forget Knowledge")?;
-			mutation_result(json, "forgotten", knowledge)
+			mutation_result(json, palette, "forgotten", knowledge)
 		}
 	}
 }
@@ -357,28 +468,69 @@ fn workspace_knowledge(
 	Ok(entry)
 }
 
-fn mutation_result(json: bool, action: &str, id: uuid::Uuid) -> anyhow::Result<()> {
+fn mutation_result(
+	json: bool,
+	palette: Palette,
+	action: &str,
+	id: uuid::Uuid,
+) -> anyhow::Result<()> {
 	if json {
 		output::json_line(&serde_json::json!({"action": action, "knowledge": id}))
 	} else {
-		output::stdout_line(&format!("{action} {id}"))
+		output::stdout_line(&success_with_id(
+			palette,
+			&format!("Knowledge {action}"),
+			&id.to_string(),
+		))
 	}
 }
 
-fn present_knowledge(items: &[Knowledge], json: bool, palette: Palette) -> anyhow::Result<()> {
+fn present_knowledge(
+	items: &[Knowledge],
+	json: bool,
+	palette: Palette,
+	empty_message: &str,
+) -> anyhow::Result<()> {
 	if json {
 		return output::json_line(&items);
 	}
+	if items.is_empty() {
+		return output::stdout_line(empty_message);
+	}
 	for entry in items {
 		output::stdout_line(&format!(
-			"{}  v{}  {}{}",
+			"{}  v{}{}  {}",
 			palette.cyan(&entry.id.to_string()),
 			entry.active_version,
-			if entry.pinned { "pinned  " } else { "" },
+			if entry.pinned {
+				format!(" · {}", palette.yellow("pinned"))
+			} else {
+				String::new()
+			},
 			output::terminal_safe_inline(&entry.key)
 		))?;
 	}
 	Ok(())
+}
+
+fn success_with_id(palette: Palette, action: &str, id: &str) -> String {
+	format!(
+		"{}  {}",
+		palette.green(&format!("✓ {action}")),
+		palette.cyan(&output::terminal_safe_inline(id))
+	)
+}
+
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+	format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+fn counted_u64(count: u64, singular: &str, plural: &str) -> String {
+	format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+fn counted_u32(count: u32, singular: &str, plural: &str) -> String {
+	format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
 fn write_workspace_export(
@@ -533,4 +685,52 @@ fn write_json(
 ) -> anyhow::Result<()> {
 	serde_json::to_writer(&mut *writer, value)
 		.with_context(|| format!("encode {label} for memory export"))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::style::ColorMode;
+
+	#[test]
+	fn status_rows_align_and_queue_state_stays_explicit() {
+		let palette = Palette::stdout(ColorMode::Never);
+		assert_eq!(
+			status_row("Database", "1.5 KiB"),
+			"  Database       1.5 KiB"
+		);
+		assert_eq!(queue_summary(0, 0, palette), "0 pending · 0 failed");
+		assert_eq!(queue_summary(1, 2, palette), "1 pending · 2 failed");
+	}
+
+	#[test]
+	fn human_counts_use_singular_and_plural_grammar() {
+		assert_eq!(counted(0, "session", "sessions"), "0 sessions");
+		assert_eq!(counted(1, "session", "sessions"), "1 session");
+		assert_eq!(counted(2, "session", "sessions"), "2 sessions");
+		assert_eq!(counted_u32(1, "failure", "failures"), "1 failure");
+		assert_eq!(counted_u64(2, "asset", "assets"), "2 assets");
+	}
+
+	#[test]
+	fn empty_states_are_specific_to_scope() {
+		assert_eq!(
+			sessions_empty_message(false),
+			"No sessions in this workspace."
+		);
+		assert_eq!(sessions_empty_message(true), "No sessions found.");
+	}
+
+	#[test]
+	fn crafted_rows_neutralize_untrusted_inline_fields() {
+		let palette = Palette::stdout(ColorMode::Never);
+		assert_eq!(
+			failure_detail_line("bad\nrow\tvalue\u{202e}"),
+			"    bad\u{240a}row\u{2409}value\u{fffd}"
+		);
+		assert_eq!(
+			success_with_id(palette, "Session deleted", "id\nforged"),
+			"✓ Session deleted  id\u{240a}forged"
+		);
+	}
 }

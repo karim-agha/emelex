@@ -138,24 +138,82 @@ fn render_report(report: &DoctorReport, json: bool, palette: Palette) -> anyhow:
 	if json {
 		output::json_line(report)?;
 	} else {
-		output::stdout_line(&format!(
-			"Emelex Home  {}",
-			output::terminal_safe_inline(&report.home)
-		))?;
-		for check in &report.checks {
-			let status = if check.ok {
-				palette.green("ok")
-			} else {
-				palette.red("fail")
-			};
-			output::stdout_line(&format!(
-				"{status}  {}  {}",
-				output::terminal_safe_inline(&check.name),
-				output::terminal_safe_inline(&check.detail)
-			))?;
+		for line in human_report_lines(report, palette) {
+			output::stdout_line(&line)?;
 		}
 	}
 	Ok(())
+}
+
+fn human_report_lines(report: &DoctorReport, palette: Palette) -> Vec<String> {
+	let labels = report
+		.checks
+		.iter()
+		.map(|check| doctor_check_label(&check.name))
+		.collect::<Vec<_>>();
+	let label_width = labels
+		.iter()
+		.map(|label| dialoguer::console::measure_text_width(label))
+		.max()
+		.unwrap_or(0);
+	let mut lines = vec![
+		palette.bold("Emelex doctor"),
+		format!(
+			"  {}  {}",
+			palette.dim("Home"),
+			output::terminal_safe_inline(&report.home)
+		),
+		String::new(),
+	];
+
+	for (check, label) in report.checks.iter().zip(labels) {
+		let status = if check.ok {
+			palette.green("✓")
+		} else {
+			palette.red("×")
+		};
+		let padding =
+			" ".repeat(label_width.saturating_sub(dialoguer::console::measure_text_width(&label)));
+		lines.push(format!(
+			"  {status} {label}{padding}  {}",
+			output::terminal_safe_inline(&check.detail)
+		));
+	}
+
+	lines.push(String::new());
+	let failed = report.checks.iter().filter(|check| !check.ok).count();
+	if failed == 0 {
+		lines.push(palette.green(&format!("✓ Ready · {}", check_count(report.checks.len()))));
+	} else {
+		lines.push(palette.red(&format!(
+			"× {failed} of {} checks failed",
+			report.checks.len()
+		)));
+	}
+	lines
+}
+
+fn doctor_check_label(name: &str) -> String {
+	let name = output::terminal_safe_inline(name);
+	if let Some(snapshot) = name.strip_prefix("model:") {
+		return format!("model {snapshot}");
+	}
+	match name.as_ref() {
+		"metal_budget" => "Metal budget".to_string(),
+		"runtime_asset" => "runtime asset".to_string(),
+		"mlx_engine" => "MLX engine".to_string(),
+		"model_inventory_entry" => "model inventory entry".to_string(),
+		"model_inventory" => "model inventory".to_string(),
+		_ => name.replace('_', " "),
+	}
+}
+
+fn check_count(count: usize) -> String {
+	if count == 1 {
+		"1 check passed".to_string()
+	} else {
+		format!("{count} checks passed")
+	}
 }
 
 fn check(name: &str, operation: impl FnOnce() -> anyhow::Result<serde_json::Value>) -> DoctorCheck {
@@ -201,5 +259,62 @@ mod tests {
 		let bounded = bounded(&text);
 		assert_eq!(bounded.chars().count(), MAX_DIAGNOSTIC_CHARS + 1);
 		assert!(bounded.ends_with('…'));
+	}
+
+	#[test]
+	fn human_report_is_aligned_sanitized_and_summarized() {
+		let report = DoctorReport {
+			ok: false,
+			home: "/tmp/emelex\nforged".to_string(),
+			checks: vec![
+				DoctorCheck {
+					name: "mlx_engine".to_string(),
+					ok: true,
+					detail: "ready".to_string(),
+					data: None,
+				},
+				DoctorCheck {
+					name: "model:abc\u{202e}".to_string(),
+					ok: false,
+					detail: "bad\nentry\u{1b}[2J".to_string(),
+					data: None,
+				},
+			],
+		};
+		let lines = human_report_lines(
+			&report,
+			Palette::stdout(super::super::style::ColorMode::Never),
+		);
+		assert_eq!(lines[0], "Emelex doctor");
+		assert_eq!(lines[1], "  Home  /tmp/emelex\u{240a}forged");
+		assert_eq!(lines[3], "  ✓ MLX engine  ready");
+		assert_eq!(
+			lines[4],
+			"  × model abc\u{fffd}  bad\u{240a}entry\u{241b}[2J"
+		);
+		assert_eq!(lines[6], "× 1 of 2 checks failed");
+		assert!(lines.iter().all(|line| !line.contains('\u{1b}')));
+	}
+
+	#[test]
+	fn successful_human_report_ends_with_ready_summary() {
+		let report = DoctorReport {
+			ok: true,
+			home: "/tmp/emelex".to_string(),
+			checks: vec![DoctorCheck {
+				name: "home".to_string(),
+				ok: true,
+				detail: "ready".to_string(),
+				data: None,
+			}],
+		};
+		let lines = human_report_lines(
+			&report,
+			Palette::stdout(super::super::style::ColorMode::Never),
+		);
+		assert_eq!(
+			lines.last().map(String::as_str),
+			Some("✓ Ready · 1 check passed")
+		);
 	}
 }

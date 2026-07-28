@@ -1,11 +1,11 @@
 //! Hugging Face discovery and download presentation.
 
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::{BTreeMap, BTreeSet, VecDeque},
 	future::Future,
 	io::{self, IsTerminal as _},
 	sync::{Arc, Mutex},
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
@@ -25,6 +25,7 @@ use super::{
 	args::HubCommand,
 	hub_auth_cmd, output,
 	style::{Palette, bytes, tokens},
+	terminal_ui::{LiveRegion, fit_line},
 };
 
 const EMPTY_SEARCH_MESSAGE: &str = "No compatible MLX models matched this search on this machine.";
@@ -47,11 +48,18 @@ pub(crate) async fn run(
 			if json {
 				output::json_line(&REMOTE_FILTERS)
 			} else {
+				output::stdout_line(&stdout_palette.bold("Remote model filters"))?;
+				output::stdout_line(
+					&stdout_palette.dim("Use with `emelex hub search --require <filter>`."),
+				)?;
 				for capability in REMOTE_FILTERS {
+					output::stdout_line("")?;
 					output::stdout_line(&format!(
-						"{:<42} {:<10} {}",
-						capability.filter, capability.evidence, capability.meaning
+						"  {}  {}",
+						stdout_palette.cyan(capability.filter),
+						stdout_palette.dim(capability.evidence)
 					))?;
+					output::stdout_line(&format!("    {}", capability.meaning))?;
 				}
 				Ok(())
 			}
@@ -132,8 +140,28 @@ async fn search(
 		.await?;
 		installed_hub_index(&snapshots)
 	};
+	let selection_enabled = search_selection_enabled(
+		json,
+		[
+			io::stdin().is_terminal(),
+			io::stdout().is_terminal(),
+			io::stderr().is_terminal(),
+		],
+	) && !page.items.is_empty();
+	let selected = if selection_enabled {
+		select_search_result(&page.items, &installed_hub, page.scanned, stdout_palette)?
+	} else {
+		None
+	};
 	if page.items.is_empty() {
 		output::stdout_line(empty_search_message(page.next_cursor.is_some()))?;
+	} else if let Some(selected) = selected {
+		let model = page
+			.items
+			.get(selected)
+			.context("Hub selection returned an invalid result index")?;
+		let status = search_install_status(&model.id, &model.revision, &installed_hub);
+		output::stdout_line(&render_search_model(model, status, stdout_palette))?;
 	} else {
 		for (index, model) in page.items.iter().enumerate() {
 			if index > 0 {
@@ -158,56 +186,9 @@ async fn search(
 	if let Some(cursor) = &page.next_cursor {
 		output::stderr_line(&stderr_palette.dim(&next_cursor_line(cursor)))?;
 	}
-	if search_selection_enabled(
-		json,
-		[
-			io::stdin().is_terminal(),
-			io::stdout().is_terminal(),
-			io::stderr().is_terminal(),
-		],
-	) && !page.items.is_empty()
-	{
-		select_search_result(
-			emelex,
-			&page.items,
-			&installed_hub,
-			stdout_palette,
-			stderr_palette,
-		)
-		.await?;
-	}
-	Ok(())
-}
-
-async fn select_search_result(
-	emelex: &Emelex,
-	items: &[HubModel],
-	installed: &InstalledHubIndex,
-	stdout_palette: Palette,
-	stderr_palette: Palette,
-) -> anyhow::Result<()> {
-	let (_, terminal_columns) = dialoguer::console::Term::stderr().size();
-	let label_width = usize::from(terminal_columns).saturating_sub(4).max(1);
-	let labels = items
-		.iter()
-		.map(|model| {
-			search_selection_label(
-				&model.id,
-				model.quantization,
-				search_install_status(&model.id, &model.revision, installed),
-				label_width,
-			)
-		})
-		.collect::<Vec<_>>();
-	let selected = dialoguer::Select::new()
-		.with_prompt("Choose a model to download")
-		.items(&labels)
-		.default(0)
-		.report(false)
-		.interact_opt()
-		.context("choose Hub model")?;
 	if let Some(selected) = selected {
-		let model = items
+		let model = page
+			.items
 			.get(selected)
 			.context("Hub selection returned an invalid result index")?;
 		download_revision(
@@ -221,6 +202,96 @@ async fn select_search_result(
 		.await?;
 	}
 	Ok(())
+}
+
+fn select_search_result(
+	items: &[HubModel],
+	installed: &InstalledHubIndex,
+	scanned: usize,
+	palette: Palette,
+) -> anyhow::Result<Option<usize>> {
+	let mut region = LiveRegion::stdout();
+	let result = run_search_selector(&mut region, items, installed, scanned, palette);
+	let cleanup = region.clear();
+	match (result, cleanup) {
+		(Ok(selected), Ok(())) => Ok(selected),
+		(Err(error), Ok(())) => Err(error),
+		(Ok(_), Err(error)) => Err(error.context("restore Hub search results terminal")),
+		(Err(error), Err(cleanup)) => {
+			Err(error.context(format!("also failed to restore terminal: {cleanup:#}")))
+		}
+	}
+}
+
+fn run_search_selector(
+	region: &mut LiveRegion,
+	items: &[HubModel],
+	installed: &InstalledHubIndex,
+	scanned: usize,
+	palette: Palette,
+) -> anyhow::Result<Option<usize>> {
+	if items.is_empty() {
+		return Ok(None);
+	}
+	if region.size().0 < 2 {
+		return Ok(None);
+	}
+	let mut selected = 0;
+	loop {
+		let frame = render_search_selector_frame(
+			items,
+			installed,
+			selected,
+			scanned,
+			region.size(),
+			palette,
+		);
+		region.draw(&frame)?;
+		match search_selector_action(&region.read_key()?, selected, items.len()) {
+			SearchSelectorAction::Move(next) => selected = next,
+			SearchSelectorAction::Select => return Ok(Some(selected)),
+			SearchSelectorAction::Cancel => return Ok(None),
+			SearchSelectorAction::Interrupt => anyhow::bail!("Hub model selection interrupted"),
+			SearchSelectorAction::Ignore => {}
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchSelectorAction {
+	Move(usize),
+	Select,
+	Cancel,
+	Interrupt,
+	Ignore,
+}
+
+fn search_selector_action(
+	key: &dialoguer::console::Key,
+	selected: usize,
+	item_count: usize,
+) -> SearchSelectorAction {
+	use dialoguer::console::Key;
+
+	if item_count == 0 {
+		return SearchSelectorAction::Cancel;
+	}
+	match key {
+		Key::ArrowDown | Key::Tab | Key::Char('j') => {
+			SearchSelectorAction::Move((selected + 1) % item_count)
+		}
+		Key::ArrowUp | Key::BackTab | Key::Char('k') => {
+			SearchSelectorAction::Move((selected + item_count - 1) % item_count)
+		}
+		Key::PageDown => SearchSelectorAction::Move(selected.saturating_add(5).min(item_count - 1)),
+		Key::PageUp => SearchSelectorAction::Move(selected.saturating_sub(5)),
+		Key::Home => SearchSelectorAction::Move(0),
+		Key::End => SearchSelectorAction::Move(item_count - 1),
+		Key::Enter | Key::Char(' ') => SearchSelectorAction::Select,
+		Key::Escape | Key::Char('q') => SearchSelectorAction::Cancel,
+		Key::CtrlC => SearchSelectorAction::Interrupt,
+		_ => SearchSelectorAction::Ignore,
+	}
 }
 
 type InstalledHubIndex = BTreeMap<HubModelId, BTreeSet<ResolvedRevision>>;
@@ -238,22 +309,6 @@ impl SearchInstallStatus {
 			Self::Downloaded => "downloaded",
 			Self::DifferentRevision => "different revision downloaded",
 			Self::NotDownloaded => "not downloaded",
-		}
-	}
-
-	const fn selector_label(self) -> &'static str {
-		match self {
-			Self::Downloaded => "downloaded",
-			Self::DifferentRevision => "other revision",
-			Self::NotDownloaded => "not downloaded",
-		}
-	}
-
-	const fn selector_code(self) -> &'static str {
-		match self {
-			Self::Downloaded => "D",
-			Self::DifferentRevision => "R",
-			Self::NotDownloaded => "N",
 		}
 	}
 }
@@ -291,49 +346,6 @@ const fn search_selection_enabled(
 	!json && stdin_is_terminal && stdout_is_terminal && stderr_is_terminal
 }
 
-fn search_selection_label(
-	id: &HubModelId,
-	quantization: HubQuantization,
-	status: SearchInstallStatus,
-	max_width: usize,
-) -> String {
-	const MIN_ID_WIDTH: usize = 12;
-	let full_prefix = format!(
-		"[{:<14}] [{:<14}] ",
-		status.selector_label(),
-		compact_quantization(quantization),
-	);
-	let status_prefix = format!("[{}] ", status.selector_label());
-	let code_prefix = format!("[{}] ", status.selector_code());
-	let prefix = [
-		full_prefix.as_str(),
-		status_prefix.as_str(),
-		code_prefix.as_str(),
-	]
-	.into_iter()
-	.find(|prefix| dialoguer::console::measure_text_width(prefix) + MIN_ID_WIDTH <= max_width)
-	.unwrap_or("");
-	let id_width = max_width.saturating_sub(dialoguer::console::measure_text_width(prefix));
-	let id = truncate_middle_ascii(id.as_str(), id_width);
-	format!("{prefix}{id}")
-}
-
-fn truncate_middle_ascii(value: &str, width: usize) -> String {
-	if value.len() <= width {
-		return value.to_string();
-	}
-	if width == 0 {
-		return String::new();
-	}
-	if width == 1 {
-		return "…".to_string();
-	}
-	let retained = width - 1;
-	let head = retained.div_ceil(2);
-	let tail = retained / 2;
-	format!("{}…{}", &value[..head], &value[value.len() - tail..])
-}
-
 fn render_search_model(model: &HubModel, status: SearchInstallStatus, palette: Palette) -> String {
 	let sizing = model.traits.sizing.as_ref();
 	render_search_card(
@@ -355,6 +367,194 @@ fn render_search_model(model: &HubModel, status: SearchInstallStatus, palette: P
 		},
 		palette,
 	)
+}
+
+fn render_search_selector_frame(
+	items: &[HubModel],
+	installed: &InstalledHubIndex,
+	selected: usize,
+	scanned: usize,
+	(rows, columns): (u16, u16),
+	palette: Palette,
+) -> String {
+	let rows = usize::from(rows).saturating_sub(1);
+	let columns = usize::from(columns).max(1);
+	if rows == 0 {
+		return String::new();
+	}
+	let selected = selected.min(items.len().saturating_sub(1));
+	if rows <= 2 {
+		return render_tiny_search_selector(items, installed, selected, rows, columns, palette);
+	}
+	let compact = columns < 48 || rows < 12;
+	let cards = items
+		.iter()
+		.enumerate()
+		.map(|(index, model)| {
+			search_selector_card(
+				model,
+				search_install_status(&model.id, &model.revision, installed),
+				index == selected,
+				compact,
+				columns,
+				palette,
+			)
+		})
+		.collect::<Vec<_>>();
+	let mut frame = Vec::new();
+	if rows >= 4 {
+		frame.push(fit_line(&palette.bold("Compatible MLX models"), columns));
+	}
+	if rows >= 6 {
+		frame.push(fit_line(
+			&palette.dim(&search_summary_line(items.len(), scanned)),
+			columns,
+		));
+	}
+	if rows >= 9 {
+		frame.push(String::new());
+	}
+	let footer_rows = 1;
+	let card_budget = rows
+		.saturating_sub(frame.len())
+		.saturating_sub(footer_rows)
+		.max(1);
+	let (start, end) = search_selector_window(&cards, selected, card_budget);
+	let mut used = 0;
+	for (offset, card) in cards[start..end].iter().enumerate() {
+		if offset > 0 && used < card_budget {
+			frame.push(String::new());
+			used += 1;
+		}
+		for line in card {
+			if used == card_budget {
+				break;
+			}
+			frame.push(line.clone());
+			used += 1;
+		}
+	}
+	let position = format!("{}/{}", selected + 1, items.len());
+	let footer = if columns < 52 {
+		format!("↑↓ move · enter · esc · {position}")
+	} else {
+		format!("↑↓ move  ·  enter download  ·  esc close  ·  {position}")
+	};
+	frame.push(fit_line(&palette.dim(&footer), columns));
+	frame.truncate(rows);
+	frame.join("\n")
+}
+
+fn render_tiny_search_selector(
+	items: &[HubModel],
+	installed: &InstalledHubIndex,
+	selected: usize,
+	rows: usize,
+	columns: usize,
+	palette: Palette,
+) -> String {
+	let model = &items[selected];
+	let quantization = compact_quantization(model.quantization);
+	if rows == 1 {
+		return fit_line(
+			&format!("{} {quantization} · {}", palette.cyan("❯"), model.id),
+			columns,
+		);
+	}
+	let status = search_install_status(&model.id, &model.revision, installed);
+	let status = match status {
+		SearchInstallStatus::Downloaded => palette.green(status.label()),
+		SearchInstallStatus::DifferentRevision => palette.yellow(status.label()),
+		SearchInstallStatus::NotDownloaded => palette.dim(status.label()),
+	};
+	[
+		fit_line(&format!("{} {}", palette.cyan("❯"), model.id), columns),
+		fit_line(
+			&format!(
+				"  {quantization} · {status} · {}/{} · ↑↓ enter esc",
+				selected + 1,
+				items.len()
+			),
+			columns,
+		),
+	]
+	.join("\n")
+}
+
+fn search_selector_card(
+	model: &HubModel,
+	status: SearchInstallStatus,
+	selected: bool,
+	compact: bool,
+	columns: usize,
+	palette: Palette,
+) -> Vec<String> {
+	let rendered = if compact {
+		let status = match status {
+			SearchInstallStatus::Downloaded => palette.green(status.label()),
+			SearchInstallStatus::DifferentRevision => palette.yellow(status.label()),
+			SearchInstallStatus::NotDownloaded => palette.dim(status.label()),
+		};
+		let weights = model
+			.traits
+			.sizing
+			.as_ref()
+			.and_then(|sizing| sizing.weights_bytes);
+		format!(
+			"{}\n  {} · {} · {} weights",
+			palette.cyan(model.id.as_str()),
+			status,
+			compact_quantization(model.quantization),
+			optional_bytes(weights),
+		)
+	} else {
+		render_search_model(model, status, palette)
+	};
+	rendered
+		.lines()
+		.enumerate()
+		.map(|(line_index, line)| {
+			let rail = match (selected, line_index) {
+				(true, 0) => palette.cyan("❯"),
+				(true, _) => palette.cyan("┃"),
+				(false, _) => " ".to_string(),
+			};
+			fit_line(&format!("{rail} {line}"), columns)
+		})
+		.collect()
+}
+
+fn search_selector_window(cards: &[Vec<String>], selected: usize, budget: usize) -> (usize, usize) {
+	if cards.is_empty() {
+		return (0, 0);
+	}
+	let selected = selected.min(cards.len() - 1);
+	let mut start = selected;
+	let mut end = selected + 1;
+	let mut used = cards[selected].len().min(budget);
+	loop {
+		let next_cost = cards.get(end).map(|card| card.len().saturating_add(1));
+		if let Some(cost) = next_cost
+			&& used.saturating_add(cost) <= budget
+		{
+			used += cost;
+			end += 1;
+			continue;
+		}
+		let previous_cost = start
+			.checked_sub(1)
+			.and_then(|index| cards.get(index))
+			.map(|card| card.len().saturating_add(1));
+		if let Some(cost) = previous_cost
+			&& used.saturating_add(cost) <= budget
+		{
+			used += cost;
+			start -= 1;
+			continue;
+		}
+		break;
+	}
+	(start, end)
 }
 
 struct SearchCardData<'a> {
@@ -596,75 +796,88 @@ async fn inspect(
 		return output::json_line(&model);
 	}
 	output::stdout_line(&stdout_palette.bold(model.id.as_str()))?;
-	output::stdout_line(&format!("revision  {}", model.revision))?;
-	output::stdout_line(&format!("downloads {}", model.downloads))?;
-	output::stdout_line(&format!("likes     {}", model.likes))?;
-	output::stdout_line(&format!(
-		"license   {}",
-		output::terminal_safe_inline(model.license.as_deref().unwrap_or("not declared"))
+	output::stdout_line(&stdout_palette.dim("Hugging Face model"))?;
+	output::stdout_line("")?;
+	output::stdout_line(&inspect_field("Revision", &model.revision.to_string()))?;
+	output::stdout_line(&inspect_field("Downloads", &model.downloads.to_string()))?;
+	output::stdout_line(&inspect_field("Likes", &model.likes.to_string()))?;
+	output::stdout_line(&inspect_field(
+		"License",
+		output::terminal_safe_inline(model.license.as_deref().unwrap_or("not declared")).as_ref(),
 	))?;
-	output::stdout_line(&format!("traits    {}", trait_summary(&model.traits)))?;
-	output::stdout_line(&format!(
-		"weights   {}",
-		optional_bytes(
+	output::stdout_line(&inspect_field(
+		"Quantization",
+		&quantization_summary(model.quantization),
+	))?;
+	output::stdout_line(&inspect_field("Traits", &trait_summary(&model.traits)))?;
+	output::stdout_line(&inspect_field(
+		"Weights",
+		&optional_bytes(
 			model
 				.traits
 				.sizing
 				.as_ref()
-				.and_then(|sizing| sizing.weights_bytes)
-		)
+				.and_then(|sizing| sizing.weights_bytes),
+		),
 	))?;
-	output::stdout_line(&format!(
-		"residency {}",
-		optional_bytes(
+	output::stdout_line(&inspect_field(
+		"Memory",
+		&optional_bytes(
 			model
 				.traits
 				.sizing
 				.as_ref()
-				.and_then(|sizing| sizing.estimated_residency_bytes)
-		)
+				.and_then(|sizing| sizing.estimated_residency_bytes),
+		),
 	))?;
-	output::stdout_line(&format!(
-		"context   {}",
-		model
-			.traits
-			.sizing
-			.as_ref()
-			.and_then(|sizing| sizing.max_context_tokens)
-			.map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string())
-	))?;
-	output::stdout_line(&format!(
-		"compatible {}",
-		if model.compatible { "yes" } else { "no" }
-	))?;
-	if let Some(fit) = &model.fit {
-		output::stdout_line(&format!(
-			"fit       {} ({} required / {} budget)",
-			if fit.fits { "yes" } else { "no" },
-			bytes(fit.required_bytes),
-			bytes(fit.budget_bytes)
-		))?;
+	let context = model
+		.traits
+		.sizing
+		.as_ref()
+		.and_then(|sizing| sizing.max_context_tokens)
+		.map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string());
+	output::stdout_line(&inspect_field("Context", &context))?;
+	let compatibility = if model.compatible {
+		stdout_palette.green("compatible")
 	} else {
-		output::stdout_line("fit       unknown")?;
-	}
+		stdout_palette.red("incompatible")
+	};
+	output::stdout_line(&inspect_field("Status", &compatibility))?;
+	let fit = model.fit.as_ref().map_or_else(
+		|| "unknown".to_string(),
+		|fit| {
+			format!(
+				"{} · {} required / {} budget",
+				if fit.fits { "fits" } else { "does not fit" },
+				bytes(fit.required_bytes),
+				bytes(fit.budget_bytes)
+			)
+		},
+	);
+	output::stdout_line(&inspect_field("Machine fit", &fit))?;
 	let visible_diagnostics = if verbose {
 		model.diagnostics.len()
 	} else {
 		model.diagnostics.len().min(10)
 	};
+	if visible_diagnostics > 0 {
+		output::stdout_line("")?;
+		output::stdout_line(&stdout_palette.yellow("Compatibility notes"))?;
+	}
 	for diagnostic in model.diagnostics.iter().take(visible_diagnostics) {
-		output::stdout_line(&format!(
-			"diagnostic {}",
-			output::terminal_safe_inline(diagnostic)
-		))?;
+		output::stdout_line(&format!("  ! {}", output::terminal_safe_inline(diagnostic)))?;
 	}
 	if visible_diagnostics < model.diagnostics.len() {
-		output::stdout_line(&format!(
-			"diagnostic {} more omitted; rerun with --verbose or --json",
+		output::stdout_line(&stdout_palette.dim(&format!(
+			"  {} more omitted · rerun with --verbose or --json",
 			model.diagnostics.len() - visible_diagnostics
-		))?;
+		)))?;
 	}
 	Ok(())
+}
+
+fn inspect_field(label: &str, value: &str) -> String {
+	format!("  {label:<14}{value}")
 }
 
 pub(crate) async fn wait_for_hub<T>(
@@ -705,36 +918,37 @@ struct TtyProgress {
 	label: &'static str,
 	enabled: bool,
 	frame: usize,
-	rendered: bool,
+	region: Option<LiveRegion>,
 }
 
 impl TtyProgress {
-	const FRAMES: [&'static str; 4] = ["⠋", "⠙", "⠹", "⠸"];
+	const FRAMES: [&'static str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-	const fn new(label: &'static str, enabled: bool) -> Self {
+	fn new(label: &'static str, enabled: bool) -> Self {
 		Self {
 			label,
 			enabled,
 			frame: 0,
-			rendered: false,
+			region: enabled.then(LiveRegion::stderr),
 		}
 	}
 
 	fn tick(&mut self) -> anyhow::Result<()> {
-		output::stderr(&format!(
-			"\r{} {}",
+		let Some(region) = &mut self.region else {
+			return Ok(());
+		};
+		region.draw(&format!(
+			"{} {}…",
 			Self::FRAMES[self.frame % Self::FRAMES.len()],
 			self.label
 		))?;
 		self.frame = self.frame.wrapping_add(1);
-		self.rendered = true;
 		Ok(())
 	}
 
 	fn clear(&mut self) -> anyhow::Result<()> {
-		if self.enabled && self.rendered {
-			output::stderr(&format!("\r{}\r", " ".repeat(self.label.len() + 2)))?;
-			self.rendered = false;
+		if let Some(region) = &mut self.region {
+			region.clear()?;
 		}
 		Ok(())
 	}
@@ -777,38 +991,45 @@ async fn download_selected(
 	stdout_palette: Palette,
 	stderr_palette: Palette,
 ) -> anyhow::Result<InstalledModel> {
-	let (observer, output_error) = download_observer(json, stderr_palette);
-	let cancellation = DownloadCancellation::default();
 	let models = emelex.models().context("initialize model manager")?;
+	let cancellation = DownloadCancellation::default();
+	let presentation = DownloadPresentation::new(model, json, stderr_palette, cancellation.clone());
 	let watcher = DownloadCancellationWatcher::spawn(cancellation.clone(), tokio::signal::ctrl_c());
 	let result = match revision {
 		Some(revision) => {
 			models
-				.download_revision_controlled(model, revision, Some(&observer), Some(&cancellation))
+				.download_revision_controlled(
+					model,
+					revision,
+					Some(presentation.observer()),
+					Some(&cancellation),
+				)
 				.await
 		}
 		None => {
 			models
-				.download_controlled(model, Some(&observer), Some(&cancellation))
+				.download_controlled(model, Some(presentation.observer()), Some(&cancellation))
 				.await
 		}
 	};
-	watcher.finish().await?;
-	let observer_error = output_error
-		.lock()
-		.unwrap_or_else(std::sync::PoisonError::into_inner)
-		.take();
-	if let Some(error) = observer_error {
-		return Err(error);
-	}
+	let watcher_result = watcher.finish().await;
+	let presentation_result = presentation.finish().await;
+	watcher_result?;
+	presentation_result?;
 	let installed = result.with_context(|| format!("download {model}"))?;
 	if json {
 		output::json_line(&installed_json(&installed))
 	} else {
 		output::stdout_line(&format!(
 			"{} {}",
-			stdout_palette.green("installed"),
-			output::terminal_safe_inline(&installed.path().display().to_string())
+			stdout_palette.green("✓ Installed"),
+			stdout_palette.bold(&installed.reference().to_string())
+		))?;
+		output::stdout_line(&format!(
+			"  {}",
+			stdout_palette.dim(&output::terminal_safe_inline(
+				&installed.path().display().to_string()
+			))
 		))
 	}?;
 	Ok(installed)
@@ -872,96 +1093,131 @@ impl Drop for DownloadCancellationWatcher {
 	}
 }
 
-fn download_observer(
-	json: bool,
-	stderr_palette: Palette,
-) -> (DownloadObserver, Arc<Mutex<Option<anyhow::Error>>>) {
-	let progress = Arc::new(Mutex::new(BTreeMap::<String, u64>::new()));
-	let output_error = Arc::new(Mutex::new(None));
-	let observer_error = Arc::clone(&output_error);
-	let observer = Arc::new(move |event: &DownloadEvent| {
-		let rendered = if json {
-			let value = match event {
-				DownloadEvent::FileStarted {
-					path,
-					resumed,
-					total,
-				} => serde_json::json!({
-					"type": "download_file_started",
-					"path": path,
-					"resumed": resumed,
-					"total": total,
-				}),
-				DownloadEvent::Progress {
-					path,
-					received,
-					total,
-				} => serde_json::json!({
-					"type": "download_progress",
-					"path": path,
-					"received": received,
-					"total": total,
-				}),
-				DownloadEvent::Retrying {
-					path,
-					attempt,
-					reason,
-				} => serde_json::json!({
-					"type": "download_retrying",
-					"path": path,
-					"attempt": attempt,
-					"reason": reason,
-				}),
-				DownloadEvent::FileVerified { path, sha256 } => serde_json::json!({
-					"type": "download_file_verified",
-					"path": path,
-					"sha256": sha256,
-				}),
-				_ => return Ok(DownloadControl::Continue),
-			};
-			output::json_line(&value)
-		} else {
-			render_human_download_event(event, stderr_palette, &progress)
-		};
-		if let Err(error) = rendered {
-			*observer_error
-				.lock()
-				.unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
-			return Ok(DownloadControl::Cancel);
-		}
-		Ok(DownloadControl::Continue)
-	});
-	(observer, output_error)
+struct DownloadPresentation {
+	observer: DownloadObserver,
+	output_error: Arc<Mutex<Option<anyhow::Error>>>,
+	live: Option<LiveDownloadTask>,
 }
 
-fn render_human_download_event(
-	event: &DownloadEvent,
-	palette: Palette,
-	progress: &Mutex<BTreeMap<String, u64>>,
-) -> anyhow::Result<()> {
-	let should_render = match event {
+impl DownloadPresentation {
+	fn new(
+		model: &HubModelId,
+		json: bool,
+		palette: Palette,
+		cancellation: DownloadCancellation,
+	) -> Self {
+		let state = Arc::new(Mutex::new(DownloadUiState::new(model)));
+		let output_error = Arc::new(Mutex::new(None));
+		let live_enabled = !json && io::stderr().is_terminal();
+		let live = live_enabled.then(|| {
+			LiveDownloadTask::spawn(
+				Arc::clone(&state),
+				Arc::clone(&output_error),
+				cancellation.clone(),
+				palette,
+			)
+		});
+		let observer_error = Arc::clone(&output_error);
+		let observer_state = Arc::clone(&state);
+		let observer_cancellation = cancellation;
+		let observer = Arc::new(move |event: &DownloadEvent| {
+			if observer_error
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.is_some()
+			{
+				return Ok(DownloadControl::Cancel);
+			}
+			let rendered = if json {
+				json_download_event(event).map_or(Ok(()), |value| output::json_line(&value))
+			} else if live_enabled {
+				observer_state
+					.lock()
+					.unwrap_or_else(std::sync::PoisonError::into_inner)
+					.observe(event, Instant::now());
+				Ok(())
+			} else {
+				render_human_download_event(event, palette)
+			};
+			if let Err(error) = rendered {
+				record_output_error(&observer_error, error);
+				observer_cancellation.cancel();
+				return Ok(DownloadControl::Cancel);
+			}
+			Ok(DownloadControl::Continue)
+		});
+		Self {
+			observer,
+			output_error,
+			live,
+		}
+	}
+
+	fn observer(&self) -> &DownloadObserver {
+		&self.observer
+	}
+
+	async fn finish(mut self) -> anyhow::Result<()> {
+		let live_result = if let Some(live) = self.live.take() {
+			live.finish().await
+		} else {
+			Ok(())
+		};
+		let output_error = self
+			.output_error
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.take();
+		if let Some(error) = output_error {
+			return Err(error);
+		}
+		live_result
+	}
+}
+
+fn json_download_event(event: &DownloadEvent) -> Option<serde_json::Value> {
+	match event {
+		DownloadEvent::FileStarted {
+			path,
+			resumed,
+			total,
+		} => Some(serde_json::json!({
+			"type": "download_file_started",
+			"path": path,
+			"resumed": resumed,
+			"total": total,
+		})),
 		DownloadEvent::Progress {
 			path,
 			received,
 			total,
-		} => {
-			let step = (*total / 20).max(1);
-			{
-				let mut observed = progress
-					.lock()
-					.unwrap_or_else(std::sync::PoisonError::into_inner);
-				let previous = observed.entry(path.clone()).or_default();
-				let should_render = received.saturating_sub(*previous) >= step || received == total;
-				if should_render {
-					*previous = *received;
-				}
-				drop(observed);
-				should_render
-			}
-		}
-		_ => true,
-	};
-	let Some(line) = human_download_event_line(event).filter(|_| should_render) else {
+		} => Some(serde_json::json!({
+			"type": "download_progress",
+			"path": path,
+			"received": received,
+			"total": total,
+		})),
+		DownloadEvent::Retrying {
+			path,
+			attempt,
+			reason,
+		} => Some(serde_json::json!({
+			"type": "download_retrying",
+			"path": path,
+			"attempt": attempt,
+			"reason": reason,
+		})),
+		DownloadEvent::FileVerified { path, sha256 } => Some(serde_json::json!({
+			"type": "download_file_verified",
+			"path": path,
+			"sha256": sha256,
+		})),
+		_ => None,
+	}
+}
+
+fn render_human_download_event(event: &DownloadEvent, palette: Palette) -> anyhow::Result<()> {
+	let Some(line) = human_download_event_line(event) else {
 		return Ok(());
 	};
 	if matches!(event, DownloadEvent::Retrying { .. }) {
@@ -973,6 +1229,11 @@ fn render_human_download_event(
 
 fn human_download_event_line(event: &DownloadEvent) -> Option<String> {
 	match event {
+		DownloadEvent::TransferStarted { files, total } => Some(format!(
+			"downloading {} ({})",
+			counted(*files, "file", "files"),
+			bytes(*total)
+		)),
 		DownloadEvent::FileStarted {
 			path,
 			resumed,
@@ -984,14 +1245,6 @@ fn human_download_event_line(event: &DownloadEvent) -> Option<String> {
 				bytes(*resumed),
 				bytes(*total)
 			))
-		}
-		DownloadEvent::Progress {
-			path,
-			received,
-			total,
-		} => {
-			let path = output::terminal_safe_inline(path);
-			Some(format!("{path}: {} / {}", bytes(*received), bytes(*total)))
 		}
 		DownloadEvent::Retrying {
 			path,
@@ -1006,7 +1259,371 @@ fn human_download_event_line(event: &DownloadEvent) -> Option<String> {
 			let path = output::terminal_safe_inline(path);
 			Some(format!("verified {path}"))
 		}
+		DownloadEvent::TransferCompleted { files, total } => Some(format!(
+			"transferred {} ({})",
+			counted(*files, "file", "files"),
+			bytes(*total)
+		)),
 		_ => None,
+	}
+}
+
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+	format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadPhase {
+	Preparing,
+	Transferring,
+	Finalizing,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DownloadFileProgress {
+	received: u64,
+	total: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadRetry {
+	path: String,
+	attempt: usize,
+	reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadUiState {
+	model: String,
+	phase: DownloadPhase,
+	total_files: usize,
+	total_bytes: u64,
+	files: BTreeMap<String, DownloadFileProgress>,
+	verified: BTreeSet<String>,
+	current_path: Option<String>,
+	retry: Option<DownloadRetry>,
+	network_bytes: u64,
+	samples: VecDeque<(Instant, u64)>,
+	last_network_at: Option<Instant>,
+}
+
+impl DownloadUiState {
+	fn new(model: &HubModelId) -> Self {
+		Self {
+			model: model.to_string(),
+			phase: DownloadPhase::Preparing,
+			total_files: 0,
+			total_bytes: 0,
+			files: BTreeMap::new(),
+			verified: BTreeSet::new(),
+			current_path: None,
+			retry: None,
+			network_bytes: 0,
+			samples: VecDeque::new(),
+			last_network_at: None,
+		}
+	}
+
+	fn observe(&mut self, event: &DownloadEvent, now: Instant) {
+		match event {
+			DownloadEvent::TransferStarted { files, total } => {
+				self.phase = DownloadPhase::Transferring;
+				self.total_files = *files;
+				self.total_bytes = *total;
+				self.samples.clear();
+				self.samples.push_back((now, self.network_bytes));
+			}
+			DownloadEvent::FileStarted {
+				path,
+				resumed,
+				total,
+			} => {
+				self.phase = DownloadPhase::Transferring;
+				self.current_path = Some(path.clone());
+				self.retry = None;
+				let file = self.files.entry(path.clone()).or_default();
+				file.received = (*resumed).min(*total);
+				file.total = *total;
+			}
+			DownloadEvent::Progress {
+				path,
+				received,
+				total,
+			} => {
+				self.phase = DownloadPhase::Transferring;
+				self.current_path = Some(path.clone());
+				self.retry = None;
+				let file = self.files.entry(path.clone()).or_default();
+				let received = (*received).min(*total);
+				let delta = if received >= file.received {
+					received - file.received
+				} else {
+					received
+				};
+				file.received = received;
+				file.total = *total;
+				if delta > 0 {
+					self.network_bytes = self.network_bytes.saturating_add(delta);
+					self.last_network_at = Some(now);
+					self.samples.push_back((now, self.network_bytes));
+					self.prune_samples(now);
+				}
+			}
+			DownloadEvent::Retrying {
+				path,
+				attempt,
+				reason,
+			} => {
+				self.phase = DownloadPhase::Transferring;
+				self.current_path = Some(path.clone());
+				self.retry = Some(DownloadRetry {
+					path: path.clone(),
+					attempt: *attempt,
+					reason: reason.clone(),
+				});
+			}
+			DownloadEvent::FileVerified { path, .. } => {
+				self.current_path = Some(path.clone());
+				self.verified.insert(path.clone());
+				if let Some(file) = self.files.get_mut(path) {
+					file.received = file.total;
+				}
+				self.retry = None;
+			}
+			DownloadEvent::TransferCompleted { files, total } => {
+				self.phase = DownloadPhase::Finalizing;
+				self.total_files = *files;
+				self.total_bytes = *total;
+				self.retry = None;
+			}
+			_ => {}
+		}
+	}
+
+	fn prune_samples(&mut self, now: Instant) {
+		let cutoff = now.checked_sub(Duration::from_secs(3)).unwrap_or(now);
+		while self.samples.len() > 2
+			&& self
+				.samples
+				.get(1)
+				.is_some_and(|(timestamp, _)| *timestamp <= cutoff)
+		{
+			self.samples.pop_front();
+		}
+	}
+
+	fn received_bytes(&self) -> u64 {
+		if self.phase == DownloadPhase::Finalizing {
+			return self.total_bytes;
+		}
+		self.files
+			.values()
+			.map(|file| file.received.min(file.total))
+			.fold(0_u64, u64::saturating_add)
+			.min(self.total_bytes)
+	}
+
+	fn bytes_per_second(&self, now: Instant) -> Option<u64> {
+		if self
+			.last_network_at
+			.is_none_or(|last| now.saturating_duration_since(last) > Duration::from_secs(2))
+		{
+			return None;
+		}
+		let (first_at, first_bytes) = self.samples.front()?;
+		let (last_at, last_bytes) = self.samples.back()?;
+		let elapsed_millis = last_at.saturating_duration_since(*first_at).as_millis();
+		if elapsed_millis < 200 || last_bytes <= first_bytes {
+			return None;
+		}
+		let bytes = u128::from(*last_bytes - *first_bytes);
+		u64::try_from(bytes.saturating_mul(1_000) / elapsed_millis)
+			.ok()
+			.filter(|speed| *speed > 0)
+	}
+}
+
+struct LiveDownloadTask {
+	stop: Option<tokio::sync::oneshot::Sender<()>>,
+	task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LiveDownloadTask {
+	fn spawn(
+		state: Arc<Mutex<DownloadUiState>>,
+		output_error: Arc<Mutex<Option<anyhow::Error>>>,
+		cancellation: DownloadCancellation,
+		palette: Palette,
+	) -> Self {
+		let (stop, mut stopped) = tokio::sync::oneshot::channel();
+		let task = tokio::spawn(async move {
+			let mut region = LiveRegion::stderr();
+			let mut interval = tokio::time::interval(Duration::from_millis(80));
+			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			let mut frame = 0_usize;
+			loop {
+				tokio::select! {
+					_ = &mut stopped => break,
+					_ = interval.tick() => {
+						let snapshot = state
+							.lock()
+							.unwrap_or_else(std::sync::PoisonError::into_inner)
+							.clone();
+						let rendered = render_download_frame(
+							&snapshot,
+							frame,
+							Instant::now(),
+							usize::from(region.size().1).max(1),
+							palette,
+						);
+						if let Err(error) = region.draw(&rendered) {
+							record_output_error(&output_error, error);
+							cancellation.cancel();
+							break;
+						}
+						frame = frame.wrapping_add(1);
+					}
+				}
+			}
+			if let Err(error) = region.clear() {
+				record_output_error(&output_error, error);
+				cancellation.cancel();
+			}
+		});
+		Self {
+			stop: Some(stop),
+			task: Some(task),
+		}
+	}
+
+	async fn finish(mut self) -> anyhow::Result<()> {
+		if let Some(stop) = self.stop.take() {
+			let _ = stop.send(());
+		}
+		let Some(task) = self.task.take() else {
+			return Err(anyhow::anyhow!("download progress task is absent"));
+		};
+		task.await.context("join download progress task")
+	}
+}
+
+impl Drop for LiveDownloadTask {
+	fn drop(&mut self) {
+		if let Some(task) = &self.task {
+			task.abort();
+		}
+	}
+}
+
+fn record_output_error(
+	destination: &Mutex<Option<anyhow::Error>>,
+	error: impl Into<anyhow::Error>,
+) {
+	let mut destination = destination
+		.lock()
+		.unwrap_or_else(std::sync::PoisonError::into_inner);
+	if destination.is_none() {
+		*destination = Some(error.into());
+	}
+}
+
+fn render_download_frame(
+	state: &DownloadUiState,
+	frame: usize,
+	now: Instant,
+	columns: usize,
+	palette: Palette,
+) -> String {
+	const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+	let spinner = palette.cyan(FRAMES[frame % FRAMES.len()]);
+	let model = output::terminal_safe_inline(&state.model);
+	if state.phase == DownloadPhase::Preparing {
+		return fit_line(&format!("{spinner} Preparing {model}"), columns);
+	}
+	if state.phase == DownloadPhase::Finalizing {
+		return fit_line(&format!("{spinner} Finalizing {model}"), columns);
+	}
+	if let Some(retry) = &state.retry {
+		let path = output::terminal_safe_inline(&retry.path);
+		let reason = output::terminal_safe_inline(&retry.reason);
+		let line = format!(
+			"{} Retrying {path} · attempt {} · {reason}",
+			palette.yellow(FRAMES[frame % FRAMES.len()]),
+			retry.attempt
+		);
+		return fit_line(&line, columns);
+	}
+
+	let received = state.received_bytes();
+	let percent = received
+		.saturating_mul(100)
+		.checked_div(state.total_bytes)
+		.unwrap_or(0)
+		.min(100);
+	if columns < 52 {
+		return fit_line(
+			&format!(
+				"{spinner} Downloading {percent:>3}% · {}/{}",
+				bytes(received),
+				bytes(state.total_bytes)
+			),
+			columns,
+		);
+	}
+
+	let bar_width = if columns >= 96 {
+		24
+	} else if columns >= 72 {
+		16
+	} else {
+		10
+	};
+	let bar = progress_bar(percent, bar_width, palette);
+	let mut lines = vec![fit_line(
+		&format!("{spinner} Downloading  {bar}  {percent:>3}%"),
+		columns,
+	)];
+	let mut details = vec![
+		format!("{} / {}", bytes(received), bytes(state.total_bytes)),
+		format!("{}/{} verified", state.verified.len(), state.total_files),
+	];
+	if let Some(speed) = state.bytes_per_second(now) {
+		details.insert(1, format!("{}/s", bytes(speed)));
+		let remaining = state.total_bytes.saturating_sub(received);
+		details.insert(2, remaining_time(remaining.div_ceil(speed)));
+	}
+	lines.push(fit_line(
+		&palette.dim(&format!("  {}", details.join(" · "))),
+		columns,
+	));
+	if columns >= 72
+		&& let Some(path) = &state.current_path
+	{
+		lines.push(fit_line(
+			&palette.dim(&format!("  {}", output::terminal_safe_inline(path))),
+			columns,
+		));
+	}
+	lines.join("\n")
+}
+
+fn progress_bar(percent: u64, width: usize, palette: Palette) -> String {
+	let filled = usize::try_from(percent)
+		.unwrap_or(width)
+		.saturating_mul(width)
+		/ 100;
+	format!(
+		"{}{}",
+		palette.cyan(&"━".repeat(filled.min(width))),
+		palette.dim(&"─".repeat(width.saturating_sub(filled)))
+	)
+}
+
+fn remaining_time(seconds: u64) -> String {
+	if seconds < 60 {
+		format!("{seconds}s left")
+	} else {
+		format!("{}m {:02}s left", seconds / 60, seconds % 60)
 	}
 }
 
@@ -1066,6 +1683,34 @@ mod tests {
 			"has_layer_overrides": has_layer_overrides
 		}))
 		.expect("valid Hub quantization")
+	}
+
+	fn search_model(id: &str, revision_byte: char) -> HubModel {
+		let mut traits = ModelTraits::default();
+		traits.mlx = true;
+		traits.tasks.extend([Task::TextGeneration, Task::Chat]);
+		serde_json::from_value(serde_json::json!({
+			"id": id,
+			"revision": revision_byte.to_string().repeat(40),
+			"downloads": 42,
+			"likes": 7,
+			"tags": ["mlx"],
+			"library": "mlx",
+			"license": "apache-2.0",
+			"traits": traits,
+			"quantization": {
+				"kind": "configured",
+				"mode": "affine",
+				"bits": 4,
+				"group_size": 64,
+				"has_layer_overrides": false
+			},
+			"compatible": true,
+			"files": ["config.json", "model.safetensors"],
+			"diagnostics": [],
+			"fit": null
+		}))
+		.expect("valid Hub model fixture")
 	}
 
 	#[test]
@@ -1168,46 +1813,126 @@ mod tests {
 	}
 
 	#[test]
-	fn search_selection_label_stays_on_one_narrow_terminal_row() {
-		let id = HubModelId::parse("a".repeat(96)).expect("maximum-length Hub ID");
+	fn inline_search_selector_marks_the_cards_without_a_duplicate_list() {
+		let items = vec![
+			search_model("mlx-community/first-4bit", 'a'),
+			search_model("mlx-community/second-4bit", 'b'),
+			search_model("mlx-community/third-4bit", 'c'),
+		];
+		let mut installed = InstalledHubIndex::new();
+		installed
+			.entry(items[0].id.clone())
+			.or_default()
+			.insert(items[0].revision.clone());
 
-		let label = search_selection_label(
-			&id,
-			HubQuantization::NotConfigured,
-			SearchInstallStatus::DifferentRevision,
-			40,
+		let frame = render_search_selector_frame(
+			&items,
+			&installed,
+			1,
+			17,
+			(24, 80),
+			Palette::stdout(crate::style::ColorMode::Never),
 		);
 
-		assert!(dialoguer::console::measure_text_width(&label) <= 40);
-		assert!(label.starts_with("[other revision"));
-		assert!(label.contains('…'));
+		assert!(frame.contains("❯ mlx-community/second-4bit"));
+		assert!(frame.contains("┃   Status  not downloaded"));
+		assert!(frame.contains("Quant   4-bit affine · group 64"));
+		assert!(frame.contains("↑↓ move  ·  enter download  ·  esc close  ·  2/3"));
+		assert!(!frame.contains("Choose a model"));
+		assert_eq!(frame.matches('❯').count(), 1);
+		assert!(frame.lines().count() <= 24);
+		assert!(
+			frame
+				.lines()
+				.all(|line| dialoguer::console::measure_text_width(line) < 80)
+		);
 	}
 
 	#[test]
-	fn narrow_selection_labels_preserve_distinguishing_id_suffixes() {
-		let first = HubModelId::parse(format!("org/{}first", "a".repeat(80)))
-			.expect("maximum-length first Hub ID");
-		let second = HubModelId::parse(format!("org/{}second", "a".repeat(80)))
-			.expect("maximum-length second Hub ID");
+	fn inline_search_selector_adapts_to_a_narrow_terminal() {
+		let items = vec![
+			search_model("mlx-community/a-very-long-first-model-name-4bit", 'a'),
+			search_model("mlx-community/second-4bit", 'b'),
+		];
 
-		let first_label = search_selection_label(
-			&first,
-			HubQuantization::NotConfigured,
-			SearchInstallStatus::DifferentRevision,
-			24,
-		);
-		let second_label = search_selection_label(
-			&second,
-			HubQuantization::NotConfigured,
-			SearchInstallStatus::DifferentRevision,
-			24,
+		let frame = render_search_selector_frame(
+			&items,
+			&InstalledHubIndex::new(),
+			0,
+			200,
+			(8, 40),
+			Palette::stdout(crate::style::ColorMode::Never),
 		);
 
-		assert_ne!(first_label, second_label);
-		assert!(first_label.ends_with("first"));
-		assert!(second_label.ends_with("second"));
-		assert!(dialoguer::console::measure_text_width(&first_label) <= 24);
-		assert!(dialoguer::console::measure_text_width(&second_label) <= 24);
+		assert!(frame.contains('❯'));
+		assert!(frame.contains("4-bit"));
+		assert!(frame.contains("1/2"));
+		assert!(frame.lines().count() <= 8);
+		assert!(
+			frame
+				.lines()
+				.all(|line| dialoguer::console::measure_text_width(line) < 40)
+		);
+	}
+
+	#[test]
+	fn inline_search_selector_reserves_a_cursor_row_at_every_height() {
+		let items = vec![search_model("mlx-community/tiny-4bit", 'a')];
+		let palette = Palette::stdout(crate::style::ColorMode::Never);
+
+		for terminal_rows in 1..=5 {
+			let frame = render_search_selector_frame(
+				&items,
+				&InstalledHubIndex::new(),
+				0,
+				1,
+				(terminal_rows, 80),
+				palette,
+			);
+			assert!(frame.lines().count() < usize::from(terminal_rows));
+		}
+		let tiny =
+			render_search_selector_frame(&items, &InstalledHubIndex::new(), 0, 1, (3, 80), palette);
+		assert!(tiny.contains("4-bit"));
+		assert!(tiny.contains("not downloaded"));
+	}
+
+	#[test]
+	fn inline_search_selector_keys_navigate_and_select_exact_results() {
+		use dialoguer::console::Key;
+
+		assert_eq!(
+			search_selector_action(&Key::ArrowDown, 2, 3),
+			SearchSelectorAction::Move(0)
+		);
+		assert_eq!(
+			search_selector_action(&Key::ArrowUp, 0, 3),
+			SearchSelectorAction::Move(2)
+		);
+		assert_eq!(
+			search_selector_action(&Key::PageDown, 1, 10),
+			SearchSelectorAction::Move(6)
+		);
+		assert_eq!(
+			search_selector_action(&Key::Home, 8, 10),
+			SearchSelectorAction::Move(0)
+		);
+		assert_eq!(
+			search_selector_action(&Key::End, 1, 10),
+			SearchSelectorAction::Move(9)
+		);
+		assert_eq!(
+			search_selector_action(&Key::Enter, 1, 3),
+			SearchSelectorAction::Select
+		);
+		assert_eq!(
+			search_selector_action(&Key::Escape, 1, 3),
+			SearchSelectorAction::Cancel
+		);
+		assert_eq!(
+			search_selector_action(&Key::CtrlC, 1, 3),
+			SearchSelectorAction::Interrupt
+		);
 	}
 
 	#[test]
@@ -1289,11 +2014,6 @@ mod tests {
 				resumed: 1,
 				total: 2,
 			},
-			DownloadEvent::Progress {
-				path: "model\tforged".to_string(),
-				received: 1,
-				total: 2,
-			},
 			DownloadEvent::Retrying {
 				path: "model\u{202e}".to_string(),
 				attempt: 1,
@@ -1309,6 +2029,160 @@ mod tests {
 			assert!(!line.contains('\t'));
 			assert!(!line.contains('\u{202e}'));
 		}
+		assert!(
+			human_download_event_line(&DownloadEvent::Progress {
+				path: "model".to_string(),
+				received: 1,
+				total: 2,
+			})
+			.is_none()
+		);
+	}
+
+	#[test]
+	fn download_progress_aggregates_resumes_speed_and_verification() {
+		let id = HubModelId::parse("owner/model").expect("valid Hub ID");
+		let mut state = DownloadUiState::new(&id);
+		let started = Instant::now();
+		state.observe(
+			&DownloadEvent::TransferStarted {
+				files: 2,
+				total: 100,
+			},
+			started,
+		);
+		state.observe(
+			&DownloadEvent::FileStarted {
+				path: "first.safetensors".to_string(),
+				resumed: 20,
+				total: 60,
+			},
+			started,
+		);
+		state.observe(
+			&DownloadEvent::Progress {
+				path: "first.safetensors".to_string(),
+				received: 40,
+				total: 60,
+			},
+			started + Duration::from_secs(1),
+		);
+		state.observe(
+			&DownloadEvent::FileVerified {
+				path: "first.safetensors".to_string(),
+				sha256: "a".repeat(64),
+			},
+			started + Duration::from_secs(1),
+		);
+		state.observe(
+			&DownloadEvent::FileStarted {
+				path: "second.safetensors".to_string(),
+				resumed: 0,
+				total: 40,
+			},
+			started + Duration::from_secs(1),
+		);
+		state.observe(
+			&DownloadEvent::Progress {
+				path: "second.safetensors".to_string(),
+				received: 20,
+				total: 40,
+			},
+			started + Duration::from_secs(2),
+		);
+
+		let frame = render_download_frame(
+			&state,
+			3,
+			started + Duration::from_secs(2),
+			96,
+			Palette::stderr(crate::style::ColorMode::Never),
+		);
+		assert!(frame.contains(" 80%"));
+		assert!(frame.contains("1/2 verified"));
+		assert!(frame.contains("20 B/s"));
+		assert!(frame.contains("second.safetensors"));
+		assert!(frame.lines().all(|line| {
+			dialoguer::console::measure_text_width(line) < 96 && !line.contains('\r')
+		}));
+	}
+
+	#[test]
+	fn download_progress_has_truthful_retry_and_finalizing_phases() {
+		let id = HubModelId::parse("owner/model").expect("valid Hub ID");
+		let mut state = DownloadUiState::new(&id);
+		let now = Instant::now();
+		state.observe(
+			&DownloadEvent::Retrying {
+				path: "model\nforged.safetensors".to_string(),
+				attempt: 2,
+				reason: "network\treset\u{202e}".to_string(),
+			},
+			now,
+		);
+		let retry = render_download_frame(
+			&state,
+			0,
+			now,
+			80,
+			Palette::stderr(crate::style::ColorMode::Never),
+		);
+		assert!(retry.contains("Retrying"));
+		assert!(retry.contains("attempt 2"));
+		assert!(!retry.contains('\n'));
+		assert!(!retry.contains('\t'));
+		assert!(!retry.contains('\u{202e}'));
+
+		state.observe(
+			&DownloadEvent::TransferCompleted {
+				files: 1,
+				total: 42,
+			},
+			now,
+		);
+		let finalizing = render_download_frame(
+			&state,
+			1,
+			now,
+			40,
+			Palette::stderr(crate::style::ColorMode::Never),
+		);
+		assert_eq!(finalizing, "⠙ Finalizing owner/model");
+	}
+
+	#[test]
+	fn json_download_events_remain_backward_compatible() {
+		assert!(
+			json_download_event(&DownloadEvent::TransferStarted {
+				files: 2,
+				total: 42,
+			})
+			.is_none()
+		);
+		assert!(
+			json_download_event(&DownloadEvent::TransferCompleted {
+				files: 2,
+				total: 42,
+			})
+			.is_none()
+		);
+		assert_eq!(
+			json_download_event(&DownloadEvent::Progress {
+				path: "model.safetensors".to_string(),
+				received: 21,
+				total: 42,
+			})
+			.expect("progress JSON")["type"],
+			"download_progress"
+		);
+	}
+
+	#[test]
+	fn count_and_eta_copy_handles_singular_and_long_transfers() {
+		assert_eq!(counted(1, "file", "files"), "1 file");
+		assert_eq!(counted(2, "file", "files"), "2 files");
+		assert_eq!(remaining_time(10), "10s left");
+		assert_eq!(remaining_time(125), "2m 05s left");
 	}
 
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
