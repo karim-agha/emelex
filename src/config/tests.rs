@@ -304,3 +304,138 @@ fn global_default_model_update_rejects_unsafe_existing_file() {
 		"[agent]\nshell = false\n"
 	);
 }
+
+#[test]
+fn global_hub_token_stays_outside_resolved_config_and_debug() {
+	let temp = tempfile::tempdir().expect("temporary directory");
+	let home = EmelexHome::prepare(&temp.path().join("home")).expect("home");
+	let token = "hf_private_config_token";
+	Config::write_global_hub_token(&home, Some(token)).expect("store Hub token");
+
+	let loaded =
+		Config::load_for_emelex(&home, temp.path(), false).expect("load config and credentials");
+	assert!(loaded.hub_credentials.is_some());
+	let json = serde_json::to_string(&loaded.config).expect("serialize resolved config");
+	assert!(!json.contains(token));
+	assert!(!format!("{:?}", loaded.config).contains(token));
+	let patch = read_optional_patch(&home.config_file())
+		.expect("read global patch")
+		.expect("global patch");
+	assert!(!format!("{patch:?}").contains(token));
+}
+
+#[test]
+fn project_config_cannot_set_or_clear_hub_token() {
+	let temp = tempfile::tempdir().expect("temporary directory");
+	let root = temp.path().join("project");
+	fs::create_dir_all(root.join(".git")).expect("Git marker");
+	let home = EmelexHome::prepare(&temp.path().join("home")).expect("home");
+
+	for text in [
+		"[hub]\ntoken = \"hf_project_secret\"\n",
+		"[hub]\ntoken = \"hf_project_secret with-space\"\n",
+		"[hub]\ntoken = { clear = true }\n",
+	] {
+		fs::write(root.join(".emelex.toml"), text).expect("project config");
+		let error = Config::load(&home, &root, true).expect_err("project Hub token rejected");
+		assert!(error.to_string().contains("hub.token"));
+		assert!(!error.to_string().contains("hf_project_secret"));
+	}
+}
+
+#[test]
+fn global_hub_token_writer_sets_replaces_and_clears_narrowly() {
+	use std::os::unix::fs::PermissionsExt as _;
+
+	let temp = tempfile::tempdir().expect("temporary directory");
+	let home = EmelexHome::prepare(&temp.path().join("home")).expect("home");
+	fs::write(
+		home.config_file(),
+		"[hub]\nresults = 7\n[agent]\nshell = false\n",
+	)
+	.expect("global config");
+
+	Config::write_global_hub_token(&home, Some("hf_first_secret")).expect("store first token");
+	assert!(
+		Config::global_hub_token_configured(&home).expect("inspect stored credential presence")
+	);
+	let first = fs::read_to_string(home.config_file()).expect("read first update");
+	assert!(first.contains("hf_first_secret"));
+	assert!(first.contains("results = 7"));
+	assert!(first.contains("shell = false"));
+	assert_eq!(
+		fs::metadata(home.config_file())
+			.expect("global config metadata")
+			.permissions()
+			.mode() & 0o777,
+		0o600
+	);
+
+	Config::write_global_hub_token(&home, Some("hf_second_secret")).expect("replace token");
+	let second = fs::read_to_string(home.config_file()).expect("read replacement");
+	assert!(!second.contains("hf_first_secret"));
+	assert!(second.contains("hf_second_secret"));
+
+	Config::write_global_hub_token(&home, None).expect("clear token");
+	assert!(
+		!Config::global_hub_token_configured(&home).expect("inspect cleared credential presence")
+	);
+	let cleared = fs::read_to_string(home.config_file()).expect("read cleared config");
+	assert!(!cleared.contains("hf_second_secret"));
+	assert!(cleared.contains("results = 7"));
+	assert!(cleared.contains("shell = false"));
+}
+
+#[test]
+fn global_hub_token_writer_rejects_invalid_secret_without_echoing_it() {
+	let temp = tempfile::tempdir().expect("temporary directory");
+	let home = EmelexHome::prepare(&temp.path().join("home")).expect("home");
+	let token = "hf_secret\nforged";
+	let error =
+		Config::write_global_hub_token(&home, Some(token)).expect_err("invalid token rejected");
+
+	assert!(!error.to_string().contains("hf_secret"));
+	assert!(!home.config_file().exists());
+}
+
+#[test]
+fn invalid_stored_hub_token_error_does_not_echo_secret() {
+	let temp = tempfile::tempdir().expect("temporary directory");
+	let home = EmelexHome::prepare(&temp.path().join("home")).expect("home");
+	let token = "hf_stored_secret with-space";
+	fs::write(home.config_file(), format!("[hub]\ntoken = {token:?}\n")).expect("global config");
+
+	let error = Config::load(&home, temp.path(), false).expect_err("invalid stored token rejected");
+
+	assert!(error.to_string().contains(HUB_TOKEN_REQUIREMENT));
+	assert!(!error.to_string().contains("hf_stored_secret"));
+}
+
+#[test]
+fn malformed_stored_hub_token_error_does_not_echo_source_line() {
+	let temp = tempfile::tempdir().expect("temporary directory");
+	let home = EmelexHome::prepare(&temp.path().join("home")).expect("home");
+	fs::write(home.config_file(), "[hub]\ntoken = \"hf_malformed_secret\n").expect("global config");
+
+	let error = Config::load(&home, temp.path(), false).expect_err("malformed token rejected");
+
+	assert!(!error.to_string().contains("hf_malformed_secret"));
+}
+
+#[test]
+fn default_model_writer_preserves_stored_hub_token() {
+	let temp = tempfile::tempdir().expect("temporary directory");
+	let home = EmelexHome::prepare(&temp.path().join("home")).expect("home");
+	let token = "hf_preserved_secret";
+	Config::write_global_hub_token(&home, Some(token)).expect("store token");
+	let model = ModelRef::parse("mlx-community/example").expect("model");
+
+	Config::write_global_default_model(&home, Some(&model)).expect("write default model");
+
+	assert!(
+		Config::global_hub_token_configured(&home).expect("inspect stored credential presence")
+	);
+	let text = fs::read_to_string(home.config_file()).expect("read global config");
+	assert!(text.contains(token));
+	assert!(text.contains("default_model"));
+}

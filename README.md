@@ -2,8 +2,8 @@
 
 Emelex is a library and command-line toolkit for local AI inference on Apple
 Silicon. It loads MLX checkpoints directly, explores compatible models across
-the Hugging Face catalog, manages immutable local installs, and provides a
-self-contained coding-agent chat harness.
+the Hugging Face catalog, manages owned snapshots and explicit external-model
+links, and provides a self-contained coding-agent chat harness.
 
 Emelex 1.0 supports Apple Silicon on macOS 26.5 or newer.
 
@@ -14,6 +14,7 @@ cargo install --locked --path .
 emelex hub search qwen --require interaction:tools
 emelex hub capabilities
 emelex hub download mlx-community/Qwen3.5-4B-4bit
+emelex model import /path/to/checkpoint --name local-name
 cd your-project
 emelex chat
 ```
@@ -40,6 +41,9 @@ emelex hub capabilities
 emelex hub search [QUERY]
 emelex hub inspect [NAMESPACE/]REPO
 emelex hub download [NAMESPACE/]REPO
+emelex hub auth login [--token-stdin]
+emelex hub auth status|logout
+emelex model import PATH [--name NAME] [--move|--symlink]
 emelex models list|import|default|update|remove|verify|gc|path
 emelex memory status|export|gc|work|failures|retry
 emelex memory sessions list|show|export|recover|delete
@@ -57,18 +61,37 @@ with a `session` record containing `session_id`, immutable `model_snapshot`,
 and `resumed`, before any recovery or agent event. Non-interactive `chat` and
 `resume` accept a positional prompt or bounded UTF-8 text on stdin.
 
-The `emelex` binary is anonymous by default and maps the standard `HF_TOKEN`
-environment variable to explicit Hub credentials. This can include private or
-gated repositories that token can access. The Rust library never reads
-`HF_TOKEN`; embedders pass a redacted `HubCredentials` value to a `HubClient`
-constructor or `EmelexBuilder`, so separate clients can use distinct
-credentials. Authorization headers are marked sensitive, and tokens are never
-written to Emelex storage, configuration, diagnostics, or logs. Transport
-errors strip request and redirect URLs before entering public errors, so
-signed download query credentials cannot leak through diagnostics. HTTP error
-bodies are also suppressed for authenticated requests, cross-origin
+`emelex hub auth` manages the optional token stored in owner-only global
+`<home>/config.toml` as `[hub].token`. Project `.emelex.toml` files may not
+contain Hub credentials. At the CLI boundary, presence of the standard
+`HF_TOKEN` environment variable overrides stored authentication: a nonempty
+value supplies credentials and an explicitly empty value disables
+authentication for that invocation. When the variable is absent, the stored
+token is used when present; otherwise the CLI is anonymous.
+
+The Rust library never reads `HF_TOKEN`. Explicit redacted `HubCredentials`
+passed to `EmelexBuilder` take precedence over the stored global token,
+followed by anonymous access. The secret is extracted separately from
+configuration and is never present in the resolved `Config` value.
+Authorization headers are marked sensitive, and tokens are redacted from
+diagnostics and logs. The raw stored token exists only in global configuration.
+Transport errors strip request and redirect URLs before entering public
+errors, so signed download query credentials cannot leak through diagnostics.
+HTTP error bodies are suppressed for authenticated requests, cross-origin
 redirects, and final URLs with queries. Hub clients disable automatic
 `Referer` generation, and HTTPS-origin clients refuse redirects to HTTP.
+
+`emelex model import PATH` derives its local name from the canonical directory;
+`--name NAME` overrides it. The command copies an immutable runtime-only
+snapshot by default. `--move` first publishes that same verified copy, then
+retires only selected source files that have not changed; ignored files remain,
+so the source directory may remain and cleanup warnings are possible.
+`--symlink` stores a managed record pointing to the canonical external model.
+Its target is caller-owned, mutable, and not guaranteed to remain available, so
+every resolve revalidates its link, runtime inventory, and full content hashes;
+every load repeats that work before compatibility checks and runtime loading.
+Removing a linked model removes only its Emelex record, never the external
+target.
 
 `hub capabilities` lists the predicates backed by remote evidence; stronger
 installed-only claims such as runtime-verified MTP are intentionally

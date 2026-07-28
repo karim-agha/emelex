@@ -6,7 +6,10 @@ use super::*;
 use crate::{
 	config::ThinkingMode,
 	memory::MemoryStore,
-	model::{ModelSizing, ModelTraits, MtpSupport, ResolvedRevision, Task},
+	model::{
+		EvidenceSource, ModelSizing, ModelTraits, MtpSupport, ResolvedRevision, Task,
+		TraitConfidence, TraitEvidence,
+	},
 };
 
 fn manager(config: Config) -> (tempfile::TempDir, ModelManager) {
@@ -39,6 +42,57 @@ fn runtime_files(root: &Path) -> Vec<ModelFile> {
 			.expect("valid file record")
 		})
 		.collect()
+}
+
+fn write_valid_safetensors(path: &Path) {
+	let mut header = br#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+	while !header.len().is_multiple_of(8) {
+		header.push(b' ');
+	}
+	let mut bytes = u64::try_from(header.len())
+		.expect("header length fits u64")
+		.to_le_bytes()
+		.to_vec();
+	bytes.extend_from_slice(&header);
+	bytes.extend_from_slice(&[0_u8; 4]);
+	fs::write(path, bytes).expect("write safetensors fixture");
+}
+
+fn runtime_source(root: &Path) {
+	fs::write(root.join("config.json"), br#"{"model_type":"llama"}"#).expect("write model config");
+	fs::write(root.join("tokenizer.json"), br#"{"model":{"type":"BPE"}}"#)
+		.expect("write tokenizer");
+	write_valid_safetensors(&root.join("model.safetensors"));
+}
+
+fn verified_local_traits(files: &[ModelFile]) -> ModelTraits {
+	let weights_bytes = files
+		.iter()
+		.filter(|file| file.path().ends_with(".safetensors"))
+		.map(ModelFile::size)
+		.sum();
+	let mut traits = ModelTraits {
+		mlx: true,
+		tasks: BTreeSet::from([Task::TextGeneration]),
+		sizing: Some(ModelSizing {
+			weights_bytes: Some(weights_bytes),
+			estimated_residency_bytes: Some(weights_bytes + 1),
+			evaluated_context_tokens: Some(16),
+			max_context_tokens: Some(32),
+		}),
+		..ModelTraits::default()
+	};
+	traits.evidence.push(TraitEvidence {
+		trait_key: "compatibility:runtime_load".to_string(),
+		source: EvidenceSource::Runtime,
+		detail: "test-only runtime evidence".to_string(),
+	});
+	for key in ["acceleration:mlx", "task:text_generation"] {
+		traits
+			.confidence
+			.insert(key.to_string(), TraitConfidence::RuntimeVerified);
+	}
+	traits
 }
 
 fn manifest(files: Vec<ModelFile>) -> ModelManifest {
@@ -218,6 +272,264 @@ fn local_snapshot_digest_is_order_independent() {
 }
 
 #[test]
+fn move_retirement_removes_only_unchanged_selected_files() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let source = directory.path().join("source");
+	fs::create_dir(&source).expect("source directory");
+	runtime_source(&source);
+	fs::write(source.join("README.md"), "caller-owned notes").expect("extra source file");
+	let plan = vec![
+		"config.json".to_string(),
+		"model.safetensors".to_string(),
+		"tokenizer.json".to_string(),
+	];
+	let snapshots = capture_source_snapshots(&source, &plan).expect("source snapshots");
+	let files = snapshot_runtime_files(&source, &plan).expect("runtime file hashes");
+
+	let disposition = retire_source_files(&source, &snapshots, &files);
+
+	assert!(matches!(
+		disposition,
+		ImportSourceDisposition::Retained { ref path, .. } if path == &source
+	));
+	assert!(source.join("README.md").is_file());
+	for path in plan {
+		assert!(!source.join(path).exists());
+	}
+}
+
+#[test]
+fn move_retirement_keeps_a_source_file_changed_after_certification() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let source = directory.path().join("source");
+	fs::create_dir(&source).expect("source directory");
+	runtime_source(&source);
+	let plan = vec![
+		"config.json".to_string(),
+		"model.safetensors".to_string(),
+		"tokenizer.json".to_string(),
+	];
+	let snapshots = capture_source_snapshots(&source, &plan).expect("source snapshots");
+	let files = snapshot_runtime_files(&source, &plan).expect("runtime file hashes");
+	fs::write(source.join("tokenizer.json"), br#"{"changed":true}"#).expect("change source");
+
+	let disposition = retire_source_files(&source, &snapshots, &files);
+
+	assert!(matches!(
+		disposition,
+		ImportSourceDisposition::Retained { ref message, .. }
+			if message.contains("changed after import")
+	));
+	assert!(source.join("tokenizer.json").is_file());
+	assert!(!source.join("config.json").exists());
+	assert!(!source.join("model.safetensors").exists());
+}
+
+#[test]
+fn linked_record_rehashes_external_runtime_files_and_detects_mutation() {
+	use std::os::unix::fs::symlink;
+
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let source = directory.path().join("source");
+	let record = directory.path().join("record");
+	fs::create_dir(&source).expect("source directory");
+	fs::create_dir(&record).expect("record directory");
+	runtime_source(&source);
+	let source = fs::canonicalize(source).expect("canonical source");
+	let plan = local_runtime_plan(&source).expect("runtime plan");
+	let files = snapshot_runtime_files(&source, &plan).expect("runtime files");
+	let name = LocalModelName::parse("linked").expect("local name");
+	let weights_bytes = files
+		.iter()
+		.filter(|file| file.path().ends_with(".safetensors"))
+		.map(ModelFile::size)
+		.sum();
+	let traits = ModelTraits {
+		mlx: true,
+		tasks: BTreeSet::from([Task::TextGeneration]),
+		sizing: Some(ModelSizing {
+			weights_bytes: Some(weights_bytes),
+			estimated_residency_bytes: Some(weights_bytes + 1),
+			evaluated_context_tokens: Some(16),
+			max_context_tokens: Some(32),
+		}),
+		..ModelTraits::default()
+	};
+	let manifest = ModelManifest::new(
+		ModelRef::Local(name),
+		ModelSource::LocalSymlink {
+			original_path: source.clone(),
+		},
+		None,
+		files,
+		traits,
+		VerificationStatus::Estimated,
+		None,
+	)
+	.expect("linked manifest");
+	symlink(&source, record.join(LINKED_SOURCE_NAME)).expect("source link");
+	write_manifest(&record, &manifest).expect("link manifest");
+
+	let runtime = linked_runtime_directory(&record, &manifest).expect("linked runtime");
+	verify_linked_files(&record, &runtime, &manifest).expect("initial linked verification");
+	fs::write(source.join("tokenizer.json"), br#"{"changed":true}"#).expect("mutate source");
+	assert!(verify_linked_files(&record, &runtime, &manifest).is_err());
+}
+
+#[test]
+fn inventory_rejects_an_orphaned_control_link() {
+	use std::os::unix::fs::symlink;
+
+	let (directory, manager) = manager(Config::default());
+	let orphan = manager.home.models_dir().join("orphan");
+	fs::create_dir(&orphan).expect("orphan directory");
+	symlink(directory.path(), orphan.join(LINKED_SOURCE_NAME)).expect("orphan control link");
+
+	let inventory = manager.inventory().expect("model inventory");
+	assert!(inventory.models.is_empty());
+	assert!(inventory.diagnostics.iter().any(|diagnostic| {
+		diagnostic.path == orphan.join(LINKED_SOURCE_NAME)
+			&& diagnostic.message.contains("symlinks are forbidden")
+	}));
+}
+
+#[test]
+fn linked_record_publication_inventory_removal_and_gc_never_touch_source() {
+	use std::os::unix::fs::symlink;
+
+	let (directory, manager) = manager(Config::default());
+	let source = directory.path().join("external");
+	fs::create_dir(&source).expect("external source");
+	runtime_source(&source);
+	let source = fs::canonicalize(source).expect("canonical source");
+	let plan = local_runtime_plan(&source).expect("runtime plan");
+	let files = snapshot_runtime_files(&source, &plan).expect("runtime files");
+	let name = LocalModelName::parse("linked-lifecycle").expect("local name");
+	let manifest = ModelManifest::new(
+		ModelRef::Local(name.clone()),
+		ModelSource::LocalSymlink {
+			original_path: source.clone(),
+		},
+		None,
+		files.clone(),
+		verified_local_traits(&files),
+		VerificationStatus::Verified,
+		None,
+	)
+	.expect("linked manifest");
+	let destination = manager.local_destination(&name, &snapshot_digest(&files));
+	let staging = manager.create_staging("linked-test").expect("link staging");
+	symlink(&source, staging.path().join(LINKED_SOURCE_NAME)).expect("source link");
+	write_manifest(staging.path(), &manifest).expect("link manifest");
+
+	let installed = manager
+		.publish_link(staging, &destination, &manifest)
+		.expect("publish linked record");
+	assert_eq!(manager.list().expect("linked inventory").len(), 1);
+	let quarantine = manager.remove(&installed).expect("remove linked record");
+	assert!(source.is_dir());
+	assert!(!installed.path().exists());
+	assert!(quarantine.is_dir());
+
+	assert_eq!(
+		manager
+			.gc_quarantine(Duration::ZERO)
+			.expect("collect linked record"),
+		1
+	);
+	assert!(source.is_dir());
+	assert!(source.join("model.safetensors").is_file());
+}
+
+#[test]
+fn move_and_link_sources_cannot_overlap_emelex_home() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let home = directory.path().join("home");
+	let source = home.join("models/source");
+	fs::create_dir_all(&source).expect("nested source");
+	assert!(reject_home_overlap(&home, &source).is_err());
+	assert!(reject_home_overlap(&source, &home).is_err());
+}
+
+#[test]
+fn import_reuse_requires_matching_ownership_and_link_target() {
+	let first = Path::new("/tmp/first");
+	let second = Path::new("/tmp/second");
+	let owned = ModelSource::LocalImport {
+		original_path: first.to_path_buf(),
+	};
+	let linked = ModelSource::LocalSymlink {
+		original_path: first.to_path_buf(),
+	};
+
+	assert!(!source_satisfies_import(
+		&owned,
+		ModelSourceKind::LocalSymlink,
+		Some(second),
+	));
+	assert!(source_satisfies_import(
+		&linked,
+		ModelSourceKind::LocalSymlink,
+		Some(first),
+	));
+	assert!(!source_satisfies_import(
+		&linked,
+		ModelSourceKind::LocalSymlink,
+		Some(second),
+	));
+	assert!(!source_satisfies_import(
+		&linked,
+		ModelSourceKind::LocalOwned,
+		None,
+	));
+}
+
+#[test]
+fn ownership_collision_preserves_the_healthy_existing_snapshot() {
+	let (_directory, manager) = manager(Config::default());
+	let staging = manager.create_staging("owned-collision").expect("staging");
+	let files = runtime_files(staging.path());
+	let name = LocalModelName::parse("owned-collision").expect("local name");
+	let reference = ModelRef::Local(name.clone());
+	let manifest = ModelManifest::new(
+		reference.clone(),
+		ModelSource::LocalImport {
+			original_path: PathBuf::from("/tmp/owned-collision"),
+		},
+		None,
+		files.clone(),
+		verified_local_traits(&files),
+		VerificationStatus::Verified,
+		None,
+	)
+	.expect("owned manifest");
+	write_manifest(staging.path(), &manifest).expect("manifest");
+	let destination = manager.local_destination(&name, &snapshot_digest(&files));
+	let installed = manager
+		.publish(staging, &destination, &manifest, None)
+		.expect("publish owned snapshot");
+
+	let error = manager
+		.reuse_existing_locked(
+			&destination,
+			&reference,
+			None,
+			installed.snapshot_id(),
+			ModelSourceKind::LocalSymlink,
+			Some(Path::new("/tmp/external-link")),
+		)
+		.expect_err("ownership mismatch must fail");
+	assert!(matches!(error, ModelsError::ImportOwnershipConflict(_)));
+	assert_eq!(
+		manager
+			.load_installed_at(&destination)
+			.expect("existing snapshot remains")
+			.snapshot_id(),
+		installed.snapshot_id()
+	);
+}
+
+#[test]
 fn direct_manager_protects_snapshots_bound_to_durable_sessions() {
 	let directory = tempfile::tempdir().expect("temporary directory");
 	let home = EmelexHome::prepare(&directory.path().join("home")).expect("test Emelex home");
@@ -315,7 +627,14 @@ fn invalid_existing_repair_serializes_against_durable_binding() {
 	started_receiver.recv().expect("binder started");
 	assert!(
 		manager
-			.reuse_existing_locked(installed.path(), &reference, None, &snapshot)
+			.reuse_existing_locked(
+				installed.path(),
+				&reference,
+				None,
+				&snapshot,
+				ModelSourceKind::Hub,
+				None,
+			)
 			.expect("repair invalid existing")
 			.is_none()
 	);

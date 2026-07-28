@@ -2,13 +2,21 @@
 
 ## Invariants
 
-- Library Hub clients are deterministically anonymous unless their constructor
+- Direct Hub clients are deterministically anonymous unless their constructor
   receives explicit `HubCredentials`; the library never reads authentication
-  environment variables.
-- The CLI boundary alone maps standard `HF_TOKEN` into credentials. Empty or
-  absent means anonymous.
-- Authorization headers are secret-sensitive. Tokens are never persisted,
-  returned in errors or diagnostics, or logged.
+  environment variables. The `Emelex` facade may instead consume the
+  separately extracted global `[hub].token`.
+- Facade precedence is explicit credentials, stored global credentials, then
+  anonymous. The token is absent from resolved `Config`.
+- At the CLI boundary, present `HF_TOKEN` overrides storage. Nonempty supplies
+  credentials; empty deliberately disables authentication. Absent allows the
+  stored token to apply.
+- Hub auth accepts a hidden prompt or bounded one-line UTF-8 stdin, never argv.
+  Status reports source only. Logout clears storage even when an environment
+  override remains effective.
+- Authorization headers are secret-sensitive. Except for intentional
+  owner-only global storage, tokens are never persisted elsewhere, returned in
+  errors or diagnostics, or logged. Project configuration cannot contain one.
 - Redirect policy disables automatic `Referer` generation. A client configured
   with an HTTPS Hub origin permits HTTPS redirects only and refuses downgrade
   destinations.

@@ -3,7 +3,8 @@
 Typed model vocabulary replaces preset tiers.
 
 - `ModelRef` addresses Hugging Face repositories as `repo_name` or
-  `namespace/repo_name`, and Emelex-owned imports as `local:<name>`.
+  `namespace/repo_name`, and local copy, move, or external-link imports as
+  `local:<name>`.
 - `ModelSnapshotId` adds an immutable Hub commit or local runtime-inventory
   digest for durable bindings.
 - `ModelTraits` records modality, task, MLX, MTP, namespaced extension facts,
@@ -13,7 +14,9 @@ Typed model vocabulary replaces preset tiers.
   progression predicates.
 - `CompatibilityReport` keeps compatibility separate from capabilities and
   distinguishes static estimates from successful runtime verification.
-- `ModelManifest` pins an immutable runnable file set and Hub commit.
+- `ModelManifest` pins an owned immutable runnable file set and Hub commit.
+  External-link records instead bind a canonical caller-owned target and
+  require full validation whenever used.
 - With optional feature `rig`, `CompletionModel` adapts one loaded Emelex client
   to Rig completion and streaming traits.
 - Rig raw completion responses and terminal streaming responses carry optional
@@ -25,15 +28,22 @@ output-only. This keeps future report fields semver-compatible.
 
 Static inspection fails closed on missing or unsupported architecture,
 quantization, tokenizer, weight layout, attention geometry, or machine fit.
-The immutable checkpoint snapshot first pins the model directory descriptor,
-then owns `config.json` bytes and every selected shard descriptor opened
-relative to it through MLX materialization and MTP
-certification. It binds each shard by descriptor identity, length, validated
-header, and complete-file SHA-256, and never reopens a model-owned pathname.
+An owned immutable checkpoint snapshot first pins the model directory
+descriptor, then owns `config.json` bytes and every selected shard descriptor
+opened relative to it through MLX materialization and MTP certification. It
+binds each shard by descriptor identity, length, validated header, and
+complete-file SHA-256, and never reopens a model-owned pathname.
 Rename, A→B→A, and whole-directory swaps therefore cannot change the loaded or
 certified identity. Each private, unlinked shard clone receives one
 complete-file hash before load; after MLX materialization, Emelex cheaply
 revalidates that still-open descriptor's identity, length, and header/layout.
+An external-link import keeps only its managed record under Emelex Home. Its
+canonical target remains caller-owned and mutable. Resolve and load therefore
+repeat complete link, inventory, and content validation; load then performs
+compatibility checks and runtime loading. A missing or changed target never
+inherits the owned-snapshot fast path.
+Manifest schema v2 distinguishes managed external links from owned snapshots;
+schema v1 owned-snapshot manifests remain readable.
 Checkpoint `generation_config.json` values are recorded as evidence; resolved
 Emelex configuration and explicit load overrides retain precedence.
 Installed tool-use and reasoning traits come from bounded semantic

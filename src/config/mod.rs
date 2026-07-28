@@ -1,6 +1,7 @@
 //! Strict global and project configuration loading.
 
 use std::{
+	fmt,
 	fs::{self, File, OpenOptions},
 	io::{Read as _, Write as _},
 	os::{
@@ -16,8 +17,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
 	agent::{MAX_SHELL_OUTPUT_BYTES, MAX_WEB_RESPONSE_BYTES},
 	home::EmelexHome,
+	hub::HubCredentials,
 	model::ModelRef,
 };
+
+const HUB_TOKEN_REQUIREMENT: &str = "Hugging Face token must contain 1..=4096 visible ASCII bytes";
 
 macro_rules! apply_copy {
 	($source:ident, $target:ident, $($field:ident),+ $(,)?) => {
@@ -244,6 +248,12 @@ pub struct ConfigSources {
 	pub project: Option<PathBuf>,
 }
 
+pub(crate) struct LoadedConfig {
+	pub(crate) config: Config,
+	pub(crate) sources: ConfigSources,
+	pub(crate) hub_credentials: Option<HubCredentials>,
+}
+
 /// Strict configuration loading failures.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -301,8 +311,21 @@ impl Config {
 		invocation_root: &Path,
 		load_project: bool,
 	) -> Result<(Self, ConfigSources), ConfigError> {
+		let loaded = Self::load_for_emelex(home, invocation_root, load_project)?;
+		Ok((loaded.config, loaded.sources))
+	}
+
+	pub(crate) fn load_for_emelex(
+		home: &EmelexHome,
+		invocation_root: &Path,
+		load_project: bool,
+	) -> Result<LoadedConfig, ConfigError> {
 		let global_path = home.config_file();
 		let global = read_optional_patch(&global_path)?;
+		let hub_credentials = match global.as_ref() {
+			Some(global) => global.global_hub_credentials(&global_path)?,
+			None => None,
+		};
 		let project_path = load_project
 			.then(|| project_root(invocation_root).map(|root| root.join(".emelex.toml")))
 			.flatten();
@@ -324,13 +347,14 @@ impl Config {
 			patch.apply(&mut config, PatchAuthority::Project);
 		}
 		config.validate()?;
-		Ok((
+		Ok(LoadedConfig {
 			config,
-			ConfigSources {
+			sources: ConfigSources {
 				global: global_path.is_file().then_some(global_path),
 				project: project_path.filter(|path| path.is_file()),
 			},
-		))
+			hub_credentials,
+		})
 	}
 
 	/// Atomically set or clear the global default model while preserving every
@@ -353,7 +377,7 @@ impl Config {
 		let mut table =
 			toml::from_str::<toml::Table>(&text).map_err(|error| ConfigError::Parse {
 				path: path.clone(),
-				message: error.to_string(),
+				message: error.message().to_string(),
 			})?;
 		match model {
 			Some(model) => {
@@ -373,12 +397,95 @@ impl Config {
 		let patch =
 			toml::from_str::<ConfigPatch>(&rendered).map_err(|error| ConfigError::Parse {
 				path: path.clone(),
-				message: error.to_string(),
+				message: error.message().to_string(),
 			})?;
+		patch.validate_global_hub_credentials(&path)?;
 		let mut resolved = Self::default();
 		patch.apply(&mut resolved, PatchAuthority::Global);
 		resolved.validate()?;
 		write_global_config(home, &path, rendered.as_bytes(), original.as_deref())
+	}
+
+	/// Atomically set or clear the global Hugging Face token while preserving
+	/// every other global setting.
+	///
+	/// Project configuration is never read or written by this operation.
+	///
+	/// # Errors
+	///
+	/// Returns when the token or existing global file is invalid, the updated
+	/// configuration would be invalid, or durable replacement fails.
+	pub fn write_global_hub_token(
+		home: &EmelexHome,
+		token: Option<&str>,
+	) -> Result<(), ConfigError> {
+		if let Some(token) = token {
+			validate_hub_token(token)?;
+		}
+		let _lock = ConfigWriteLock::acquire(home)?;
+		let path = home.config_file();
+		let original = read_optional_text(&path)?;
+		let text = original.clone().unwrap_or_default();
+		let mut table =
+			toml::from_str::<toml::Table>(&text).map_err(|error| ConfigError::Parse {
+				path: path.clone(),
+				message: error.message().to_string(),
+			})?;
+		let remove_empty_hub = match token {
+			Some(token) => {
+				let hub = table
+					.entry("hub".to_string())
+					.or_insert_with(|| toml::Value::Table(toml::Table::new()))
+					.as_table_mut()
+					.ok_or_else(|| ConfigError::Parse {
+						path: path.clone(),
+						message: "hub configuration must be a table".to_string(),
+					})?;
+				hub.insert("token".to_string(), toml::Value::String(token.to_string()));
+				false
+			}
+			None => match table.get_mut("hub") {
+				Some(value) => {
+					let hub = value.as_table_mut().ok_or_else(|| ConfigError::Parse {
+						path: path.clone(),
+						message: "hub configuration must be a table".to_string(),
+					})?;
+					hub.remove("token");
+					hub.is_empty()
+				}
+				None => false,
+			},
+		};
+		if remove_empty_hub {
+			table.remove("hub");
+		}
+		let rendered = toml::to_string_pretty(&table).map_err(|error| ConfigError::Parse {
+			path: path.clone(),
+			message: error.to_string(),
+		})?;
+		let patch =
+			toml::from_str::<ConfigPatch>(&rendered).map_err(|error| ConfigError::Parse {
+				path: path.clone(),
+				message: error.message().to_string(),
+			})?;
+		patch.validate_global_hub_credentials(&path)?;
+		let mut resolved = Self::default();
+		patch.apply(&mut resolved, PatchAuthority::Global);
+		resolved.validate()?;
+		write_global_config(home, &path, rendered.as_bytes(), original.as_deref())
+	}
+
+	/// Whether the global configuration contains a usable Hugging Face token.
+	///
+	/// Project configuration is never inspected.
+	///
+	/// # Errors
+	///
+	/// Returns when the global configuration is unreadable or invalid.
+	pub fn global_hub_token_configured(home: &EmelexHome) -> Result<bool, ConfigError> {
+		Ok(Self::load_for_emelex(home, home.root(), false)?
+			.hub_credentials
+			.is_some())
 	}
 
 	/// Validate every resolved limit and cross-field invariant.
@@ -443,6 +550,15 @@ impl Config {
 	}
 }
 
+#[derive(Clone, Deserialize)]
+struct ConfiguredHubToken(String);
+
+impl fmt::Debug for ConfiguredHubToken {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("ConfiguredHubToken([REDACTED])")
+	}
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigPatch {
@@ -454,6 +570,27 @@ struct ConfigPatch {
 }
 
 impl ConfigPatch {
+	fn validate_global_hub_credentials(&self, path: &Path) -> Result<(), ConfigError> {
+		self.global_hub_credentials(path).map(|_| ())
+	}
+
+	fn global_hub_credentials(&self, path: &Path) -> Result<Option<HubCredentials>, ConfigError> {
+		let Some(token) = self.hub.as_ref().and_then(|hub| hub.token.as_ref()) else {
+			return Ok(None);
+		};
+		match token {
+			PatchValue::Set(token) => {
+				HubCredentials::bearer_token(&token.0)
+					.map(Some)
+					.map_err(|_| ConfigError::Parse {
+						path: path.to_path_buf(),
+						message: HUB_TOKEN_REQUIREMENT.to_string(),
+					})
+			}
+			PatchValue::Clear(_) => Ok(None),
+		}
+	}
+
 	fn validate_project(&self, path: &Path) -> Result<(), ConfigError> {
 		let mut forbidden = Vec::new();
 		if self.default_model.is_some() {
@@ -482,6 +619,9 @@ impl ConfigPatch {
 			.is_some_and(|agent| agent.system_prompt.is_some())
 		{
 			forbidden.push("agent.system_prompt");
+		}
+		if self.hub.as_ref().is_some_and(|hub| hub.token.is_some()) {
+			forbidden.push("hub.token");
 		}
 		if let Some(memory) = &self.memory {
 			if memory.model.is_some() {
@@ -647,6 +787,7 @@ struct HubPatch {
 	metadata_concurrency: Option<usize>,
 	request_timeout_seconds: Option<u64>,
 	retries: Option<usize>,
+	token: Option<PatchValue<ConfiguredHubToken>>,
 }
 
 impl HubPatch {
@@ -713,6 +854,12 @@ impl MemoryPatch {
 	}
 }
 
+fn validate_hub_token(token: &str) -> Result<(), ConfigError> {
+	HubCredentials::bearer_token(token)
+		.map(|_| ())
+		.map_err(|_| ConfigError::Invalid(HUB_TOKEN_REQUIREMENT.to_string()))
+}
+
 fn read_optional_patch(path: &Path) -> Result<Option<ConfigPatch>, ConfigError> {
 	let Some(text) = read_optional_text(path)? else {
 		return Ok(None);
@@ -721,7 +868,7 @@ fn read_optional_patch(path: &Path) -> Result<Option<ConfigPatch>, ConfigError> 
 		.map(Some)
 		.map_err(|error| ConfigError::Parse {
 			path: path.to_path_buf(),
-			message: error.to_string(),
+			message: error.message().to_string(),
 		})
 }
 

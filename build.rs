@@ -258,7 +258,6 @@ fn metal_version(toolchains: Option<&str>) -> Result<(bool, String), String> {
 
 fn emit_rerun_directives(paths: &[&Path]) {
 	println!("cargo:rerun-if-changed=build.rs");
-	println!("cargo:rerun-if-changed=build_support.rs");
 	for path in paths {
 		println!("cargo:rerun-if-changed={}", path.display());
 	}

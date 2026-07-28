@@ -3,18 +3,29 @@
 The Hub client explores model repositories accessible to the current caller.
 Repository IDs follow Hugging Face's full one- or two-component catalog
 grammar: `repo_name` or `namespace/repo_name`.
-Library constructors are deterministically anonymous unless given explicit,
-redacted `HubCredentials`; the library never reads environment variables.
-The CLI alone maps the standard environment-only `HF_TOKEN` into credentials.
-Each token is installed only as a secret-sensitive `Authorization` header and
-is never persisted or logged. Transport errors discard their request and
-redirect URL before crossing the public error boundary, so signed download
-query credentials cannot appear through error display, debug, or source
-chains. HTTP error bodies are suppressed for authenticated requests,
-cross-origin redirects, and final URLs with queries; only anonymous,
-same-origin, query-free API errors retain a bounded body. Automatic `Referer`
-generation is disabled, and clients configured with an HTTPS Hub origin refuse
-redirect downgrades to HTTP.
+Direct Hub-client constructors are deterministically anonymous unless given
+explicit, redacted `HubCredentials`; the library never reads environment
+variables. The `Emelex` facade resolves explicit builder credentials before an
+optional global `[hub].token`, then falls back to anonymous access. The stored
+secret remains outside resolved `Config`.
+
+At the CLI boundary, presence of `HF_TOKEN` overrides stored credentials. A
+nonempty value authenticates and an empty value explicitly disables
+authentication. `emelex hub auth login` stores a token in owner-only global
+configuration using a hidden prompt or bounded one-line UTF-8 stdin; `status`
+reports only effective source and `logout` clears only the stored value.
+Tokens are never accepted through argv or project configuration.
+
+Each effective token is installed only as a secret-sensitive `Authorization`
+header and is never logged. Apart from its intentional owner-only global
+configuration field, it is not copied into Emelex state. Transport errors
+discard their request and redirect URL before crossing the public error
+boundary, so signed download query credentials cannot appear through error
+display, debug, or source chains. HTTP error bodies are suppressed for
+authenticated requests, cross-origin redirects, and final URLs with queries;
+only anonymous, same-origin, query-free API errors retain a bounded body.
+Automatic `Referer` generation is disabled, and clients configured with an
+HTTPS Hub origin refuse redirect downgrades to HTTP.
 
 Search preserves Hub rank, preflights candidates with bounded concurrency,
 returns only models matching validated remote-evidence trait filters, and

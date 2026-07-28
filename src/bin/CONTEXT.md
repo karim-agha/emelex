@@ -56,6 +56,13 @@
 - Hub download Ctrl-C handling runs in an independent watcher task, so the
   atomic cancellation flag changes even while the download future executes a
   synchronous local phase on another runtime worker.
+- Hub auth login reads either a hidden terminal prompt or, with
+  `--token-stdin`, one bounded UTF-8 stdin line. Token argv is forbidden.
+  Status reveals only effective credential source. Logout clears stored global
+  state but does not override a present environment token.
+- At the CLI boundary, present `HF_TOKEN` has three-state semantics: nonempty
+  overrides with that token, empty explicitly disables authentication, and
+  absence permits stored global credentials.
 - `hub capabilities` renders the library's complete `REMOTE_FILTERS` catalog;
   its displayed syntax and accepted remote predicates cannot drift apart.
 - Every CLI Hub search enables `HubSearch::mlx_library` independently of user
@@ -64,6 +71,15 @@
   workload separately from the model's maximum context, and capability groups
   wrap with hanging indentation. Default diagnostics show only a count, verbose
   diagnostics group by sanitized candidate ID, and JSON stays complete.
+- Preferred local import uses singular `model import PATH`, with an optional
+  `--name`; other lifecycle commands remain plural `models`. Import defaults to
+  an owned immutable copy. Move publishes before selectively retiring only
+  unchanged selected source files; changed or unselected files remain and
+  cleanup warnings do not hide the committed install.
+- Symlink import stores a managed record pointing to one canonical external
+  target. Every resolve/load revalidates its link, runtime inventory, and full
+  hashes; load also checks compatibility and opens the runtime. Removal
+  deletes only the record.
 - Attachment UX advertises only formats decoded by the embedded runtime.
 - Media onboarding maps runtime image/audio requirements to remote
   advertised-input evidence, labels that evidence as provisional, and requires

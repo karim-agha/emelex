@@ -55,7 +55,9 @@
   one structurally complete replay batch and removes its recoverable journal.
 - Exact model binding takes a typed `InstalledModel`. The Emelex Home
   snapshot-mutation lock is held across path/manifest/file revalidation and DB
-  commit. Model removal holds the same lock across reference check and mutation.
+  commit. Owned snapshots use their stamp; linked models revalidate the
+  canonical target, runtime inventory, and full hashes. Model removal holds the
+  same lock across reference check and mutation.
 - Direct `ModelManager` construction installs the lazy memory reference guard;
   reference-query failures are typed and fail closed.
 - Assets are byte-addressed, mode `0600`, bounded to 128 MiB each, and verified

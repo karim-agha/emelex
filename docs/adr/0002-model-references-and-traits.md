@@ -67,10 +67,15 @@ but rejects installed-only runtime-verification claims. Layout validation is
 an internal prerequisite of runtime verification, not a third public MTP
 support state.
 Library clients are anonymously deterministic unless given explicit, redacted
-credentials. The CLI maps standard `HF_TOKEN` into those credentials at its
-boundary. Hugging Face decides which private or gated repositories a token can
-access; Emelex marks the authorization header sensitive and never persists or
-logs the token.
+credentials. The original environment-only persistence decision in this
+paragraph is superseded by
+[ADR 0008](0008-hub-credential-precedence.md). Hugging Face decides which
+private or gated repositories a token can access; Emelex marks authorization
+headers sensitive and never logs the token.
+
+The original assumption above that every local model is Emelex-owned is
+superseded by [ADR 0007](0007-local-model-import-ownership.md), which adds an
+explicit managed external-link mode.
 
 ## Consequences
 

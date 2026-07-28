@@ -20,7 +20,7 @@ use emelex::{
 
 use super::{
 	args::HubCommand,
-	output,
+	hub_auth_cmd, output,
 	style::{Palette, bytes, tokens},
 };
 
@@ -37,6 +37,9 @@ pub(crate) async fn run(
 	stderr_palette: Palette,
 ) -> anyhow::Result<()> {
 	match command {
+		HubCommand::Auth { command } => {
+			hub_auth_cmd::run(emelex.home(), command, json, stdout_palette, stderr_palette)
+		}
 		HubCommand::Capabilities => {
 			if json {
 				output::json_line(&REMOTE_FILTERS)

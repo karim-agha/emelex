@@ -20,6 +20,7 @@ pub(crate) mod args;
 pub(crate) mod chat_cmd;
 pub(crate) mod doctor_cmd;
 pub(crate) mod generate_cmd;
+pub(crate) mod hub_auth_cmd;
 pub(crate) mod hub_cmd;
 pub(crate) mod markdown;
 pub(crate) mod media;
@@ -32,9 +33,9 @@ pub(crate) mod style;
 pub(crate) mod web_search;
 
 use anyhow::Context as _;
-use args::{Cli, Command};
+use args::{Cli, Command, HubCommand};
 use clap::Parser as _;
-use emelex::{Emelex, hub::HubCredentials};
+use emelex::{Emelex, home::EmelexHome, hub::HubCredentials};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -69,6 +70,13 @@ fn format_human_error(error: &anyhow::Error, palette: style::Palette) -> String 
 async fn run(cli: Cli) -> anyhow::Result<()> {
 	let stdout_palette = style::Palette::stdout(cli.color);
 	let stderr_palette = style::Palette::stderr(cli.color);
+	if let Command::Hub {
+		command: HubCommand::Auth { command },
+	} = &cli.command
+	{
+		let home = EmelexHome::resolve(cli.home.as_deref()).context("initialize Emelex Home")?;
+		return hub_auth_cmd::run(&home, *command, cli.json, stdout_palette, stderr_palette);
+	}
 	let mut builder = Emelex::builder().project_config(!cli.no_project_config);
 	if let Some(home) = cli.home {
 		builder = builder.home(home);
@@ -76,8 +84,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 	if let Some(directory) = cli.directory {
 		builder = builder.invocation_root(directory);
 	}
-	if let Some(credentials) = hf_credentials_from_env()? {
-		builder = builder.hub_credentials(credentials);
+	match hf_credentials_from_env()? {
+		HubCredentialOverride::Inherit => {}
+		HubCredentialOverride::Anonymous => builder = builder.anonymous_hub(),
+		HubCredentialOverride::Explicit(credentials) => {
+			builder = builder.hub_credentials(credentials);
+		}
 	}
 	let emelex = builder.build().context("initialize Emelex")?;
 	match cli.command {
@@ -94,6 +106,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 		Command::Hub { command } => {
 			hub_cmd::run(&emelex, command, cli.json, stdout_palette, stderr_palette).await
 		}
+		Command::Model { command } => {
+			models_cmd::run_model(&emelex, command, cli.json, stdout_palette, stderr_palette)
+		}
 		Command::Models { command } => {
 			models_cmd::run(&emelex, command, cli.json, stdout_palette, stderr_palette).await
 		}
@@ -104,13 +119,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 	}
 }
 
-fn hf_credentials_from_env() -> anyhow::Result<Option<HubCredentials>> {
-	match std::env::var("HF_TOKEN") {
-		Ok(token) if token.is_empty() => Ok(None),
+#[derive(Debug)]
+enum HubCredentialOverride {
+	Inherit,
+	Anonymous,
+	Explicit(HubCredentials),
+}
+
+fn hf_credentials_from_env() -> anyhow::Result<HubCredentialOverride> {
+	hf_credentials_from_value(std::env::var("HF_TOKEN"))
+}
+
+fn hf_credentials_from_value(
+	value: Result<String, std::env::VarError>,
+) -> anyhow::Result<HubCredentialOverride> {
+	match value {
+		Ok(token) if token.is_empty() => Ok(HubCredentialOverride::Anonymous),
 		Ok(token) => HubCredentials::bearer_token(&token)
-			.map(Some)
+			.map(HubCredentialOverride::Explicit)
 			.context("invalid HF_TOKEN"),
-		Err(std::env::VarError::NotPresent) => Ok(None),
+		Err(std::env::VarError::NotPresent) => Ok(HubCredentialOverride::Inherit),
 		Err(std::env::VarError::NotUnicode(_)) => {
 			anyhow::bail!("HF_TOKEN must contain valid UTF-8")
 		}
@@ -128,5 +156,22 @@ mod tests {
 		assert!(!rendered.contains('\u{1b}'));
 		assert!(!rendered.contains('\u{202e}'));
 		assert!(rendered.contains('\u{241b}'));
+	}
+
+	#[test]
+	fn environment_credentials_distinguish_inherit_and_explicit_anonymous() {
+		assert!(matches!(
+			hf_credentials_from_value(Err(std::env::VarError::NotPresent))
+				.expect("absent environment"),
+			HubCredentialOverride::Inherit
+		));
+		assert!(matches!(
+			hf_credentials_from_value(Ok(String::new())).expect("empty environment"),
+			HubCredentialOverride::Anonymous
+		));
+		assert!(matches!(
+			hf_credentials_from_value(Ok("hf_example".to_string())).expect("explicit environment"),
+			HubCredentialOverride::Explicit(_)
+		));
 	}
 }

@@ -18,9 +18,17 @@ use super::{
 pub enum ModelSource {
 	/// Hugging Face repository snapshot.
 	Hub,
-	/// User-selected local directory copied into Emelex home.
+	/// User-selected local directory copied or moved into Emelex home.
 	LocalImport {
 		/// Original canonical source path for provenance.
+		original_path: PathBuf,
+	},
+	/// User-selected local directory referenced outside Emelex home.
+	///
+	/// The managed snapshot contains only a link record. Runtime files remain
+	/// caller-owned and are revalidated before every resolution or load.
+	LocalSymlink {
+		/// Canonical external source path.
 		original_path: PathBuf,
 	},
 }
@@ -112,7 +120,7 @@ pub struct ModelManifest {
 
 impl ModelManifest {
 	/// Current manifest schema.
-	pub const SCHEMA_VERSION: u32 = 1;
+	pub const SCHEMA_VERSION: u32 = 2;
 	/// Compatibility implementation identifier.
 	pub const COMPATIBILITY_ENGINE: &'static str = "emelex-1";
 
@@ -152,8 +160,14 @@ impl ModelManifest {
 		reason = "manifest deserialization and construction share one fail-closed invariant gate"
 	)]
 	fn from_parts(parts: ManifestParts) -> Result<Self, ManifestError> {
-		if parts.schema_version != Self::SCHEMA_VERSION {
+		if !matches!(parts.schema_version, 1 | Self::SCHEMA_VERSION) {
 			return Err(ManifestError::UnsupportedSchema(parts.schema_version));
+		}
+		if parts.schema_version == 1 && matches!(parts.source, ModelSource::LocalSymlink { .. }) {
+			return Err(ManifestError::SourceRequiresSchema {
+				kind: "local_symlink",
+				schema_version: Self::SCHEMA_VERSION,
+			});
 		}
 		if parts.compatibility_engine != Self::COMPATIBILITY_ENGINE {
 			return Err(ManifestError::UnsupportedCompatibilityEngine(
@@ -162,10 +176,14 @@ impl ModelManifest {
 		}
 		match (&parts.source, &parts.resolved_revision) {
 			(ModelSource::Hub, None) => return Err(ManifestError::MissingHubRevision),
-			(ModelSource::LocalImport { .. }, Some(_)) => {
+			(ModelSource::LocalImport { .. } | ModelSource::LocalSymlink { .. }, Some(_)) => {
 				return Err(ManifestError::LocalImportHasRevision);
 			}
-			(ModelSource::LocalImport { original_path }, None) if !original_path.is_absolute() => {
+			(
+				ModelSource::LocalImport { original_path }
+				| ModelSource::LocalSymlink { original_path },
+				None,
+			) if !original_path.is_absolute() => {
 				return Err(ManifestError::LocalImportPathNotAbsolute(
 					original_path.clone(),
 				));
@@ -175,7 +193,10 @@ impl ModelManifest {
 		if !matches!(
 			(&parts.source, &parts.reference),
 			(ModelSource::Hub, ModelRef::Hub(_))
-				| (ModelSource::LocalImport { .. }, ModelRef::Local(_))
+				| (
+					ModelSource::LocalImport { .. } | ModelSource::LocalSymlink { .. },
+					ModelRef::Local(_)
+				)
 		) {
 			return Err(ManifestError::SourceReferenceMismatch);
 		}
@@ -429,6 +450,14 @@ pub enum ManifestError {
 	/// Manifest schema is not supported.
 	#[error("unsupported model manifest schema {0}")]
 	UnsupportedSchema(u32),
+	/// A source kind requires a newer manifest schema.
+	#[error("model source {kind} requires manifest schema {schema_version}")]
+	SourceRequiresSchema {
+		/// Serialized source kind.
+		kind: &'static str,
+		/// First schema supporting it.
+		schema_version: u32,
+	},
 	/// Compatibility engine differs from this build.
 	#[error("unsupported compatibility engine {0:?}")]
 	UnsupportedCompatibilityEngine(String),

@@ -80,6 +80,53 @@ fn local_snapshot_digest_is_independent_of_file_order() {
 }
 
 #[test]
+fn linked_local_models_require_schema_two_and_absolute_targets() {
+	let name = crate::model::LocalModelName::parse("linked").expect("valid local name");
+	let manifest = ModelManifest::new(
+		ModelRef::Local(name),
+		ModelSource::LocalSymlink {
+			original_path: PathBuf::from("/tmp/linked-model"),
+		},
+		None,
+		files(),
+		traits(),
+		VerificationStatus::Estimated,
+		None,
+	)
+	.expect("valid linked manifest");
+	assert_eq!(manifest.schema_version(), 2);
+
+	let mut old = serde_json::to_value(&manifest).expect("serialize manifest");
+	old["schema_version"] = serde_json::json!(1);
+	assert!(serde_json::from_value::<ModelManifest>(old).is_err());
+
+	let mut relative = serde_json::to_value(&manifest).expect("serialize manifest");
+	relative["source"]["local_symlink"]["original_path"] = serde_json::json!("relative");
+	assert!(serde_json::from_value::<ModelManifest>(relative).is_err());
+}
+
+#[test]
+fn schema_one_owned_manifests_remain_readable() {
+	let name = crate::model::LocalModelName::parse("owned").expect("valid local name");
+	let manifest = ModelManifest::new(
+		ModelRef::Local(name),
+		ModelSource::LocalImport {
+			original_path: PathBuf::from("/tmp/owned-model"),
+		},
+		None,
+		files(),
+		traits(),
+		VerificationStatus::Estimated,
+		None,
+	)
+	.expect("valid manifest");
+	let mut old = serde_json::to_value(&manifest).expect("serialize manifest");
+	old["schema_version"] = serde_json::json!(1);
+	let decoded = serde_json::from_value::<ModelManifest>(old).expect("schema one manifest");
+	assert_eq!(decoded.schema_version(), 1);
+}
+
+#[test]
 fn deserialization_rejects_forged_snapshot_id() {
 	let manifest = ModelManifest::new(
 		ModelRef::Hub(HubModelId::parse("owner/model").expect("valid Hub ID")),

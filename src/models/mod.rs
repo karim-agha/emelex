@@ -35,6 +35,7 @@ use crate::{
 
 const MANIFEST_NAME: &str = "emelex-model.json";
 const VERIFIED_STAMP_NAME: &str = ".emelex-verified.json";
+const LINKED_SOURCE_NAME: &str = ".emelex-linked-source";
 const QUARANTINE_RECORD_NAME: &str = "emelex-quarantine.json";
 const MAX_MANIFEST_BYTES: u64 = 4 << 20;
 const MAX_VERIFICATION_STAMP_BYTES: u64 = 8 << 20;
@@ -253,7 +254,127 @@ pub struct ModelVerification {
 	pub client: Client,
 }
 
-/// Emelex-owned immutable model store.
+/// Local model ingestion behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ImportMode {
+	/// Copy selected runtime files into an immutable Emelex-owned snapshot.
+	#[default]
+	Copy,
+	/// Publish an immutable snapshot, then retire unchanged selected source files.
+	Move,
+	/// Keep runtime files outside Emelex and publish a managed link record.
+	Symlink,
+}
+
+/// Options for importing one local model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImportOptions {
+	mode: ImportMode,
+}
+
+impl ImportOptions {
+	/// Select copy, move, or symlink behavior.
+	#[must_use]
+	pub const fn mode(mut self, mode: ImportMode) -> Self {
+		self.mode = mode;
+		self
+	}
+
+	/// Selected import behavior.
+	pub const fn selected_mode(self) -> ImportMode {
+		self.mode
+	}
+}
+
+/// Source disposition after a successful local import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+#[non_exhaustive]
+pub enum ImportSourceDisposition {
+	/// An owned snapshot was published or reused; the source remains untouched.
+	Preserved,
+	/// Every selected runtime source file was retired and its root became empty.
+	Removed,
+	/// The snapshot committed, but some source data remains.
+	Retained {
+		/// Canonical source directory.
+		path: PathBuf,
+		/// Bounded cleanup diagnostic.
+		message: String,
+	},
+	/// Runtime files remain caller-owned at the canonical external target.
+	Linked {
+		/// Canonical external source directory.
+		path: PathBuf,
+	},
+}
+
+/// Successful local import and its source-side result.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ImportOutcome {
+	installed: InstalledModel,
+	disposition: ImportSourceDisposition,
+}
+
+impl ImportOutcome {
+	/// Installed snapshot or managed link record.
+	pub const fn installed(&self) -> &InstalledModel {
+		&self.installed
+	}
+
+	/// Consume the outcome and return the installed model.
+	pub fn into_installed(self) -> InstalledModel {
+		self.installed
+	}
+
+	/// What happened to the caller-selected source.
+	pub const fn disposition(&self) -> &ImportSourceDisposition {
+		&self.disposition
+	}
+
+	/// Non-fatal source cleanup warning after a committed move.
+	pub fn warning(&self) -> Option<&str> {
+		match &self.disposition {
+			ImportSourceDisposition::Retained { message, .. } => Some(message),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelSourceKind {
+	Hub,
+	LocalOwned,
+	LocalSymlink,
+}
+
+const fn model_source_kind(source: &ModelSource) -> ModelSourceKind {
+	match source {
+		ModelSource::Hub => ModelSourceKind::Hub,
+		ModelSource::LocalImport { .. } => ModelSourceKind::LocalOwned,
+		ModelSource::LocalSymlink { .. } => ModelSourceKind::LocalSymlink,
+	}
+}
+
+fn source_satisfies_import(
+	source: &ModelSource,
+	expected: ModelSourceKind,
+	linked_target: Option<&Path>,
+) -> bool {
+	match (expected, source) {
+		(ModelSourceKind::Hub, ModelSource::Hub)
+		| (ModelSourceKind::LocalOwned, ModelSource::LocalImport { .. }) => true,
+		(ModelSourceKind::LocalSymlink, ModelSource::LocalSymlink { original_path }) => {
+			linked_target == Some(original_path.as_path())
+		}
+		_ => false,
+	}
+}
+
+/// Managed immutable snapshots and explicit external model links.
 #[derive(Clone)]
 pub struct ModelManager {
 	home: EmelexHome,
@@ -357,6 +478,9 @@ impl ModelManager {
 				}
 			};
 			if entry.file_type().is_symlink() {
+				if entry.file_name() == LINKED_SOURCE_NAME && declared_link_record(entry.path()) {
+					continue;
+				}
 				diagnostics.push(ModelDiagnostic {
 					path: entry.path().to_path_buf(),
 					message: "symlinks are forbidden in the managed model store".to_string(),
@@ -522,6 +646,8 @@ impl ModelManager {
 				&existing_reference,
 				Some(&existing_revision),
 				&existing_snapshot,
+				ModelSourceKind::Hub,
+				None,
 			)
 		})
 		.await
@@ -617,10 +743,52 @@ impl ModelManager {
 		name: &LocalModelName,
 		source: &Path,
 	) -> Result<InstalledModel, ModelsError> {
+		self.import_with_options(name, source, ImportOptions::default())
+			.map(ImportOutcome::into_installed)
+	}
+
+	/// Import, move, or link one local checkpoint.
+	///
+	/// Copy and move publish an immutable runtime-only snapshot. Move retires
+	/// only source files that remain identical to those certified for the
+	/// committed snapshot; cleanup trouble is reported in
+	/// [`ImportOutcome::disposition`] without hiding the successful install.
+	/// Symlink publishes a managed link record and leaves runtime files under
+	/// caller ownership.
+	///
+	/// # Errors
+	///
+	/// Returns source, storage, compatibility, manifest, or load errors before
+	/// publication. A successful move never becomes an error solely because
+	/// source cleanup was partial.
+	pub fn import_with_options(
+		&self,
+		name: &LocalModelName,
+		source: &Path,
+		options: ImportOptions,
+	) -> Result<ImportOutcome, ModelsError> {
+		let requested_source = source.to_path_buf();
 		let source = fs::canonicalize(source).map_err(|error| ModelsError::Io {
-			path: source.to_path_buf(),
+			path: requested_source.clone(),
 			source: error,
 		})?;
+		if !source.is_dir() {
+			return Err(ModelsError::UnsafeInstall(source));
+		}
+		if matches!(options.mode, ImportMode::Move)
+			&& fs::symlink_metadata(&requested_source)
+				.map_err(|source_error| ModelsError::Io {
+					path: requested_source,
+					source: source_error,
+				})?
+				.file_type()
+				.is_symlink()
+		{
+			return Err(ModelsError::UnsafeInstall(source));
+		}
+		if !matches!(options.mode, ImportMode::Copy) {
+			reject_home_overlap(self.home.root(), &source)?;
+		}
 		let reference = ModelRef::Local(name.clone());
 		let source_report = inspect_directory(
 			reference.clone(),
@@ -631,21 +799,19 @@ impl ModelManager {
 		if !source_report.compatible {
 			return Err(ModelsError::Incompatible(source_report.reasons));
 		}
-		let copy_plan = local_runtime_plan(&source)?;
-		let transfer_bytes = copy_plan.iter().try_fold(0_u64, |total, path| {
-			let metadata = fs::symlink_metadata(source.join(path)).map_err(|source_error| {
-				ModelsError::Io {
-					path: source.join(path),
-					source: source_error,
-				}
-			})?;
-			total.checked_add(metadata.len()).ok_or_else(|| {
-				ModelsError::Configuration("local import byte count overflow".to_string())
-			})
-		})?;
+		let plan = local_runtime_plan(&source)?;
+		if matches!(options.mode, ImportMode::Symlink) {
+			return self.import_symlink(name, &source, reference, source_report, &plan);
+		}
+		let source_snapshots = if matches!(options.mode, ImportMode::Move) {
+			capture_source_snapshots(&source, &plan)?
+		} else {
+			Vec::new()
+		};
+		let transfer_bytes = source_snapshots_or_plan_bytes(&source, &plan, &source_snapshots)?;
 		preflight_disk(&self.home.temp_dir(), transfer_bytes)?;
 		let staging = self.create_staging("local")?;
-		let files = copy_runtime_files(&source, staging.path(), &copy_plan)?;
+		let files = copy_runtime_files(&source, staging.path(), &plan)?;
 		verify_files(staging.path(), &files)?;
 		let digest = snapshot_digest(&files);
 		let destination = self.local_destination(name, &digest);
@@ -654,20 +820,128 @@ impl ModelManager {
 			digest: crate::model::SnapshotDigest::parse(digest)
 				.map_err(|error| ModelsError::Configuration(error.to_string()))?,
 		};
-		{
+		let existing = {
 			let _mutation_lock = self.snapshot_mutation_lock()?;
-			if let Some(existing) =
-				self.reuse_existing_locked(&destination, &reference, None, &expected_snapshot)?
-			{
-				return Ok(existing);
-			}
-		}
-		let mut report = inspect_directory(
-			reference.clone(),
-			staging.path(),
-			self.workload()?,
-			self.metal_budget_bytes,
-		)?;
+			self.reuse_existing_locked(
+				&destination,
+				&reference,
+				None,
+				&expected_snapshot,
+				ModelSourceKind::LocalOwned,
+				None,
+			)?
+		};
+		let installed = if let Some(existing) = existing {
+			existing
+		} else {
+			let traits = self.certify_local_runtime(reference.clone(), staging.path(), &files)?;
+			let manifest = ModelManifest::new(
+				reference,
+				ModelSource::LocalImport {
+					original_path: source.clone(),
+				},
+				None,
+				files,
+				traits,
+				VerificationStatus::Verified,
+				None,
+			)?;
+			write_manifest(staging.path(), &manifest)?;
+			self.publish(staging, &destination, &manifest, None)?
+		};
+		let disposition = if matches!(options.mode, ImportMode::Move) {
+			retire_source_files(&source, &source_snapshots, installed.manifest().files())
+		} else {
+			ImportSourceDisposition::Preserved
+		};
+		Ok(ImportOutcome {
+			installed,
+			disposition,
+		})
+	}
+
+	fn import_symlink(
+		&self,
+		name: &LocalModelName,
+		source: &Path,
+		reference: ModelRef,
+		source_report: CompatibilityReport,
+		plan: &[String],
+	) -> Result<ImportOutcome, ModelsError> {
+		let files = snapshot_runtime_files(source, plan)?;
+		let digest = snapshot_digest(&files);
+		let destination = self.local_destination(name, &digest);
+		let expected_snapshot = ModelSnapshotId::Local {
+			name: name.clone(),
+			digest: crate::model::SnapshotDigest::parse(digest)
+				.map_err(|error| ModelsError::Configuration(error.to_string()))?,
+		};
+		let existing = {
+			let _mutation_lock = self.snapshot_mutation_lock()?;
+			self.reuse_existing_locked(
+				&destination,
+				&reference,
+				None,
+				&expected_snapshot,
+				ModelSourceKind::LocalSymlink,
+				Some(source),
+			)?
+		};
+		let installed = if let Some(existing) = existing {
+			existing
+		} else {
+			let traits = self.certify_local_runtime_report(source, &files, source_report)?;
+			let manifest = ModelManifest::new(
+				reference,
+				ModelSource::LocalSymlink {
+					original_path: source.to_path_buf(),
+				},
+				None,
+				files,
+				traits,
+				VerificationStatus::Verified,
+				None,
+			)?;
+			let staging = self.create_staging("linked")?;
+			std::os::unix::fs::symlink(source, staging.path().join(LINKED_SOURCE_NAME)).map_err(
+				|source_error| ModelsError::Io {
+					path: staging.path().join(LINKED_SOURCE_NAME),
+					source: source_error,
+				},
+			)?;
+			write_manifest(staging.path(), &manifest)?;
+			self.publish_link(staging, &destination, &manifest)?
+		};
+		let ModelSource::LocalSymlink { original_path } = installed.manifest().source() else {
+			return Err(ModelsError::ManifestEncoding(
+				"symlink import resolved to a non-link snapshot".to_string(),
+			));
+		};
+		let disposition = ImportSourceDisposition::Linked {
+			path: original_path.clone(),
+		};
+		Ok(ImportOutcome {
+			installed,
+			disposition,
+		})
+	}
+
+	fn certify_local_runtime(
+		&self,
+		reference: ModelRef,
+		path: &Path,
+		files: &[ModelFile],
+	) -> Result<crate::model::ModelTraits, ModelsError> {
+		let report = inspect_directory(reference, path, self.workload()?, self.metal_budget_bytes)?;
+		self.certify_local_runtime_report(path, files, report)
+	}
+
+	fn certify_local_runtime_report(
+		&self,
+		path: &Path,
+		files: &[ModelFile],
+		mut report: CompatibilityReport,
+	) -> Result<crate::model::ModelTraits, ModelsError> {
 		if !report.compatible {
 			return Err(ModelsError::Incompatible(report.reasons));
 		}
@@ -680,27 +954,14 @@ impl ModelManager {
 				..ModelLoadOptions::default()
 			},
 		)?;
-		let client = self.build_client(staging.path(), &policy, &files, None)?;
+		let client = self.build_client(path, &policy, files, None)?;
 		client.runtime_probe()?;
 		report.mark_runtime_loaded(
 			client.supports_mtp(),
 			client.supports_images(),
 			client.supports_audio(),
 		);
-		drop(client);
-		let manifest = ModelManifest::new(
-			reference,
-			ModelSource::LocalImport {
-				original_path: source,
-			},
-			None,
-			files,
-			report.traits,
-			VerificationStatus::Verified,
-			None,
-		)?;
-		write_manifest(staging.path(), &manifest)?;
-		self.publish(staging, &destination, &manifest, None)
+		Ok(report.traits)
 	}
 
 	/// Hash, inspect, and runtime-load one installed snapshot.
@@ -710,10 +971,11 @@ impl ModelManager {
 	/// Returns when any immutable file changed or the model no longer loads.
 	pub fn verify(&self, installed: &InstalledModel) -> Result<ModelVerification, ModelsError> {
 		self.validate_owned_install(installed)?;
-		verify_files(installed.path(), installed.manifest().files())?;
+		let runtime = runtime_directory(installed.path(), installed.manifest())?;
+		verify_runtime_files(installed.path(), &runtime, installed.manifest(), true)?;
 		let mut compatibility = inspect_directory(
 			installed.reference().clone(),
-			installed.path(),
+			&runtime,
 			self.workload()?,
 			self.metal_budget_bytes,
 		)?;
@@ -730,7 +992,7 @@ impl ModelManager {
 			},
 		)?;
 		let client = self.build_client(
-			installed.path(),
+			&runtime,
 			&policy,
 			installed.manifest().files(),
 			Some(installed.snapshot_id()),
@@ -758,11 +1020,11 @@ impl ModelManager {
 		options: &ModelLoadOptions,
 	) -> Result<Client, ModelsError> {
 		self.validate_owned_install(installed)?;
-		verify_files(installed.path(), installed.manifest().files())?;
+		let runtime = runtime_directory(installed.path(), installed.manifest())?;
 		let policy = self.resolve_load_policy(installed.manifest().traits(), options)?;
 		let compatibility = inspect_directory(
 			installed.reference().clone(),
-			installed.path(),
+			&runtime,
 			WorkloadProfile::new(1, policy.context_tokens)
 				.map_err(|error| ModelsError::Configuration(error.to_string()))?,
 			self.metal_budget_bytes,
@@ -771,7 +1033,7 @@ impl ModelManager {
 			return Err(ModelsError::Incompatible(compatibility.reasons));
 		}
 		let client = self.build_client(
-			installed.path(),
+			&runtime,
 			&policy,
 			installed.manifest().files(),
 			Some(installed.snapshot_id()),
@@ -1015,7 +1277,8 @@ impl ModelManager {
 		if canonical != expected {
 			return Err(ModelsError::UnsafeInstall(canonical));
 		}
-		verify_installed_files(&canonical, &manifest)?;
+		let runtime = runtime_directory(&canonical, &manifest)?;
+		verify_installed_files(&canonical, &runtime, &manifest)?;
 		Ok(InstalledModel::new(canonical, manifest))
 	}
 
@@ -1025,6 +1288,8 @@ impl ModelManager {
 		reference: &ModelRef,
 		revision: Option<&crate::model::ResolvedRevision>,
 		expected_snapshot: &ModelSnapshotId,
+		expected_source: ModelSourceKind,
+		expected_link_target: Option<&Path>,
 	) -> Result<Option<InstalledModel>, ModelsError> {
 		match fs::symlink_metadata(destination) {
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1041,7 +1306,16 @@ impl ModelManager {
 			&& installed.reference() == reference
 			&& installed.manifest().resolved_revision() == revision
 		{
-			return Ok(Some(installed.clone()));
+			if source_satisfies_import(
+				installed.manifest().source(),
+				expected_source,
+				expected_link_target,
+			) {
+				return Ok(Some(installed.clone()));
+			}
+			return Err(ModelsError::ImportOwnershipConflict(
+				installed.snapshot_id().clone(),
+			));
 		}
 		let occupant_snapshot = existing
 			.as_ref()
@@ -1098,6 +1372,54 @@ impl ModelManager {
 		cancellation: Option<&DownloadCancellation>,
 	) -> Result<InstalledModel, ModelsError> {
 		self.publish_inner_with_lock(staging, destination, expected, cancellation, None, || {})
+	}
+
+	fn publish_link(
+		&self,
+		mut staging: StagingGuard,
+		destination: &Path,
+		expected: &ModelManifest,
+	) -> Result<InstalledModel, ModelsError> {
+		let parent = destination
+			.parent()
+			.ok_or_else(|| ModelsError::UnsafeInstall(destination.to_path_buf()))?;
+		prepare_owned_directory(self.home.root(), parent)?;
+		let runtime = linked_runtime_directory(staging.path(), expected)?;
+		verify_linked_files(staging.path(), &runtime, expected)?;
+		sync_directory(staging.path())?;
+		set_mode(&staging.path().join(MANIFEST_NAME), 0o400)?;
+		let _mutation_lock = self.snapshot_mutation_lock()?;
+		if fs::symlink_metadata(destination).is_ok()
+			&& let Some(existing) = self.reuse_existing_locked(
+				destination,
+				expected.reference(),
+				expected.resolved_revision(),
+				expected.snapshot_id(),
+				ModelSourceKind::LocalSymlink,
+				match expected.source() {
+					ModelSource::LocalSymlink { original_path } => Some(original_path.as_path()),
+					ModelSource::Hub | ModelSource::LocalImport { .. } => None,
+				},
+			)? {
+			return Ok(existing);
+		}
+		fs::rename(staging.path(), destination).map_err(|source| ModelsError::Io {
+			path: destination.to_path_buf(),
+			source,
+		})?;
+		staging.moved_to(destination);
+		sync_directory(parent)?;
+		let installed = self.load_installed_at(destination)?;
+		if installed.manifest() != expected {
+			return Err(ModelsError::ManifestEncoding(
+				"published link manifest differs from verified staging manifest".to_string(),
+			));
+		}
+		set_mode(staging.path(), 0o500)?;
+		sync_directory(staging.path())?;
+		sync_directory(parent)?;
+		staging.commit();
+		Ok(installed)
 	}
 
 	fn publish_with_lock(
@@ -1162,7 +1484,6 @@ impl ModelManager {
 		make_read_only_contents(staging.path())?;
 		write_verification_stamp(staging.path(), expected)?;
 		set_mode(&staging.path().join(VERIFIED_STAMP_NAME), 0o400)?;
-		set_mode(staging.path(), 0o500)?;
 		before_rename();
 		check_download_cancellation(cancellation)?;
 		let _mutation_lock = match mutation_lock {
@@ -1175,6 +1496,8 @@ impl ModelManager {
 				expected.reference(),
 				expected.resolved_revision(),
 				expected.snapshot_id(),
+				model_source_kind(expected.source()),
+				None,
 			)? {
 			check_download_cancellation(cancellation)?;
 			return Ok(existing);
@@ -1192,6 +1515,9 @@ impl ModelManager {
 				"published manifest differs from verified staging manifest".to_string(),
 			));
 		}
+		set_mode(staging.path(), 0o500)?;
+		sync_directory(staging.path())?;
+		sync_directory(parent)?;
 		staging.commit();
 		Ok(installed)
 	}
@@ -1263,7 +1589,8 @@ pub(crate) fn revalidate_installed_snapshot(
 			"installed manifest changed since resolution".to_string(),
 		));
 	}
-	verify_installed_files(&path, &stored)
+	let runtime = runtime_directory(&path, &stored)?;
+	verify_installed_files(&path, &runtime, &stored)
 }
 
 #[cfg(test)]
@@ -1447,6 +1774,147 @@ fn validate_load_policy(
 	Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct SourceFileSnapshot {
+	relative_path: String,
+	runtime_path: String,
+	identity: FileIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+	size: u64,
+	device: u64,
+	inode: u64,
+	mtime_seconds: i64,
+	mtime_nanoseconds: i64,
+	ctime_seconds: i64,
+	ctime_nanoseconds: i64,
+}
+
+impl FileIdentity {
+	fn from_metadata(metadata: &fs::Metadata) -> Self {
+		Self {
+			size: metadata.len(),
+			device: metadata.dev(),
+			inode: metadata.ino(),
+			mtime_seconds: metadata.mtime(),
+			mtime_nanoseconds: metadata.mtime_nsec(),
+			ctime_seconds: metadata.ctime(),
+			ctime_nanoseconds: metadata.ctime_nsec(),
+		}
+	}
+}
+
+fn reject_home_overlap(home: &Path, source: &Path) -> Result<(), ModelsError> {
+	let home = fs::canonicalize(home).map_err(|source_error| ModelsError::Io {
+		path: home.to_path_buf(),
+		source: source_error,
+	})?;
+	let source = fs::canonicalize(source).map_err(|source_error| ModelsError::Io {
+		path: source.to_path_buf(),
+		source: source_error,
+	})?;
+	if source.starts_with(&home) || home.starts_with(&source) {
+		return Err(ModelsError::Configuration(format!(
+			"move and symlink sources must not overlap Emelex home: {}",
+			source.display()
+		)));
+	}
+	Ok(())
+}
+
+fn capture_source_snapshots(
+	source: &Path,
+	plan: &[String],
+) -> Result<Vec<SourceFileSnapshot>, ModelsError> {
+	let mut snapshots = Vec::with_capacity(plan.len());
+	let mut destinations = BTreeSet::new();
+	for relative_path in plan {
+		if !runtime_source_file_name(relative_path) {
+			return Err(ModelsError::UnsafeInstall(source.join(relative_path)));
+		}
+		let runtime_path = crate::hub::local_runtime_path(relative_path).to_string();
+		if !destinations.insert(runtime_path.clone()) {
+			return Err(ModelsError::Configuration(format!(
+				"runtime paths collide after normalization: {relative_path:?}"
+			)));
+		}
+		let path = source.join(relative_path);
+		let file = open_regular(&path)?;
+		let metadata = file.metadata().map_err(|source_error| ModelsError::Io {
+			path,
+			source: source_error,
+		})?;
+		snapshots.push(SourceFileSnapshot {
+			relative_path: relative_path.clone(),
+			runtime_path,
+			identity: FileIdentity::from_metadata(&metadata),
+		});
+	}
+	Ok(snapshots)
+}
+
+fn source_snapshots_or_plan_bytes(
+	source: &Path,
+	plan: &[String],
+	snapshots: &[SourceFileSnapshot],
+) -> Result<u64, ModelsError> {
+	if !snapshots.is_empty() {
+		return snapshots.iter().try_fold(0_u64, |total, snapshot| {
+			total.checked_add(snapshot.identity.size).ok_or_else(|| {
+				ModelsError::Configuration("local import byte count overflow".to_string())
+			})
+		});
+	}
+	plan.iter().try_fold(0_u64, |total, relative_path| {
+		let path = source.join(relative_path);
+		let metadata = fs::symlink_metadata(&path).map_err(|source_error| ModelsError::Io {
+			path,
+			source: source_error,
+		})?;
+		total.checked_add(metadata.len()).ok_or_else(|| {
+			ModelsError::Configuration("local import byte count overflow".to_string())
+		})
+	})
+}
+
+fn snapshot_runtime_files(source: &Path, plan: &[String]) -> Result<Vec<ModelFile>, ModelsError> {
+	let mut files = Vec::with_capacity(plan.len());
+	let mut destinations = BTreeSet::new();
+	for relative_path in plan {
+		if !runtime_source_file_name(relative_path) {
+			return Err(ModelsError::UnsafeInstall(source.join(relative_path)));
+		}
+		let runtime_path = crate::hub::local_runtime_path(relative_path);
+		if !destinations.insert(runtime_path) {
+			return Err(ModelsError::Configuration(format!(
+				"runtime paths collide after normalization: {relative_path:?}"
+			)));
+		}
+		let path = source.join(relative_path);
+		let mut file = open_regular(&path)?;
+		let before = file.metadata().map_err(|source_error| ModelsError::Io {
+			path: path.clone(),
+			source: source_error,
+		})?;
+		let (size, sha256) = hash_reader(&mut file, &path)?;
+		let after = file.metadata().map_err(|source_error| ModelsError::Io {
+			path: path.clone(),
+			source: source_error,
+		})?;
+		if !same_file_snapshot(&before, &after) {
+			return Err(ModelsError::Configuration(format!(
+				"runtime file changed while importing: {}",
+				path.display()
+			)));
+		}
+		files.push(ModelFile::new(runtime_path, size, sha256)?);
+	}
+	files.sort_by(|left, right| left.path().cmp(right.path()));
+	Ok(files)
+}
+
 fn copy_runtime_files(
 	source: &Path,
 	destination: &Path,
@@ -1467,6 +1935,10 @@ fn copy_runtime_files(
 		let source_path = source.join(name);
 		let target = destination.join(local_name);
 		let mut input = open_regular(&source_path)?;
+		let before = input.metadata().map_err(|source_error| ModelsError::Io {
+			path: source_path.clone(),
+			source: source_error,
+		})?;
 		let mut output = OpenOptions::new()
 			.write(true)
 			.create_new(true)
@@ -1509,6 +1981,16 @@ fn copy_runtime_files(
 			path: target,
 			source: source_error,
 		})?;
+		let after = input.metadata().map_err(|source_error| ModelsError::Io {
+			path: source_path.clone(),
+			source: source_error,
+		})?;
+		if !same_file_snapshot(&before, &after) {
+			return Err(ModelsError::Configuration(format!(
+				"runtime file changed while importing: {}",
+				source_path.display()
+			)));
+		}
 		files.push(ModelFile::new(
 			local_name.to_string(),
 			size,
@@ -1518,6 +2000,152 @@ fn copy_runtime_files(
 	files.sort_by(|left, right| left.path().cmp(right.path()));
 	sync_directory(destination)?;
 	Ok(files)
+}
+
+fn retire_source_files(
+	source: &Path,
+	snapshots: &[SourceFileSnapshot],
+	files: &[ModelFile],
+) -> ImportSourceDisposition {
+	let expected = files
+		.iter()
+		.map(|file| (file.path(), file))
+		.collect::<std::collections::BTreeMap<_, _>>();
+	let mut diagnostics = Vec::new();
+	let mut parents = BTreeSet::new();
+	for snapshot in snapshots {
+		let Some(expected) = expected.get(snapshot.runtime_path.as_str()) else {
+			diagnostics.push(format!(
+				"installed manifest omitted selected source {:?}",
+				snapshot.relative_path
+			));
+			continue;
+		};
+		let path = source.join(&snapshot.relative_path);
+		match retire_unchanged_source_file(&path, snapshot.identity, expected) {
+			Ok(()) => {
+				if let Some(parent) = path.parent()
+					&& parent != source
+				{
+					parents.insert(parent.to_path_buf());
+				}
+			}
+			Err(error) => diagnostics.push(bounded_diagnostic(&error.to_string())),
+		}
+	}
+	let mut parents = parents.into_iter().collect::<Vec<_>>();
+	parents.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+	for parent in parents {
+		match fs::remove_dir(&parent) {
+			Ok(()) => {}
+			Err(error)
+				if matches!(
+					error.kind(),
+					std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+				) => {}
+			Err(error) => diagnostics.push(bounded_diagnostic(&format!(
+				"cannot remove empty source directory {}: {error}",
+				parent.display()
+			))),
+		}
+	}
+	match fs::remove_dir(source) {
+		Ok(()) if diagnostics.is_empty() => ImportSourceDisposition::Removed,
+		Ok(()) => ImportSourceDisposition::Retained {
+			path: source.to_path_buf(),
+			message: diagnostics.join("; "),
+		},
+		Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+			diagnostics.push(
+				"source directory retained because it contains files not selected for runtime"
+					.to_string(),
+			);
+			ImportSourceDisposition::Retained {
+				path: source.to_path_buf(),
+				message: diagnostics.join("; "),
+			}
+		}
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound && diagnostics.is_empty() => {
+			ImportSourceDisposition::Removed
+		}
+		Err(error) => {
+			diagnostics.push(bounded_diagnostic(&format!(
+				"cannot remove source directory {}: {error}",
+				source.display()
+			)));
+			ImportSourceDisposition::Retained {
+				path: source.to_path_buf(),
+				message: diagnostics.join("; "),
+			}
+		}
+	}
+}
+
+fn retire_unchanged_source_file(
+	path: &Path,
+	identity: FileIdentity,
+	expected: &ModelFile,
+) -> Result<(), ModelsError> {
+	let mut file = open_regular(path)?;
+	let before = file.metadata().map_err(|source| ModelsError::Io {
+		path: path.to_path_buf(),
+		source,
+	})?;
+	if FileIdentity::from_metadata(&before) != identity {
+		return Err(ModelsError::Configuration(format!(
+			"source file changed after import and was retained: {}",
+			path.display()
+		)));
+	}
+	let (size, sha256) = hash_reader(&mut file, path)?;
+	let after = file.metadata().map_err(|source| ModelsError::Io {
+		path: path.to_path_buf(),
+		source,
+	})?;
+	if !same_file_snapshot(&before, &after)
+		|| size != expected.size()
+		|| sha256 != expected.sha256()
+	{
+		return Err(ModelsError::Configuration(format!(
+			"source file changed after import and was retained: {}",
+			path.display()
+		)));
+	}
+	drop(file);
+	let parent = path
+		.parent()
+		.ok_or_else(|| ModelsError::UnsafeInstall(path.to_path_buf()))?;
+	let tombstone = parent.join(format!(".emelex-move-{}", uuid::Uuid::now_v7()));
+	fs::rename(path, &tombstone).map_err(|source| ModelsError::Io {
+		path: path.to_path_buf(),
+		source,
+	})?;
+	let moved_metadata = match fs::symlink_metadata(&tombstone) {
+		Ok(metadata) => metadata,
+		Err(source) => {
+			let _ = fs::rename(&tombstone, path);
+			return Err(ModelsError::Io {
+				path: tombstone,
+				source,
+			});
+		}
+	};
+	let moved_identity = FileIdentity::from_metadata(&moved_metadata);
+	if moved_metadata.file_type().is_symlink()
+		|| moved_identity.size != identity.size
+		|| moved_identity.device != identity.device
+		|| moved_identity.inode != identity.inode
+	{
+		let _ = fs::rename(&tombstone, path);
+		return Err(ModelsError::Configuration(format!(
+			"source file identity changed during retirement and was restored: {}",
+			path.display()
+		)));
+	}
+	fs::remove_file(&tombstone).map_err(|source| ModelsError::Io {
+		path: tombstone,
+		source,
+	})
 }
 
 fn local_runtime_plan(source: &Path) -> Result<Vec<String>, ModelsError> {
@@ -1928,14 +2556,163 @@ fn verify_files(root: &Path, files: &[ModelFile]) -> Result<(), ModelsError> {
 	Ok(())
 }
 
-fn verify_installed_files(root: &Path, manifest: &ModelManifest) -> Result<(), ModelsError> {
-	verify_file_inventory(root, manifest.files())?;
-	if !verification_stamp_matches(root, manifest.files())? {
+fn runtime_directory(
+	install_directory: &Path,
+	manifest: &ModelManifest,
+) -> Result<PathBuf, ModelsError> {
+	match manifest.source() {
+		ModelSource::LocalSymlink { .. } => linked_runtime_directory(install_directory, manifest),
+		ModelSource::Hub | ModelSource::LocalImport { .. } => Ok(install_directory.to_path_buf()),
+	}
+}
+
+fn linked_runtime_directory(
+	install_directory: &Path,
+	manifest: &ModelManifest,
+) -> Result<PathBuf, ModelsError> {
+	let ModelSource::LocalSymlink { original_path } = manifest.source() else {
+		return Err(ModelsError::ManifestEncoding(
+			"managed link record has a non-link source".to_string(),
+		));
+	};
+	let link = install_directory.join(LINKED_SOURCE_NAME);
+	let metadata = fs::symlink_metadata(&link).map_err(|source| ModelsError::Io {
+		path: link.clone(),
+		source,
+	})?;
+	if !metadata.file_type().is_symlink() {
+		return Err(ModelsError::UnsafeInstall(link));
+	}
+	let recorded_target = fs::read_link(&link).map_err(|source| ModelsError::Io {
+		path: link.clone(),
+		source,
+	})?;
+	if &recorded_target != original_path {
+		return Err(ModelsError::UnsafeInstall(link));
+	}
+	let target = fs::canonicalize(&link).map_err(|source| ModelsError::Io {
+		path: original_path.clone(),
+		source,
+	})?;
+	if &target != original_path || !target.is_dir() {
+		return Err(ModelsError::UnsafeInstall(target));
+	}
+	Ok(target)
+}
+
+fn declared_link_record(link: &Path) -> bool {
+	let Some(parent) = link.parent() else {
+		return false;
+	};
+	read_manifest(parent)
+		.is_ok_and(|manifest| matches!(manifest.source(), ModelSource::LocalSymlink { .. }))
+}
+
+fn verify_link_record_inventory(root: &Path) -> Result<(), ModelsError> {
+	let mut actual = BTreeSet::new();
+	for entry in fs::read_dir(root).map_err(|source| ModelsError::Io {
+		path: root.to_path_buf(),
+		source,
+	})? {
+		let entry = entry.map_err(|source| ModelsError::Io {
+			path: root.to_path_buf(),
+			source,
+		})?;
+		let name = entry
+			.file_name()
+			.into_string()
+			.map_err(|_| ModelsError::UnsafeInstall(entry.path()))?;
+		let file_type = entry.file_type().map_err(|source| ModelsError::Io {
+			path: entry.path(),
+			source,
+		})?;
+		match name.as_str() {
+			MANIFEST_NAME if file_type.is_file() && !file_type.is_symlink() => {}
+			LINKED_SOURCE_NAME if file_type.is_symlink() => {}
+			_ => return Err(ModelsError::UnexpectedRuntimeFile(entry.path())),
+		}
+		actual.insert(name);
+	}
+	let expected = BTreeSet::from([MANIFEST_NAME.to_string(), LINKED_SOURCE_NAME.to_string()]);
+	if actual != expected {
+		return Err(ModelsError::RuntimeInventory {
+			expected: expected.into_iter().collect(),
+			actual: actual.into_iter().collect(),
+		});
+	}
+	Ok(())
+}
+
+fn verify_linked_files(
+	install_directory: &Path,
+	runtime_directory: &Path,
+	manifest: &ModelManifest,
+) -> Result<(), ModelsError> {
+	verify_link_record_inventory(install_directory)?;
+	let plan = local_runtime_plan(runtime_directory)?;
+	let files = snapshot_runtime_files(runtime_directory, &plan)?;
+	let actual_paths = files
+		.iter()
+		.map(|file| file.path().to_string())
+		.collect::<Vec<_>>();
+	let expected_paths = manifest
+		.files()
+		.iter()
+		.map(|file| file.path().to_string())
+		.collect::<Vec<_>>();
+	if actual_paths != expected_paths {
+		return Err(ModelsError::RuntimeInventory {
+			expected: expected_paths,
+			actual: actual_paths,
+		});
+	}
+	for (actual, expected) in files.iter().zip(manifest.files()) {
+		if actual.size() != expected.size() || actual.sha256() != expected.sha256() {
+			return Err(ModelsError::CorruptFile {
+				path: runtime_directory.join(expected.path()),
+				expected_size: expected.size(),
+				actual_size: actual.size(),
+				expected_sha256: expected.sha256().to_string(),
+				actual_sha256: actual.sha256().to_string(),
+			});
+		}
+	}
+	Ok(())
+}
+
+fn verify_installed_files(
+	install_directory: &Path,
+	runtime_directory: &Path,
+	manifest: &ModelManifest,
+) -> Result<(), ModelsError> {
+	if matches!(manifest.source(), ModelSource::LocalSymlink { .. }) {
+		return verify_linked_files(install_directory, runtime_directory, manifest);
+	}
+	if install_directory != runtime_directory {
+		return Err(ModelsError::UnsafeInstall(runtime_directory.to_path_buf()));
+	}
+	verify_file_inventory(runtime_directory, manifest.files())?;
+	if !verification_stamp_matches(runtime_directory, manifest.files())? {
 		return Err(ModelsError::InvalidVerificationStamp(
 			manifest.snapshot_id().clone(),
 		));
 	}
 	Ok(())
+}
+
+fn verify_runtime_files(
+	install_directory: &Path,
+	runtime_directory: &Path,
+	manifest: &ModelManifest,
+	force_hash: bool,
+) -> Result<(), ModelsError> {
+	if matches!(manifest.source(), ModelSource::LocalSymlink { .. }) {
+		verify_linked_files(install_directory, runtime_directory, manifest)
+	} else if force_hash {
+		verify_files(runtime_directory, manifest.files())
+	} else {
+		verify_installed_files(install_directory, runtime_directory, manifest)
+	}
 }
 
 async fn verify_files_controlled(
@@ -2242,10 +3019,68 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), ModelsError> {
 	})
 }
 
+struct DirectoryRenamePermissions {
+	directory: fs::File,
+	original: fs::Permissions,
+	path: PathBuf,
+}
+
+impl DirectoryRenamePermissions {
+	fn prepare(path: &Path) -> Result<Option<Self>, ModelsError> {
+		let metadata = fs::symlink_metadata(path).map_err(|source| ModelsError::Io {
+			path: path.to_path_buf(),
+			source,
+		})?;
+		if !metadata.file_type().is_dir() {
+			return Ok(None);
+		}
+		let directory = OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+			.open(path)
+			.map_err(|source| ModelsError::Io {
+				path: path.to_path_buf(),
+				source,
+			})?;
+		let original = directory
+			.metadata()
+			.map_err(|source| ModelsError::Io {
+				path: path.to_path_buf(),
+				source,
+			})?
+			.permissions();
+		let mut writable = original.clone();
+		writable.set_mode(original.mode() | 0o200);
+		directory
+			.set_permissions(writable)
+			.map_err(|source| ModelsError::Io {
+				path: path.to_path_buf(),
+				source,
+			})?;
+		Ok(Some(Self {
+			directory,
+			original,
+			path: path.to_path_buf(),
+		}))
+	}
+
+	fn restore(self) -> Result<(), ModelsError> {
+		self.directory
+			.set_permissions(self.original)
+			.map_err(|source| ModelsError::Io {
+				path: self.path,
+				source,
+			})
+	}
+}
+
 fn make_writable(path: &Path) -> Result<(), ModelsError> {
 	for entry in WalkDir::new(path).follow_links(false) {
 		let entry = entry.map_err(|error| ModelsError::Walk(error.to_string()))?;
 		if entry.file_type().is_symlink() {
+			if entry.file_name() == LINKED_SOURCE_NAME {
+				continue;
+			}
 			return Err(ModelsError::UnsafeInstall(entry.path().to_path_buf()));
 		}
 		let mode = if entry.file_type().is_dir() {
@@ -2327,13 +3162,24 @@ fn move_to_quarantine(
 		})?;
 	drop(record_file);
 	let payload = destination.join("payload");
+	let rename_permissions = DirectoryRenamePermissions::prepare(source)?;
 	if let Err(source_error) = fs::rename(source, &payload) {
+		let restore_error = rename_permissions
+			.map(DirectoryRenamePermissions::restore)
+			.transpose()
+			.err();
 		let _ = fs::remove_file(destination.join(QUARANTINE_RECORD_NAME));
 		let _ = fs::remove_dir(&destination);
+		if let Some(error) = restore_error {
+			return Err(error);
+		}
 		return Err(ModelsError::Io {
 			path: source.to_path_buf(),
 			source: source_error,
 		});
+	}
+	if let Some(rename_permissions) = rename_permissions {
+		rename_permissions.restore()?;
 	}
 	if let Some(source_parent) = source.parent() {
 		sync_directory(source_parent)?;
@@ -2535,6 +3381,13 @@ pub enum ModelsError {
 	/// Durable state still references the snapshot.
 	#[error("model snapshot is still referenced by a durable session: {0}")]
 	SnapshotReferenced(ModelSnapshotId),
+	/// A healthy local snapshot already occupies this content address with
+	/// different ownership semantics or a different external target.
+	#[error(
+		"model snapshot {0} is already installed with different ownership or link-target \
+		 semantics; remove that exact snapshot before re-importing"
+	)]
+	ImportOwnershipConflict(ModelSnapshotId),
 	/// Snapshot-reference policy could not decide safely.
 	#[error("model snapshot reference guard failed: {0}")]
 	ReferenceGuard(#[source] SnapshotReferenceError),

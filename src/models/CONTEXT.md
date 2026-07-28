@@ -2,8 +2,10 @@
 
 ## Invariants
 
-- Visible snapshots are complete, manifest-valid, hash-valid, and runtime
-  load-verified.
+- Visible owned snapshots are complete, manifest-valid, hash-valid, and
+  runtime load-verified. Managed external links are a distinct weaker storage
+  mode: resolve revalidates link identity, runtime inventory, and full content
+  hashes; load repeats that work before compatibility checks and runtime load.
 - Candidate-specific planning and certification failures have a dedicated
   `ModelsError::Certification` boundary. Only static JSON/config/layout
   rejection, candidate privacy/compatibility/fit changes during planning,
@@ -25,14 +27,30 @@
 - Controlled verification dispatches inventory walks, stamp reads, and secure
   contained opens to blocking workers, with cancellation checks around every
   join. Descriptor hashing uses cancellable async chunks.
-- Inventory skips corrupt candidates and retains bounded per-entry diagnostics.
-- Snapshot paths stay under the selected Emelex Home.
+- Inventory skips corrupt or unavailable candidates and retains bounded
+  per-entry diagnostics.
+- Owned snapshot paths and all link records stay under the selected Emelex
+  Home. A link record may name one canonical caller-owned external target.
 - Hub snapshot paths carry an explicit `unnamespaced` or `namespaced`
   discriminator before validated repository components, preventing
   one-component IDs from colliding with two-component IDs.
-- Files are read-only after publication; updates create a new revision.
+- Owned files are read-only after publication; updates create a new revision.
+- Copy import leaves its source untouched. Move import commits the copied
+  snapshot first, then retires only selected source files whose identity and
+  content still match the copy. Changed and unselected files remain, cleanup
+  failures warn, and the committed snapshot is never rolled back.
+- Move import is copy-then-retire rather than rename. It works across
+  filesystems and requires full temporary duplicate capacity.
+- Symlink import creates a managed record whose controlled link points to one
+  canonical external target. That target is mutable and may be unavailable;
+  every resolve/load performs full link, inventory, and hash validation, while
+  load additionally performs compatibility checks and runtime loading.
+- A healthy local name/digest collision across ownership modes or canonical
+  link targets is a typed conflict. Import preserves the existing record;
+  authority changes require exact removal followed by re-import.
 - Failed staging and removals move to Emelex quarantine.
-- Offline load performs no network access and verifies immutable files.
+- Owned snapshots remain self-contained for offline load. A linked model uses
+  no network but depends on its external target remaining locally available.
 - A descriptor-bound verification stamp permits a persistent hash fast path
   only while file identity, size, mtime, and ctime remain unchanged.
 - Removal, durable session binding, and quarantine deletion share one
@@ -52,3 +70,5 @@
   exists.
 - Destructive removal resolves an exact `ModelSnapshotId`, never a mutable
   stable reference.
+- Removing an external link deletes only its managed record. It never deletes,
+  quarantines, chmods, or otherwise modifies the external target.

@@ -1571,7 +1571,7 @@ impl MemoryStore {
 		}
 	}
 
-	/// Bind a session to one immutable installed-model snapshot.
+	/// Bind a session to one exact installed-model content identity.
 	///
 	/// Repeating the same binding is idempotent. A different binding is
 	/// rejected so resumed sessions cannot silently change models.

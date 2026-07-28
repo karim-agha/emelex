@@ -8,6 +8,8 @@ Accepted Emelex architecture decisions:
 4. [Agent sessions, workspaces, and approvals](0004-agent-session-and-approvals.md)
 5. [Byte-bound MTP certification](0005-mtp-certification.md)
 6. [Lazy invocation facets](0006-lazy-invocation-facets.md)
+7. [Local model import ownership modes](0007-local-model-import-ownership.md)
+8. [Hub credential storage and precedence](0008-hub-credential-precedence.md)
 
 Supersede a decision with a new ADR. Do not rewrite history once a release
 depends on it.

@@ -51,7 +51,12 @@ pub(crate) enum Command {
 		#[command(subcommand)]
 		command: HubCommand,
 	},
-	/// Manage Emelex-owned immutable model snapshots.
+	/// Import a local model checkpoint.
+	Model {
+		#[command(subcommand)]
+		command: ModelCommand,
+	},
+	/// Manage installed model snapshots and external links.
 	Models {
 		#[command(subcommand)]
 		command: ModelsCommand,
@@ -187,6 +192,11 @@ pub(crate) enum ThinkingArg {
 /// Hugging Face Hub operation.
 #[derive(Debug, Subcommand)]
 pub(crate) enum HubCommand {
+	/// Manage stored Hugging Face authentication.
+	Auth {
+		#[command(subcommand)]
+		command: HubAuthCommand,
+	},
 	/// List filters supported during remote catalog discovery.
 	Capabilities,
 	/// Search MLX Hub ranking for models compatible with this machine.
@@ -205,7 +215,7 @@ pub(crate) enum HubCommand {
 	},
 	/// Inspect one visible repository and its inferred traits.
 	Inspect {
-		/// Hugging Face repository visible anonymously or to `HF_TOKEN`.
+		/// Hugging Face repository visible to the effective Hub credentials.
 		model: HubModelId,
 		/// Print every compatibility diagnostic instead of the bounded summary.
 		#[arg(long)]
@@ -213,15 +223,54 @@ pub(crate) enum HubCommand {
 	},
 	/// Download, verify, runtime-probe, and publish one immutable snapshot.
 	Download {
-		/// Hugging Face repository visible anonymously or to `HF_TOKEN`.
+		/// Hugging Face repository visible to the effective Hub credentials.
 		model: HubModelId,
 	},
+}
+
+/// Stored Hugging Face authentication operation.
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub(crate) enum HubAuthCommand {
+	/// Read a token without exposing it in process arguments, then store it.
+	Login {
+		/// Read one bounded token from standard input instead of prompting.
+		#[arg(long)]
+		token_stdin: bool,
+	},
+	/// Report whether Hub authentication is active and where it comes from.
+	Status,
+	/// Remove the stored token.
+	Logout,
+}
+
+/// Preferred local-model operation.
+#[derive(Debug, Subcommand)]
+pub(crate) enum ModelCommand {
+	/// Import and verify a local checkpoint.
+	Import(ModelImportArgs),
+}
+
+/// Preferred local checkpoint import options.
+#[derive(Debug, Args)]
+pub(crate) struct ModelImportArgs {
+	/// Checkpoint directory.
+	#[arg(value_name = "PATH")]
+	pub(crate) path: PathBuf,
+	/// Stable local name; defaults to the canonical directory name.
+	#[arg(long, value_name = "NAME")]
+	pub(crate) name: Option<String>,
+	/// Publish a managed copy, then retire unchanged imported source files.
+	#[arg(long = "move", conflicts_with = "symlink")]
+	pub(crate) move_source: bool,
+	/// Link the checkpoint without copying it.
+	#[arg(long, conflicts_with = "move_source")]
+	pub(crate) symlink: bool,
 }
 
 /// Managed local model operation.
 #[derive(Debug, Subcommand)]
 pub(crate) enum ModelsCommand {
-	/// List installed immutable snapshots.
+	/// List installed snapshots and external links.
 	List,
 	/// Copy and verify a local checkpoint.
 	Import {
@@ -259,7 +308,7 @@ pub(crate) enum ModelsCommand {
 		#[arg(long, default_value_t = 7)]
 		older_than_days: u64,
 	},
-	/// Print the selected immutable snapshot directory.
+	/// Print the selected snapshot or link-record directory.
 	Path {
 		/// Stable installed model reference.
 		model: ModelRef,
@@ -504,6 +553,98 @@ mod tests {
 			Cli::try_parse_from(["emelex", "models", "import", "work", "/tmp/checkpoint"]).is_ok()
 		);
 		assert!(Cli::try_parse_from(["emelex", "models", "download", "owner/repo"]).is_err());
+	}
+
+	#[test]
+	fn preferred_model_import_parses_path_name_and_modes() {
+		let copied = Cli::try_parse_from(["emelex", "model", "import", "/tmp/checkpoint"])
+			.expect("copy import");
+		assert!(matches!(
+			copied.command,
+			Command::Model {
+				command: ModelCommand::Import(ModelImportArgs {
+					ref path,
+					name: None,
+					move_source: false,
+					symlink: false,
+				}),
+			} if path == &PathBuf::from("/tmp/checkpoint")
+		));
+
+		let moved = Cli::try_parse_from([
+			"emelex",
+			"model",
+			"import",
+			"/tmp/checkpoint",
+			"--name",
+			"work",
+			"--move",
+		])
+		.expect("move import");
+		assert!(matches!(
+			moved.command,
+			Command::Model {
+				command: ModelCommand::Import(ModelImportArgs {
+					ref path,
+					name: Some(ref name),
+					move_source: true,
+					symlink: false,
+				}),
+			} if path == &PathBuf::from("/tmp/checkpoint") && name == "work"
+		));
+
+		let linked =
+			Cli::try_parse_from(["emelex", "model", "import", "/tmp/checkpoint", "--symlink"])
+				.expect("symlink import");
+		assert!(matches!(
+			linked.command,
+			Command::Model {
+				command: ModelCommand::Import(ModelImportArgs {
+					move_source: false,
+					symlink: true,
+					..
+				}),
+			}
+		));
+
+		let conflict = Cli::try_parse_from([
+			"emelex",
+			"model",
+			"import",
+			"/tmp/checkpoint",
+			"--move",
+			"--symlink",
+		])
+		.expect_err("import modes must conflict");
+		assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
+		assert!(
+			Cli::try_parse_from(["emelex", "models", "import", "work", "/tmp/checkpoint"]).is_ok()
+		);
+		assert!(
+			Cli::try_parse_from(["emelex", "model", "import", "work", "/tmp/checkpoint",]).is_err()
+		);
+		assert!(Cli::try_parse_from(["emelex", "models", "import", "/tmp/checkpoint"]).is_err());
+	}
+
+	#[test]
+	fn hub_auth_never_accepts_a_token_argument() {
+		let login = Cli::try_parse_from(["emelex", "hub", "auth", "login", "--token-stdin"])
+			.expect("stdin login");
+		assert!(matches!(
+			login.command,
+			Command::Hub {
+				command: HubCommand::Auth {
+					command: HubAuthCommand::Login { token_stdin: true },
+				},
+			}
+		));
+		assert!(Cli::try_parse_from(["emelex", "hub", "auth", "status"]).is_ok());
+		assert!(Cli::try_parse_from(["emelex", "hub", "auth", "logout"]).is_ok());
+		assert!(Cli::try_parse_from(["emelex", "hub", "auth", "login", "hf_secret"]).is_err());
+		assert!(
+			Cli::try_parse_from(["emelex", "hub", "auth", "login", "--token", "hf_secret"])
+				.is_err()
+		);
 	}
 
 	#[test]

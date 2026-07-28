@@ -3,7 +3,8 @@
 ## Invariants
 
 - Hub identity follows the catalog's `repo_name` or
-  `namespace/repo_name` grammar; local imports always use `local:<name>`.
+  `namespace/repo_name` grammar; local copy, move, and external-link imports
+  always use `local:<name>`.
 - Hub revisions are full 40-character commit SHAs.
 - Durable bindings use exact `ModelSnapshotId` values; stable references are
   never sufficient for session identity.
@@ -33,7 +34,15 @@
   activations, and `max(512 MiB, 10% of weights)`.
 - MTP is either metadata-advertised or runtime-verified; layout checks are part
   of runtime verification, not a separately addressable support level.
-- Manifests describe Emelex-owned immutable snapshots; model loading is offline.
+- Manifests describe Emelex-owned immutable snapshots. Managed external-link
+  records describe canonical caller-owned targets separately.
+- Manifest schema v2 represents both ownership modes. Schema v1 owned-snapshot
+  manifests remain readable.
+- Owned snapshot loading is self-contained and offline. Linked loading uses no
+  network but depends on the external target, which is mutable and may be
+  unavailable. Resolve revalidates link identity, runtime inventory, and full
+  content hashes; load repeats that work before compatibility checks and
+  runtime loading.
 - The entire sizing aggregate is optional. `ModelTraits::sizing == None` means
   no sizing evidence; individual `ModelSizing` fields may also be unknown.
   Numeric filters fail closed for every missing value.
@@ -48,6 +57,8 @@
   complete-file digest before load. After MLX materialization, Emelex
   revalidates the still-open descriptor identity, length, and checkpoint
   layout without a second full-file hash.
+- Removing a managed external link removes only the Emelex record and never
+  mutates the caller-owned target.
 
 Rig response DTOs remain independent of engine types. Optional speculation
 accounting is copied onto the response produced by that exact call; no

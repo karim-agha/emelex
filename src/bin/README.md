@@ -66,8 +66,26 @@ retains the complete structured page. Downloads report files, bounded
 percentage progress, retries, and verification; Ctrl-C cooperatively cancels
 transfer, hashing, or retry waits before returning. An independently scheduled
 signal watcher sets the same cancellation flag during synchronous local
-inspection/load phases, and a final checkpoint precedes publication. `models
-remove` requires the exact snapshot ID printed by `models list`.
+inspection/load phases, and a final checkpoint precedes publication.
+
+`hub auth login` reads the token from a hidden prompt. `--token-stdin` switches
+to one bounded UTF-8 line on stdin; `--json` login requires this non-interactive
+form. No command accepts a token through argv.
+`hub auth status` prints only the effective source, never token material.
+`hub auth logout` clears global storage, but a present `HF_TOKEN` still wins.
+At the CLI boundary, nonempty `HF_TOKEN` overrides the stored token and empty
+`HF_TOKEN` explicitly disables authentication for one invocation.
+
+Preferred import uses singular `model import PATH`; its name defaults from the
+canonical directory and `--name NAME` overrides it. It copies an owned
+immutable snapshot by default. `--move` publishes first, then retires only
+unchanged selected source files; extra or changed files remain and produce a
+truthful cleanup warning. `--symlink` creates a managed record for a canonical
+caller-owned external target. Resolve/load revalidate its link, runtime
+inventory, and full hashes; load also checks compatibility and opens the
+runtime. Removal deletes only the record. Other lifecycle operations
+remain under `models`; `models remove` requires the exact snapshot ID printed
+by `models list`.
 
 Attachments are descriptor-stable and bounded. The self-contained CLI accepts
 JPEG, PNG, WebP, and PCM16/float32 WAV input. Encoded video and formats that

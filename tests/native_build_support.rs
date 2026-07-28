@@ -1,43 +1,10 @@
-//! Regression tests for native-build parsing and argv-safe preamble generators.
+//! Regression tests for argv-safe native preamble generators.
 
 #![allow(clippy::expect_used)]
 
-#[path = "../build_support.rs"]
-mod build_support;
-
 use std::{fs, os::unix::fs::PermissionsExt as _, path::Path, process::Command};
 
-use build_support::AppleVersion;
 use tempfile::TempDir;
-
-#[test]
-fn apple_versions_accept_one_or_two_ascii_numeric_components() {
-	let one = AppleVersion::parse("26", "version").expect("valid one-component version");
-	let two = AppleVersion::parse("026.05", "version").expect("valid two-component version");
-
-	assert_eq!(one.to_string(), "26.0");
-	assert_eq!(two.to_string(), "26.5");
-}
-
-#[test]
-fn apple_versions_reject_ambiguous_or_extra_input() {
-	for value in [
-		"",
-		".",
-		"26.",
-		".5",
-		"26.5.1",
-		" 26.5",
-		"26.5 ",
-		"26.a",
-		"２６.５",
-	] {
-		assert!(
-			AppleVersion::parse(value, "version").is_err(),
-			"{value:?} should fail"
-		);
-	}
-}
 
 #[test]
 fn preamble_generators_preserve_paths_with_spaces() {

@@ -6,16 +6,30 @@ use anyhow::{Context as _, bail};
 use emelex::{
 	Emelex,
 	config::Config,
-	model::{LocalModelName, ModelRef},
-	models::ModelManager,
+	model::{InstalledModel, LocalModelName, ModelRef},
+	models::{ImportMode, ImportOptions, ImportSourceDisposition, ModelManager},
 };
 
 use super::{
-	args::ModelsCommand,
+	args::{ModelCommand, ModelImportArgs, ModelsCommand},
 	hub_cmd::{download, installed_json, trait_summary},
 	output,
 	style::{Palette, bytes},
 };
+
+pub(crate) fn run_model(
+	emelex: &Emelex,
+	command: ModelCommand,
+	json: bool,
+	stdout_palette: Palette,
+	stderr_palette: Palette,
+) -> anyhow::Result<()> {
+	match command {
+		ModelCommand::Import(args) => {
+			import_checkpoint(emelex, args, json, stdout_palette, stderr_palette)
+		}
+	}
+}
 
 pub(crate) async fn run(
 	emelex: &Emelex,
@@ -33,15 +47,7 @@ pub(crate) async fn run(
 				.context("initialize model manager")?
 				.import(&name, &path)
 				.with_context(|| format!("import checkpoint {}", path.display()))?;
-			if json {
-				output::json_line(&installed_json(&installed))
-			} else {
-				output::stdout_line(&format!(
-					"{} {}",
-					stdout_palette.green("installed"),
-					output::terminal_safe_inline(&installed.path().display().to_string())
-				))
-			}
+			write_import_result(&installed, None, json, stdout_palette, stderr_palette)
 		}
 		ModelsCommand::Default { model, clear } => default_model(emelex, model, clear, json),
 		ModelsCommand::Update { model } => {
@@ -105,6 +111,83 @@ pub(crate) async fn run(
 			}
 		}
 	}
+}
+
+fn import_checkpoint(
+	emelex: &Emelex,
+	args: ModelImportArgs,
+	json: bool,
+	stdout_palette: Palette,
+	stderr_palette: Palette,
+) -> anyhow::Result<()> {
+	let name = import_name(&args.path, args.name)?;
+	let mode = if args.move_source {
+		ImportMode::Move
+	} else if args.symlink {
+		ImportMode::Symlink
+	} else {
+		ImportMode::Copy
+	};
+	let options = ImportOptions::default().mode(mode);
+	let outcome = emelex
+		.models()
+		.context("initialize model manager")?
+		.import_with_options(&name, &args.path, options)
+		.with_context(|| format!("import checkpoint {}", args.path.display()))?;
+	write_import_result(
+		outcome.installed(),
+		Some(outcome.disposition()),
+		json,
+		stdout_palette,
+		stderr_palette,
+	)
+}
+
+fn import_name(path: &std::path::Path, explicit: Option<String>) -> anyhow::Result<LocalModelName> {
+	if let Some(name) = explicit {
+		return LocalModelName::parse(name).context("validate local model name");
+	}
+	let canonical = std::fs::canonicalize(path)
+		.with_context(|| format!("resolve checkpoint directory {}", path.display()))?;
+	let name = canonical
+		.file_name()
+		.and_then(std::ffi::OsStr::to_str)
+		.context(
+			"derive local model name from checkpoint directory; pass an ASCII name with --name",
+		)?;
+	LocalModelName::parse(name)
+		.context("derive local model name from checkpoint directory; pass a valid name with --name")
+}
+
+fn write_import_result(
+	installed: &InstalledModel,
+	disposition: Option<&ImportSourceDisposition>,
+	json: bool,
+	stdout_palette: Palette,
+	stderr_palette: Palette,
+) -> anyhow::Result<()> {
+	if json {
+		let mut result = installed_json(installed);
+		if let (Some(fields), Some(disposition)) = (result.as_object_mut(), disposition) {
+			fields.insert(
+				"source_disposition".to_string(),
+				serde_json::to_value(disposition).context("encode import source disposition")?,
+			);
+		}
+		return output::json_line(&result);
+	}
+	output::stdout_line(&format!(
+		"{} {}",
+		stdout_palette.green("installed"),
+		output::terminal_safe_inline(&installed.path().display().to_string())
+	))?;
+	if let Some(ImportSourceDisposition::Retained {
+		message: warning, ..
+	}) = disposition
+	{
+		output::stderr_line(&stderr_palette.yellow(&output::terminal_safe_inline(warning)))?;
+	}
+	Ok(())
 }
 
 fn default_model(
@@ -326,5 +409,25 @@ mod tests {
 		assert!(!line.contains('\u{202e}'));
 		assert!(line.contains('\u{240a}'));
 		assert!(line.contains('\u{2409}'));
+	}
+
+	#[test]
+	fn import_name_defaults_to_canonical_directory_name() {
+		let directory = tempfile::tempdir().expect("temporary directory");
+		let checkpoint = directory.path().join("mlx-checkpoint");
+		std::fs::create_dir(&checkpoint).expect("checkpoint directory");
+
+		let name = import_name(&checkpoint, None).expect("derived model name");
+		assert_eq!(name.as_str(), "mlx-checkpoint");
+	}
+
+	#[test]
+	fn explicit_import_name_does_not_require_an_existing_path() {
+		let name = import_name(
+			std::path::Path::new("/missing/checkpoint"),
+			Some("work".to_string()),
+		)
+		.expect("explicit model name");
+		assert_eq!(name.as_str(), "work");
 	}
 }

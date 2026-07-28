@@ -38,8 +38,9 @@ erase the fact that a host tool may already have run.
 
 Model binding accepts a typed `InstalledModel`, not caller-supplied strings.
 Emelex takes the Home-wide snapshot-mutation lock, revalidates the installed
-path, manifest, inventory, stamp, and hashes, derives the stable reference and
-exact snapshot ID, and holds the lock through the database commit. Model
+path and manifest, then validates either the owned snapshot stamp or the linked
+target's identity, inventory, and full hashes. It derives the stable reference
+and exact snapshot ID and holds the lock through the database commit. Model
 removal uses the same lock and a lazy `MemorySnapshotReferenceGuard`, closing
 the check/mutate race across processes. `ModelManager::new` installs this guard
 by default, so direct library construction cannot silently bypass retained

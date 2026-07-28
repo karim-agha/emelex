@@ -16,8 +16,25 @@ Project files are untrusted repository input. They may disable tools and lower
 resource/network limits, never re-enable or raise values denied by global
 configuration. Model selection, deterministic seeds, system prompts, memory
 models, and enabling thinking remain global/CLI authority; putting those fields
-in `.emelex.toml` is a hard error, not a silent no-op. No configuration field
-can redirect the Emelex home/database or grant approvals.
+in `.emelex.toml` is a hard error, not a silent no-op. Hub credentials are also
+global-only: optional `[hub].token` is accepted in `<home>/config.toml` and
+forbidden in `.emelex.toml`. No configuration field can redirect the Emelex
+home/database or grant approvals.
+
+The global Hub token is extracted as secret invocation state rather than
+stored in resolved `Config`. Explicit `HubCredentials` supplied to
+`EmelexBuilder` override it; without either, facade Hub access is anonymous.
+The library never reads `HF_TOKEN`. At the CLI boundary, a present `HF_TOKEN`
+overrides global storage: a nonempty value authenticates and an empty value
+explicitly selects anonymous access. When the variable is absent, the stored
+token may be used.
+
+`emelex hub auth login` reads a token from a hidden terminal prompt.
+`emelex hub auth login --token-stdin` instead accepts one bounded UTF-8 line
+from stdin; tokens are never command-line arguments. `status` reports only the
+effective credential source, never the value. `logout` clears the stored token;
+an active `HF_TOKEN` environment override can still authenticate the current
+invocation.
 
 Resolved `inference.max_tokens` must not exceed
 `inference.context_tokens`, including after project reductions merge.
@@ -51,4 +68,7 @@ bypass file-loaded bounds or cross-field invariants.
 management surfaces. It validates the existing global file, preserves all
 other global keys, validates the new resolved global snapshot, and replaces
 `config.toml` atomically with an owner-only file. It never reads or serializes
-project configuration.
+project configuration. Hub authentication uses the same global-only,
+field-specific mutation principle: login/logout preserve unrelated global
+keys, never merge project configuration, and never route the token through
+resolved `Config`.

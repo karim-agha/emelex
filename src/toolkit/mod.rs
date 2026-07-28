@@ -83,7 +83,7 @@ impl Emelex {
 		})
 	}
 
-	/// Immutable installed-model manager.
+	/// Owned-snapshot and external-link model manager.
 	///
 	/// # Errors
 	///
@@ -144,7 +144,15 @@ pub struct EmelexBuilder {
 	invocation_root: Option<PathBuf>,
 	load_project_config: bool,
 	metal_budget_bytes: Option<u64>,
-	hub_credentials: Option<HubCredentials>,
+	hub_credentials: HubCredentialSelection,
+}
+
+#[derive(Debug, Clone, Default)]
+enum HubCredentialSelection {
+	#[default]
+	StoredFallback,
+	Explicit(HubCredentials),
+	Anonymous,
 }
 
 impl Default for EmelexBuilder {
@@ -154,7 +162,7 @@ impl Default for EmelexBuilder {
 			invocation_root: None,
 			load_project_config: true,
 			metal_budget_bytes: None,
-			hub_credentials: None,
+			hub_credentials: HubCredentialSelection::StoredFallback,
 		}
 	}
 }
@@ -190,11 +198,19 @@ impl EmelexBuilder {
 
 	/// Use explicit Hugging Face credentials for this invocation's Hub facets.
 	///
+	/// Explicit credentials override any token in the global configuration.
 	/// No environment variable is read by the library. Separate builders may
 	/// therefore carry distinct credentials in the same process.
 	#[must_use]
 	pub fn hub_credentials(mut self, credentials: HubCredentials) -> Self {
-		self.hub_credentials = Some(credentials);
+		self.hub_credentials = HubCredentialSelection::Explicit(credentials);
+		self
+	}
+
+	/// Suppress any global Hugging Face token for this invocation.
+	#[must_use]
+	pub fn anonymous_hub(mut self) -> Self {
+		self.hub_credentials = HubCredentialSelection::Anonymous;
 		self
 	}
 
@@ -230,8 +246,14 @@ impl EmelexBuilder {
 				),
 			});
 		}
-		let (config, config_sources) =
-			Config::load(&home, &invocation_root, self.load_project_config)?;
+		let loaded = Config::load_for_emelex(&home, &invocation_root, self.load_project_config)?;
+		let hub_credentials = match self.hub_credentials {
+			HubCredentialSelection::StoredFallback => loaded.hub_credentials,
+			HubCredentialSelection::Explicit(credentials) => Some(credentials),
+			HubCredentialSelection::Anonymous => None,
+		};
+		let config = loaded.config;
+		let config_sources = loaded.sources;
 		if self.metal_budget_bytes == Some(0) {
 			return Err(ToolkitError::Configuration(
 				"Metal budget override must be positive".to_string(),
@@ -248,7 +270,7 @@ impl EmelexBuilder {
 			memory: OnceCell::new(),
 			metal_budget_bytes: OnceCell::new(),
 			metal_budget_override,
-			hub_credentials: self.hub_credentials,
+			hub_credentials,
 		})
 	}
 }
@@ -351,6 +373,70 @@ mod tests {
 				.hub()
 				.is_authenticated()
 		);
+	}
+
+	#[test]
+	fn stored_global_credentials_reach_both_lazy_hub_clients() {
+		let directory = tempfile::tempdir().expect("temporary invocation root");
+		let home = EmelexHome::prepare(&directory.path().join("home")).expect("prepare home");
+		Config::write_global_hub_token(&home, Some("hf_stored")).expect("store token");
+		let emelex = Emelex::builder()
+			.home(home.root())
+			.invocation_root(directory.path())
+			.metal_budget_bytes(123_456)
+			.build()
+			.expect("build authenticated invocation facade");
+
+		assert!(
+			emelex
+				.hub()
+				.expect("initialize static Hub client")
+				.is_authenticated()
+		);
+		assert!(
+			emelex
+				.models()
+				.expect("initialize model manager")
+				.hub()
+				.is_authenticated()
+		);
+	}
+
+	#[test]
+	fn explicit_anonymous_hub_suppresses_stored_credentials() {
+		let directory = tempfile::tempdir().expect("temporary invocation root");
+		let home = EmelexHome::prepare(&directory.path().join("home")).expect("prepare home");
+		Config::write_global_hub_token(&home, Some("hf_stored")).expect("store token");
+		let emelex = Emelex::builder()
+			.home(home.root())
+			.invocation_root(directory.path())
+			.metal_budget_bytes(123_456)
+			.anonymous_hub()
+			.build()
+			.expect("build anonymous invocation facade");
+
+		assert!(
+			!emelex
+				.hub()
+				.expect("initialize static Hub client")
+				.is_authenticated()
+		);
+		assert!(
+			!emelex
+				.models()
+				.expect("initialize model manager")
+				.hub()
+				.is_authenticated()
+		);
+	}
+
+	#[test]
+	fn builder_debug_redacts_explicit_credentials() {
+		let token = "hf_builder_secret";
+		let builder = Emelex::builder()
+			.hub_credentials(HubCredentials::bearer_token(token).expect("valid credentials"));
+
+		assert!(!format!("{builder:?}").contains(token));
 	}
 
 	#[test]
