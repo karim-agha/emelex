@@ -1,0 +1,60 @@
+{
+  "schema_version": 2,
+  "implementation_id": "emelex-qwen3.5-mtp-dense-bf16-v1",
+  "required_steps": 3,
+  "model": {
+    "source": {
+      "repository": "Qwen/Qwen3.5-4B",
+      "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+    },
+    "equivalence_reference": {
+      "repository": "mlx-community/Qwen3.5-4B-MTP-bf16",
+      "revision": "c05eea475606a952730182a0308d05c7cf7ccd77"
+    },
+    "files": [
+      {
+        "path": "config.json",
+        "sha256": "77025ed0b68732aea52fd24d5e537e3838838cac8fe4e920735266c6f7c4e454"
+      },
+      {
+        "path": "model-00001-of-00002.safetensors",
+        "sha256": "76eaf5f25a656064e175b5d2538cbf03ad1bf2917f4cb76dd08febf81b811801"
+      },
+      {
+        "path": "model-00002-of-00002.safetensors",
+        "sha256": "72b17f015dd762fe07db7668a772852c5ebd4652e0374433a0a836ae012fb83a"
+      }
+    ]
+  },
+  "reference": {
+    "converter": {
+      "repository": "https://github.com/AirRunner/mlx-lm.git",
+      "revision": "45f53582d64287aa875c1606e479f7f66c0afb58",
+      "package_version": "0.31.3",
+      "python_tree_sha256": "b8130c5a098083b1c5ce44bb1e120f5f6d28aab9886da30d134f91aeee931761"
+    },
+    "mlx_version": "0.32.0",
+    "python_version": "3.10.10"
+  },
+  "goldens": {
+    "generator": "tools/mtp_parity_dump.py",
+    "files": [
+      {
+        "path": "meta.json",
+        "sha256": "da4ce37a2a5ef6895fdf107526f85d35a973d4de080c42d9dc368ff88b998b37"
+      },
+      {
+        "path": "step0.npy",
+        "sha256": "1c7a420332767b69ae508ee3e728f4af61baea487a2b5e29b857236d01bcff7d"
+      },
+      {
+        "path": "step1.npy",
+        "sha256": "073d5f73e233b22677f2d079badc6304906e7b3c33455657afbeb217766d9ada"
+      },
+      {
+        "path": "step2.npy",
+        "sha256": "a13fa2611c59fba2b35b68cdd8eb09c35378aa1414d71f25a4af26abee0fe249"
+      }
+    ]
+  }
+}

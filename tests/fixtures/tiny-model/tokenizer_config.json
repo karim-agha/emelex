@@ -1,0 +1,5 @@
+{
+  "eos_token": "<|im_end|>",
+  "unk_token": "<unk>",
+  "model_max_length": 4096
+}

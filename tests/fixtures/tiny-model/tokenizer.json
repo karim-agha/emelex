@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    { "id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true },
+    { "id": 1, "content": "<|im_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true },
+    { "id": 2, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true },
+    { "id": 3, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true },
+    { "id": 4, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Whitespace" },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0,
+      "<|im_start|>": 1,
+      "<|im_end|>": 2,
+      "<think>": 3,
+      "</think>": 4,
+      "user": 5,
+      "assistant": 6,
+      "system": 7,
+      "hello": 8,
+      "world": 9,
+      "hi": 10,
+      "ok": 11,
+      "a": 12,
+      "b": 13,
+      "c": 14,
+      "d": 15
+    },
+    "unk_token": "<unk>"
+  }
+}

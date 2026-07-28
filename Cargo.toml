@@ -1,0 +1,190 @@
+[package]
+name = "emelex"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.93"
+description = "Apple Silicon local inference toolkit powered by MLX"
+documentation = "https://docs.rs/emelex"
+license = "MIT"
+readme = "README.md"
+keywords = ["mlx", "llm", "inference", "apple-silicon", "agent"]
+categories = ["command-line-utilities", "science"]
+links = "mlxc"
+build = "build.rs"
+include = [
+	"/src/**/*",
+	"/examples/**/*",
+	"/tests/**/*",
+	"/tools/*.py",
+	"/tools/*.sh",
+	"/docs/**/*",
+	"/vendor/**/*",
+	"/licenses/**/*",
+	"/build.rs",
+	"/build_support.rs",
+	"/Cargo.toml",
+	"/Cargo.lock",
+	"/rust-toolchain.toml",
+	"/README.md",
+	"/LICENSE",
+	"/ATTRIBUTION.md",
+	"/NOTICE.md",
+	"/deny.toml",
+	"/rustfmt.toml",
+	"/clippy.toml",
+]
+
+[workspace]
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "aarch64-apple-darwin"
+targets = []
+
+[features]
+default = ["cli"]
+cli = [
+	"dep:anyhow",
+	"dep:clap",
+	"dep:dialoguer",
+	"dep:mime_guess",
+	"dep:rustyline",
+	"dep:syntect",
+]
+rig = ["dep:rig-core"]
+bench = ["rig"]
+
+[[bin]]
+name = "emelex"
+path = "src/bin/emelex/main.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "mtp_bench"
+required-features = ["bench"]
+
+[[example]]
+name = "agent"
+required-features = ["rig"]
+
+[[example]]
+name = "chat"
+required-features = ["rig"]
+
+[[example]]
+name = "concurrent"
+required-features = ["rig"]
+
+[[example]]
+name = "extract"
+required-features = ["rig"]
+
+[[example]]
+name = "multi_tool"
+required-features = ["rig"]
+
+[[example]]
+name = "orchestration"
+required-features = ["rig"]
+
+[[example]]
+name = "rag"
+required-features = ["rig"]
+
+[[example]]
+name = "vision"
+required-features = ["rig"]
+
+[[test]]
+name = "live"
+required-features = ["rig"]
+
+[[test]]
+name = "public_api"
+required-features = ["rig"]
+
+[[test]]
+name = "runtime"
+
+[[test]]
+name = "native_api"
+
+[dependencies]
+anyhow = { version = "1.0", optional = true }
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6", features = ["derive", "color"], optional = true }
+dialoguer = { version = "0.12", optional = true }
+futures = "0.3"
+hex = "0.4"
+half = "2"
+image = { version = "0.25", default-features = false, features = [
+	"jpeg",
+	"png",
+	"webp",
+] }
+libc = "0.2"
+minijinja = { version = "2", features = ["fuel", "json", "loader"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+mime_guess = { version = "2.0", optional = true }
+once_cell = "1.21"
+rand = "0.8"
+reqwest = { version = "0.13", features = ["json", "query", "stream"] }
+rig-core = { version = "=0.40.0", optional = true }
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
+rustfft = "6"
+rustyline = { version = "18", features = ["derive"], optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+syntect = { version = "5.3", default-features = false, optional = true, features = [
+	"default-fancy",
+] }
+tempfile = "3.23"
+thiserror = "2.0"
+tokenizers = "0.22"
+tokio = { version = "1.52", features = ["full"] }
+toml = "1.1.2"
+tracing = "0.1"
+url = "2.5"
+uuid = { version = "1.19", features = ["serde", "v7"] }
+walkdir = "2.5"
+zstd = "0.13"
+
+[build-dependencies]
+bindgen = "0.72"
+cc = "1.2"
+cmake = "0.1"
+hex = "0.4"
+sha2 = "0.11"
+zstd = "0.13"
+
+[dev-dependencies]
+insta = { version = "1.43", features = ["json"] }
+tempfile = "3.23"
+tokio = { version = "1.52", features = ["full", "test-util"] }
+
+[lints.rust]
+future_incompatible = "deny"
+missing_docs = "deny"
+nonstandard_style = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -2 }
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"
+wildcard_imports = "allow"
+tabs_in_doc_comments = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+redundant_closure_for_method_calls = "allow"
+similar_names = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+future_not_send = "allow"
+needless_doctest_main = "allow"

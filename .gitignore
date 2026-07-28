@@ -1,0 +1,8 @@
+/target/
+/dist/
+/agents/worktrees/*
+!/agents/worktrees/.gitkeep
+*.profraw
+*.pyc
+__pycache__/
+.DS_Store
