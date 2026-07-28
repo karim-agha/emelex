@@ -2656,5 +2656,5 @@ fn mark_hub_candidate_certification_error(error: HubError) -> ModelsError {
 }
 
 #[cfg(test)]
-#[path = "models_tests.rs"]
+#[path = "tests.rs"]
 mod tests;

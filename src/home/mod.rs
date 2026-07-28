@@ -815,5 +815,5 @@ fn create_owner_subdir_from(
 }
 
 #[cfg(test)]
-#[path = "home_tests.rs"]
+#[path = "tests.rs"]
 mod tests;

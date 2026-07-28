@@ -942,5 +942,5 @@ fn project_root(start: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-#[path = "config_tests.rs"]
+#[path = "tests.rs"]
 mod tests;
