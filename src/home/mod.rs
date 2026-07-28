@@ -4,7 +4,7 @@ use std::{
 	env,
 	ffi::{CStr, CString, OsString},
 	fs::{self, File, OpenOptions},
-	io::{Read as _, Write as _},
+	io::{self, Read as _, Write as _},
 	mem::MaybeUninit,
 	os::{
 		fd::{AsRawFd as _, FromRawFd as _},
@@ -25,6 +25,28 @@ pub(crate) fn effective_user_id() -> u32 {
 	// SAFETY: `geteuid` takes no arguments, has no preconditions, and returns
 	// process credential state without borrowing caller-owned memory.
 	unsafe { libc::geteuid() }
+}
+
+/// Filesystem-reported bytes available to an unprivileged Emelex process.
+pub(crate) fn available_disk_bytes(path: &Path) -> io::Result<u64> {
+	let encoded = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+		io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"storage path contains an interior NUL",
+		)
+	})?;
+	let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+	// SAFETY: `encoded` is NUL-terminated and alive for the call; `stats`
+	// points to writable storage that is read only after a zero return.
+	let status = unsafe { libc::statvfs(encoded.as_ptr(), stats.as_mut_ptr()) };
+	if status != 0 {
+		return Err(io::Error::last_os_error());
+	}
+	// SAFETY: `statvfs` returned zero and initialized the output structure.
+	let stats = unsafe { stats.assume_init() };
+	u64::from(stats.f_bavail)
+		.checked_mul(stats.f_frsize)
+		.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "available disk size overflow"))
 }
 const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
 const ACL_FIRST_ENTRY: libc::c_int = 0;

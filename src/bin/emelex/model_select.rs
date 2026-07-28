@@ -195,7 +195,7 @@ async fn onboard(
 		.context("read Hub search text")?;
 	let filters = onboarding_filters(required)?;
 	explain_media_discovery(required, stderr_palette)?;
-	let mut search = HubSearch::default().requirements(filters);
+	let mut search = HubSearch::default().mlx_library().requirements(filters);
 	if !query.trim().is_empty() {
 		search = search.query(query);
 	}

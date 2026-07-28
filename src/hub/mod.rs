@@ -41,7 +41,8 @@ const MAX_RUNTIME_COMPONENT_BYTES: usize = 255;
 const MAX_SEARCH_QUERY_BYTES: usize = 1 << 10;
 const MAX_SEARCH_CURSOR_BYTES: usize = 2 << 10;
 const MAX_UPSTREAM_CURSOR_BYTES: usize = 1 << 10;
-const SEARCH_CURSOR_VERSION: u8 = 2;
+const HUB_MLX_FILTER: &str = "mlx";
+const SEARCH_CURSOR_VERSION: u8 = 3;
 
 /// One catalog query.
 #[derive(Debug, Clone, Default)]
@@ -53,6 +54,7 @@ pub struct HubSearch {
 	pub require: Vec<TraitFilter>,
 	/// Opaque cursor returned by a previous page.
 	pub cursor: Option<String>,
+	mlx_library: bool,
 }
 
 /// One remotely evaluable catalog-filter shape shown by capability discovery.
@@ -211,6 +213,13 @@ impl HubSearch {
 		self.cursor = Some(cursor.into());
 		self
 	}
+
+	/// Restrict discovery to Hugging Face's MLX library catalog.
+	#[must_use]
+	pub const fn mlx_library(mut self) -> Self {
+		self.mlx_library = true;
+		self
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +259,8 @@ pub struct HubModel {
 	pub diagnostics: Vec<String>,
 	/// Machine fit when the Hub client was constructed with a fit profile.
 	pub fit: Option<FitReport>,
+	#[serde(skip)]
+	download_bytes: Option<u64>,
 }
 
 /// Compatible search page.
@@ -617,6 +628,7 @@ pub struct HubClient {
 	client: reqwest::Client,
 	config: HubConfig,
 	fit_profile: Option<(WorkloadProfile, u64)>,
+	search_storage_path: Option<PathBuf>,
 	credential_scope: Option<[u8; 32]>,
 	#[cfg(test)]
 	publish_gate: Option<Arc<TestPublishGate>>,
@@ -717,6 +729,24 @@ impl HubClient {
 		)
 	}
 
+	/// Construct the model-manager client with local search storage filtering.
+	pub(crate) fn with_local_search_profile(
+		config: HubConfig,
+		workload: WorkloadProfile,
+		metal_budget_bytes: u64,
+		search_storage_path: PathBuf,
+		credentials: Option<HubCredentials>,
+	) -> Result<Self, HubError> {
+		let mut client = Self::with_endpoint_and_fit(
+			config,
+			"https://huggingface.co",
+			Some((workload, metal_budget_bytes)),
+			credentials,
+		)?;
+		client.search_storage_path = Some(search_storage_path);
+		Ok(client)
+	}
+
 	fn with_endpoint_and_fit(
 		config: HubConfig,
 		endpoint: &str,
@@ -757,6 +787,7 @@ impl HubClient {
 			client,
 			config,
 			fit_profile,
+			search_storage_path: None,
 			credential_scope,
 			#[cfg(test)]
 			publish_gate: None,
@@ -776,6 +807,7 @@ impl HubClient {
 	pub async fn search(&self, search: &HubSearch) -> Result<HubSearchPage, HubError> {
 		validate_remote_filters(&search.require)?;
 		let normalized_query = normalized_search_query(search)?;
+		let search_storage_budget_bytes = self.current_search_storage_budget_bytes()?;
 		let position =
 			decode_search_cursor(search, self.credential_scope.as_ref(), self.fit_profile)?;
 		let mut url = self.api_url(&["api", "models"])?;
@@ -783,6 +815,9 @@ impl HubClient {
 			let mut query = url.query_pairs_mut();
 			query.append_pair("full", "true");
 			query.append_pair("config", "true");
+			if search.mlx_library {
+				query.append_pair("filter", HUB_MLX_FILTER);
+			}
 			query.append_pair("limit", &self.config.scan_limit.to_string());
 			if let Some(value) = normalized_query {
 				query.append_pair("search", value);
@@ -875,6 +910,8 @@ impl HubClient {
 					Err(error) => return Err(error),
 				}
 			}
+			let accepted =
+				filter_search_storage(accepted, search_storage_budget_bytes, &mut diagnostics);
 			if let Some(offset) =
 				append_compatible_page(&mut compatible, accepted, self.config.results)
 			{
@@ -910,6 +947,27 @@ impl HubClient {
 			scanned: search_scanned(immediately_scanned, metadata_scanned),
 			diagnostics,
 		})
+	}
+
+	fn current_search_storage_budget_bytes(&self) -> Result<Option<u64>, HubError> {
+		let Some(path) = &self.search_storage_path else {
+			return Ok(None);
+		};
+		crate::home::available_disk_bytes(path)
+			.map(Some)
+			.map_err(|source| {
+				if matches!(
+					source.kind(),
+					std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
+				) {
+					HubError::Configuration(source.to_string())
+				} else {
+					HubError::Io {
+						path: path.clone(),
+						source,
+					}
+				}
+			})
 	}
 
 	/// Inspect one repository visible to this client at its current revision.
@@ -1938,6 +1996,7 @@ fn model_from_wire(wire: &ModelWire, authenticated: bool) -> Result<HubModel, Hu
 		compatible: false,
 		diagnostics: Vec::new(),
 		fit: None,
+		download_bytes: None,
 	})
 }
 
@@ -2211,6 +2270,7 @@ fn enrich_remote_model(
 		diagnostics.push(format!("unsupported quantization: {error}"));
 	}
 	let statically_compatible = diagnostics.is_empty();
+	let download_bytes = validate_download_files(files)?;
 	let weights_bytes = files
 		.iter()
 		.filter(|file| file.path.ends_with(".safetensors"))
@@ -2457,6 +2517,7 @@ fn enrich_remote_model(
 	model.fit = fit;
 	model.diagnostics = diagnostics;
 	model.files = files.iter().map(|file| file.path.clone()).collect();
+	model.download_bytes = Some(download_bytes);
 	Ok(())
 }
 
@@ -2793,6 +2854,12 @@ fn validate_download_files(files: &[RemoteFile]) -> Result<u64, HubError> {
 		));
 	}
 	Ok(total)
+}
+
+/// Transfer bytes plus the safety margin retained after a model download.
+pub(crate) fn required_download_storage_bytes(transfer_bytes: u64) -> Option<u64> {
+	let margin = (64_u64 << 20).max(transfer_bytes / 20);
+	transfer_bytes.checked_add(margin)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3163,6 +3230,41 @@ fn append_compatible_page<T>(
 	None
 }
 
+fn filter_search_storage(
+	ranked: Vec<(usize, HubModel)>,
+	available: Option<u64>,
+	diagnostics: &mut Vec<HubDiagnostic>,
+) -> Vec<(usize, HubModel)> {
+	let Some(available) = available else {
+		return ranked;
+	};
+	let mut accepted = Vec::with_capacity(ranked.len());
+	for (rank, model) in ranked {
+		let Some(required) = model
+			.download_bytes
+			.and_then(required_download_storage_bytes)
+		else {
+			diagnostics.push(HubDiagnostic {
+				id: Some(model.id),
+				message: "candidate download storage requirement is unavailable".to_string(),
+			});
+			continue;
+		};
+		if required > available {
+			diagnostics.push(HubDiagnostic {
+				id: Some(model.id),
+				message: format!(
+					"download requires {required} bytes including safety margin, exceeds available \
+					 storage {available} bytes"
+				),
+			});
+			continue;
+		}
+		accepted.push((rank, model));
+	}
+	accepted
+}
+
 const fn search_scanned(immediately_scanned: usize, metadata_scanned: usize) -> usize {
 	immediately_scanned.saturating_add(metadata_scanned)
 }
@@ -3230,8 +3332,14 @@ fn search_scope(
 		.collect::<Vec<_>>();
 	require.sort_unstable();
 	require.dedup();
-	let scope = serde_json::to_vec(&(query, require, credential_scope, fit_profile))
-		.map_err(|error| HubError::Protocol(format!("cannot encode Hub search scope: {error}")))?;
+	let scope = serde_json::to_vec(&(
+		query,
+		require,
+		search.mlx_library,
+		credential_scope,
+		fit_profile,
+	))
+	.map_err(|error| HubError::Protocol(format!("cannot encode Hub search scope: {error}")))?;
 	Ok(hex::encode(Sha256::digest(scope)))
 }
 
@@ -3309,7 +3417,8 @@ fn decode_search_cursor(
 		|| decoded.scope != search_scope(search, credential_scope, fit_profile)?
 	{
 		return Err(HubError::Protocol(
-			"Hub search cursor does not match this query, credential, or fit scope".to_string(),
+			"Hub search cursor does not match this query, catalog, credential, or fit scope"
+				.to_string(),
 		));
 	}
 	if let Some(cursor) = &decoded.upstream {
@@ -4190,6 +4299,7 @@ mod tests {
 			],
 			diagnostics: Vec::new(),
 			fit: None,
+			download_bytes: None,
 		}
 	}
 
@@ -4602,6 +4712,27 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn mlx_catalog_filter_composes_with_optional_search_text() {
+		for expected_search in [None, Some("qwen")] {
+			let server = loopback_server(json_response("200 OK", &serde_json::json!([]))).await;
+			let client = loopback_client(&server.endpoint);
+			let search = expected_search.map_or_else(
+				|| HubSearch::default().mlx_library(),
+				|query| HubSearch::default().mlx_library().query(query),
+			);
+			client.search(&search).await.expect("MLX catalog search");
+
+			let request = String::from_utf8(server.task.await.expect("search server"))
+				.expect("UTF-8 request");
+			let target = request.split_whitespace().nth(1).expect("request target");
+			let url = Url::parse(&format!("http://loopback{target}")).expect("request URL");
+			let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+			assert_eq!(query.get("filter").map(AsRef::as_ref), Some("mlx"));
+			assert_eq!(query.get("search").map(AsRef::as_ref), expected_search);
+		}
+	}
+
+	#[tokio::test]
 	async fn search_propagates_metadata_preflight_service_failures() {
 		for (status, expected) in [
 			("429 Too Many Requests", StatusCode::TOO_MANY_REQUESTS),
@@ -4737,6 +4868,25 @@ mod tests {
 			..HubSearch::default()
 		};
 		assert!(decode_search_cursor(&changed, None, None).is_err());
+	}
+
+	#[test]
+	fn composite_cursor_is_scoped_to_mlx_catalog_filter() {
+		let first = HubSearch::default().mlx_library();
+		let cursor = encode_search_cursor(&first, None, None, Some("upstream".to_string()), 7)
+			.expect("encode cursor");
+
+		assert!(
+			decode_search_cursor(&HubSearch::default().cursor(cursor.clone()), None, None).is_err()
+		);
+		assert!(
+			decode_search_cursor(
+				&HubSearch::default().mlx_library().cursor(cursor),
+				None,
+				None
+			)
+			.is_ok()
+		);
 	}
 
 	#[test]
@@ -5147,6 +5297,39 @@ mod tests {
 	}
 
 	#[test]
+	fn search_storage_filter_rejects_before_filling_the_ranked_page() {
+		let mut fits = model();
+		fits.download_bytes = Some(3);
+		let mut too_large = model();
+		too_large.id = HubModelId::parse("mlx-community/too-large").expect("model ID");
+		too_large.download_bytes = Some(4);
+		let mut diagnostics = Vec::new();
+		let accepted = filter_search_storage(
+			vec![(0, too_large), (1, fits)],
+			Some((64_u64 << 20) + 3),
+			&mut diagnostics,
+		);
+		let mut page = Vec::new();
+		let offset = append_compatible_page(&mut page, accepted, 1);
+
+		assert_eq!(offset, Some(2));
+		assert_eq!(page.len(), 1);
+		assert_eq!(page[0].id.as_str(), "mlx-community/example");
+		assert_eq!(diagnostics.len(), 1);
+		assert!(diagnostics[0].message.contains("exceeds available storage"));
+	}
+
+	#[test]
+	fn download_storage_requirement_preserves_margin_policy() {
+		assert_eq!(required_download_storage_bytes(1), Some((64_u64 << 20) + 1));
+		assert_eq!(
+			required_download_storage_bytes(2_u64 << 30),
+			Some((2_u64 << 30) + ((2_u64 << 30) / 20))
+		);
+		assert_eq!(required_download_storage_bytes(u64::MAX), None);
+	}
+
+	#[test]
 	fn static_enrichment_reports_compatibility_without_claiming_fit() {
 		let wire = wire();
 		let mut model = model_from_wire(&wire, false).expect("valid wire model");
@@ -5158,6 +5341,7 @@ mod tests {
 		assert_eq!(model.fit, None);
 		let sizing = model.traits.sizing.as_ref().expect("static sizing");
 		assert_eq!(sizing.weights_bytes, Some(1 << 20));
+		assert_eq!(model.download_bytes, Some(1_054_848));
 		assert_eq!(sizing.estimated_residency_bytes, None);
 		assert_eq!(sizing.evaluated_context_tokens, None);
 		assert_eq!(sizing.max_context_tokens, Some(32_768));

@@ -58,6 +58,12 @@
   synchronous local phase on another runtime worker.
 - `hub capabilities` renders the library's complete `REMOTE_FILTERS` catalog;
   its displayed syntax and accepted remote predicates cannot drift apart.
+- Every CLI Hub search enables `HubSearch::mlx_library` independently of user
+  text and uses the model-manager client's local Metal/storage fit. Human
+  results render as labeled vertical cards: the memory row names its evaluated
+  workload separately from the model's maximum context, and capability groups
+  wrap with hanging indentation. Default diagnostics show only a count, verbose
+  diagnostics group by sanitized candidate ID, and JSON stays complete.
 - Attachment UX advertises only formats decoded by the embedded runtime.
 - Media onboarding maps runtime image/audio requirements to remote
   advertised-input evidence, labels that evidence as provisional, and requires

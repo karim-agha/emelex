@@ -10,7 +10,6 @@ use std::{
 	process::Command,
 };
 
-use build_support::AppleVersion;
 use sha2::{Digest as _, Sha256};
 
 const MINIMUM_MACOS: &str = "26.5";

@@ -93,19 +93,13 @@ impl Emelex {
 		self.models.get_or_try_init(|| {
 			let workload = WorkloadProfile::new(1, self.config.inference.context_tokens)?;
 			let metal_budget_bytes = self.metal_budget_bytes()?;
-			let hub = match &self.hub_credentials {
-				Some(credentials) => HubClient::with_fit_profile_and_credentials(
-					self.config.hub.clone(),
-					workload,
-					metal_budget_bytes,
-					credentials.clone(),
-				)?,
-				None => HubClient::with_fit_profile(
-					self.config.hub.clone(),
-					workload,
-					metal_budget_bytes,
-				)?,
-			};
+			let hub = HubClient::with_local_search_profile(
+				self.config.hub.clone(),
+				workload,
+				metal_budget_bytes,
+				self.home.temp_dir(),
+				self.hub_credentials.clone(),
+			)?;
 			Ok(ModelManager::new(
 				self.home.clone(),
 				self.config.clone(),

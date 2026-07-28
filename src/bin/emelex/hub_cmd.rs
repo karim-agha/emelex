@@ -12,17 +12,22 @@ use anyhow::Context as _;
 use emelex::{
 	Emelex,
 	hub::{
-		DownloadCancellation, DownloadControl, DownloadEvent, DownloadObserver, HubSearch,
-		REMOTE_FILTERS,
+		DownloadCancellation, DownloadControl, DownloadEvent, DownloadObserver, HubDiagnostic,
+		HubModel, HubSearch, REMOTE_FILTERS,
 	},
-	model::{HubModelId, InstalledModel},
+	model::{HubModelId, InstalledModel, Modality, ModelTraits, MtpSupport, Task},
 };
 
 use super::{
 	args::HubCommand,
 	output,
-	style::{Palette, bytes},
+	style::{Palette, bytes, tokens},
 };
+
+const EMPTY_SEARCH_MESSAGE: &str = "No compatible MLX models matched this search on this machine.";
+const EMPTY_SEARCH_PAGE_MESSAGE: &str =
+	"No compatible MLX models on this ranked page; use the next cursor to continue.";
+const SEARCH_CARD_WIDTH: usize = 64;
 
 pub(crate) async fn run(
 	emelex: &Emelex,
@@ -88,7 +93,7 @@ async fn search(
 	stdout_palette: Palette,
 	stderr_palette: Palette,
 ) -> anyhow::Result<()> {
-	let mut search = HubSearch::default().requirements(require);
+	let mut search = HubSearch::default().mlx_library().requirements(require);
 	if let Some(query) = query {
 		search = search.query(query);
 	}
@@ -109,59 +114,222 @@ async fn search(
 	if json {
 		return output::json_line(&page);
 	}
-	for model in &page.items {
-		let weights = optional_bytes(
-			model
-				.traits
-				.sizing
-				.as_ref()
-				.and_then(|sizing| sizing.weights_bytes),
-		);
-		let fit = model.fit.as_ref().map_or_else(
-			|| "fit unknown".to_string(),
-			|fit| {
-				format!(
-					"{} {} / {}",
-					if fit.fits { "fits" } else { "does not fit" },
-					bytes(fit.required_bytes),
-					bytes(fit.budget_bytes)
-				)
-			},
-		);
-		output::stdout_line(&format!(
-			"{}  {weights}  {fit}  {}",
-			stdout_palette.cyan(model.id.as_str()),
-			trait_summary(&model.traits)
-		))?;
-	}
-	let visible_diagnostics = if verbose {
-		page.diagnostics.len()
+	if page.items.is_empty() {
+		output::stdout_line(empty_search_message(page.next_cursor.is_some()))?;
 	} else {
-		page.diagnostics.len().min(10)
+		for (index, model) in page.items.iter().enumerate() {
+			if index > 0 {
+				output::stdout_line("")?;
+			}
+			output::stdout_line(&render_search_model(model, stdout_palette))?;
+		}
+	}
+	if verbose && !page.diagnostics.is_empty() {
+		output::stderr_line(&stderr_palette.yellow("Skipped candidates:"))?;
+		for (candidate, messages) in grouped_diagnostics(&page.diagnostics) {
+			output::stderr_line(&stderr_palette.yellow(&format!("  {candidate}")))?;
+			for message in messages {
+				output::stderr_line(&stderr_palette.dim(&format!("    {message}")))?;
+			}
+		}
+	} else if !page.diagnostics.is_empty() {
+		output::stderr_line(&stderr_palette.dim(&hidden_diagnostics_line(page.diagnostics.len())))?;
+	}
+	output::stderr_line(&stderr_palette.dim(&search_summary_line(page.items.len(), page.scanned)))?;
+	if let Some(cursor) = &page.next_cursor {
+		output::stderr_line(&stderr_palette.dim(&next_cursor_line(cursor)))?;
+	}
+	Ok(())
+}
+
+fn render_search_model(model: &HubModel, palette: Palette) -> String {
+	let sizing = model.traits.sizing.as_ref();
+	render_search_card(
+		model.id.as_str(),
+		sizing.and_then(|sizing| sizing.weights_bytes),
+		model.fit.as_ref().map(|fit| {
+			(
+				fit.required_bytes,
+				fit.budget_bytes,
+				fit.workload.batch_size(),
+				fit.workload.context_tokens(),
+			)
+		}),
+		sizing.and_then(|sizing| sizing.max_context_tokens),
+		&model.traits,
+		palette,
+	)
+}
+
+fn render_search_card(
+	id: &str,
+	weights_bytes: Option<u64>,
+	memory: Option<(u64, u64, usize, usize)>,
+	max_context_tokens: Option<usize>,
+	traits: &ModelTraits,
+	palette: Palette,
+) -> String {
+	let id = output::terminal_safe_inline(id);
+	let mut lines = vec![
+		palette.cyan(&id),
+		search_field("Weights", &optional_bytes(weights_bytes)),
+	];
+	if let Some((required, budget, batch_size, context_tokens)) = memory {
+		lines.push(search_field(
+			"Memory",
+			&format!("{} required", bytes(required)),
+		));
+		lines.push(format!(
+			"          at batch {batch_size} · {} tokens",
+			optional_tokens(Some(context_tokens))
+		));
+		lines.push(search_field("Budget", &format!("{} Metal", bytes(budget))));
+	} else {
+		lines.push(search_field("Memory", "requirement unknown"));
+		lines.push(search_field("Budget", "unknown"));
+	}
+	lines.push(search_field(
+		"Context",
+		&format!("{} max", optional_tokens(max_context_tokens)),
+	));
+	lines.extend(search_capability_lines(traits));
+	lines.join("\n")
+}
+
+fn search_field(label: &str, value: &str) -> String {
+	format!("  {label:<7} {value}")
+}
+
+fn search_capability_lines(traits: &ModelTraits) -> Vec<String> {
+	let mut runtime = Vec::new();
+	if traits.mlx {
+		runtime.push("MLX");
+	}
+	let mtp = match traits.mtp {
+		MtpSupport::Absent => None,
+		MtpSupport::Advertised => Some("MTP advertised"),
+		MtpSupport::RuntimeVerified => Some("MTP verified"),
+		_ => Some("MTP"),
 	};
-	for diagnostic in page.diagnostics.iter().take(visible_diagnostics) {
+	if let Some(mtp) = mtp {
+		runtime.push(mtp);
+	}
+	let mut tasks = Vec::new();
+	for task in &traits.tasks {
+		let label = match task {
+			Task::TextGeneration => "text generation",
+			Task::Chat => "chat",
+			Task::ToolUse => "tools",
+			Task::StructuredOutput => "structured output",
+			Task::Reasoning => "reasoning",
+			_ => "other task",
+		};
+		if !tasks.contains(&label) {
+			tasks.push(label);
+		}
+	}
+	let mut inputs = Vec::new();
+	for input in &traits.input {
+		let label = match input {
+			Modality::Text => None,
+			Modality::Image => Some("image"),
+			Modality::Audio => Some("audio"),
+			_ => Some("other"),
+		};
+		if let Some(label) = label
+			&& !inputs.contains(&label)
+		{
+			inputs.push(label);
+		}
+	}
+	let mut lines = Vec::new();
+	for (label, values) in [
+		("Runtime", runtime.as_slice()),
+		("Tasks", tasks.as_slice()),
+		("Inputs", inputs.as_slice()),
+	] {
+		if !values.is_empty() {
+			lines.extend(wrap_search_values(label, values));
+		}
+	}
+	if lines.is_empty() {
+		lines.push(search_field("Details", "capabilities unknown"));
+	}
+	lines
+}
+
+fn wrap_search_values(label: &str, values: &[&str]) -> Vec<String> {
+	let prefix = format!("  {label:<7} ");
+	let continuation = "          ";
+	let mut lines = Vec::new();
+	let mut line = prefix;
+	let mut has_value = false;
+	for value in values {
+		let separator = if has_value { " · " } else { "" };
+		let projected = line.chars().count() + separator.chars().count() + value.chars().count();
+		if has_value && projected > SEARCH_CARD_WIDTH {
+			lines.push(line);
+			line = continuation.to_string();
+			has_value = false;
+		}
+		if has_value {
+			line.push_str(" · ");
+		}
+		line.push_str(value);
+		has_value = true;
+	}
+	lines.push(line);
+	lines
+}
+
+fn grouped_diagnostics(diagnostics: &[HubDiagnostic]) -> BTreeMap<String, Vec<String>> {
+	let mut grouped = BTreeMap::<String, Vec<String>>::new();
+	for diagnostic in diagnostics {
 		let candidate = diagnostic
 			.id
 			.as_ref()
-			.map_or_else(|| "candidate".to_string(), ToString::to_string);
-		let message = format!("skipped {candidate}: {}", diagnostic.message);
-		output::stderr_line(&stderr_palette.yellow(&output::terminal_safe_inline(&message)))?;
+			.map_or_else(|| "unidentified candidate".to_string(), ToString::to_string);
+		let candidate = output::terminal_safe_inline(&candidate).into_owned();
+		let message = output::terminal_safe_inline(&diagnostic.message).into_owned();
+		grouped.entry(candidate).or_default().push(message);
 	}
-	if visible_diagnostics < page.diagnostics.len() {
-		output::stderr_line(&stderr_palette.dim(&format!(
-			"{} more diagnostic(s) omitted; rerun with --verbose or --json",
-			page.diagnostics.len() - visible_diagnostics
-		)))?;
+	grouped
+}
+
+fn hidden_diagnostics_line(count: usize) -> String {
+	format!(
+		"{count} search {} hidden; rerun with --verbose or --json",
+		if count == 1 {
+			"diagnostic"
+		} else {
+			"diagnostics"
+		}
+	)
+}
+
+const fn empty_search_message(has_more: bool) -> &'static str {
+	if has_more {
+		EMPTY_SEARCH_PAGE_MESSAGE
+	} else {
+		EMPTY_SEARCH_MESSAGE
 	}
-	output::stderr_line(&stderr_palette.dim(&format!(
-		"{} compatible result(s); {} candidate(s) scanned{}",
-		page.items.len(),
-		page.scanned,
-		page.next_cursor
-			.as_ref()
-			.map_or_else(String::new, |cursor| format!("; next cursor {cursor}"))
-	)))?;
-	Ok(())
+}
+
+fn search_summary_line(results: usize, scanned: usize) -> String {
+	format!(
+		"{results} compatible MLX {} · {scanned} {} scanned",
+		if results == 1 { "model" } else { "models" },
+		if scanned == 1 {
+			"candidate"
+		} else {
+			"candidates"
+		}
+	)
+}
+
+fn next_cursor_line(cursor: &str) -> String {
+	let cursor = output::terminal_safe_inline(cursor);
+	format!("next cursor:\n  {cursor}")
 }
 
 async fn inspect(
@@ -592,9 +760,123 @@ fn optional_bytes(value: Option<u64>) -> String {
 	value.map_or_else(|| "unknown".to_string(), bytes)
 }
 
+fn optional_tokens(value: Option<usize>) -> String {
+	value.map_or_else(
+		|| "unknown".to_string(),
+		|value| u64::try_from(value).map_or_else(|_| value.to_string(), tokens),
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn search_card_is_compact_human_readable_and_complete() {
+		let mut traits = ModelTraits::default();
+		traits.mlx = true;
+		traits.input.extend([Modality::Text, Modality::Image]);
+		traits
+			.tasks
+			.extend([Task::TextGeneration, Task::Chat, Task::ToolUse]);
+		traits.mtp = MtpSupport::Advertised;
+
+		let rendered = render_search_card(
+			"mlx-community/Qwen3.5-4B-4bit",
+			Some(4_u64 << 30),
+			Some((6_u64 << 30, 16_u64 << 30, 1, 16_384)),
+			Some(32_768),
+			&traits,
+			Palette::stdout(crate::style::ColorMode::Never),
+		);
+
+		assert_eq!(
+			rendered,
+			"mlx-community/Qwen3.5-4B-4bit\n  Weights 4.0 GiB\n  Memory  6.0 GiB required\n          \
+			 at batch 1 · 16.4k tokens\n  Budget  16 GiB Metal\n  Context 32.8k max\n  Runtime MLX \
+			 · MTP advertised\n  Tasks   text generation · chat · tools\n  Inputs  image"
+		);
+		assert!(
+			rendered
+				.lines()
+				.all(|line| line.chars().count() <= SEARCH_CARD_WIDTH)
+		);
+	}
+
+	#[test]
+	fn search_card_handles_unknowns_and_neutralizes_untrusted_id() {
+		let rendered = render_search_card(
+			"owner/model\nforged\trow\u{202e}",
+			None,
+			None,
+			None,
+			&ModelTraits::default(),
+			Palette::stdout(crate::style::ColorMode::Never),
+		);
+
+		assert_eq!(
+			rendered,
+			"owner/model\u{240a}forged\u{2409}row\u{fffd}\n  Weights unknown\n  Memory  \
+			 requirement unknown\n  Budget  unknown\n  Context unknown max\n  Details capabilities \
+			 unknown"
+		);
+		assert_eq!(rendered.lines().count(), 6);
+	}
+
+	#[test]
+	fn diagnostics_group_by_candidate_and_cannot_forge_rows() {
+		let diagnostics = serde_json::from_value::<Vec<HubDiagnostic>>(serde_json::json!([
+			{"id": "owner/model", "message": "unsupported layout"},
+			{"id": "owner/model", "message": "bad\nrow\tvalue\u{202e}"},
+			{"id": null, "message": "invalid identity"},
+		]))
+		.expect("diagnostic fixture");
+
+		assert_eq!(
+			grouped_diagnostics(&diagnostics),
+			BTreeMap::from([
+				(
+					"owner/model".to_string(),
+					vec![
+						"unsupported layout".to_string(),
+						"bad\u{240a}row\u{2409}value\u{fffd}".to_string(),
+					],
+				),
+				(
+					"unidentified candidate".to_string(),
+					vec!["invalid identity".to_string()],
+				),
+			])
+		);
+	}
+
+	#[test]
+	fn search_summaries_have_explicit_empty_and_singular_states() {
+		assert_eq!(
+			empty_search_message(false),
+			"No compatible MLX models matched this search on this machine."
+		);
+		assert_eq!(
+			empty_search_message(true),
+			"No compatible MLX models on this ranked page; use the next cursor to continue."
+		);
+		assert_eq!(
+			search_summary_line(0, 200),
+			"0 compatible MLX models · 200 candidates scanned"
+		);
+		assert_eq!(
+			search_summary_line(1, 1),
+			"1 compatible MLX model · 1 candidate scanned"
+		);
+		assert_eq!(
+			hidden_diagnostics_line(1),
+			"1 search diagnostic hidden; rerun with --verbose or --json"
+		);
+		assert_eq!(
+			next_cursor_line("page\nforged\tvalue\u{202e}"),
+			"next cursor:\n  page\u{240a}forged\u{2409}value\u{fffd}"
+		);
+	}
 
 	#[test]
 	fn progress_is_tty_human_only() {

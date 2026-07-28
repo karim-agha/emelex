@@ -58,14 +58,16 @@ awaits native model-thread completion and tool cleanup, including process-group
 kill and reap for an active shell command. Human cancellation flushes buffered
 Markdown and resets terminal styling before returning the cancellation error.
 
-`hub capabilities` is the source of truth for remote filters. Human search and
-inspection cap diagnostics by default and point to `--verbose` or `--json` for
-the complete set. Downloads report files, bounded percentage progress, retries,
-and verification; Ctrl-C cooperatively cancels transfer, hashing, or retry
-waits before returning. An independently scheduled signal watcher sets the
-same cancellation flag during synchronous local inspection/load phases, and a
-final checkpoint precedes publication. `models remove` requires the exact
-snapshot ID printed by `models list`.
+`hub capabilities` is the source of truth for explicit remote filters. Every
+CLI search also applies Hugging Face's MLX catalog scope and local Metal/storage
+fit. Human results use compact multi-line model cards; skipped-candidate
+diagnostics collapse to a count unless `--verbose` is present, while `--json`
+retains the complete structured page. Downloads report files, bounded
+percentage progress, retries, and verification; Ctrl-C cooperatively cancels
+transfer, hashing, or retry waits before returning. An independently scheduled
+signal watcher sets the same cancellation flag during synchronous local
+inspection/load phases, and a final checkpoint precedes publication. `models
+remove` requires the exact snapshot ID printed by `models list`.
 
 Attachments are descriptor-stable and bounded. The self-contained CLI accepts
 JPEG, PNG, WebP, and PCM16/float32 WAV input. Encoded video and formats that

@@ -14,7 +14,9 @@
   credential value when configured.
 - The direct Hub facet is static-only. The model manager owns a fit-profiled
   Hub client with the same configuration bounds plus the facade's workload and
-  Metal budget.
+  Metal budget. That client probes Emelex Home filesystem availability only
+  when searching; unrelated model-manager operations do not depend on the
+  probe, and downloads recheck it.
 - The model facet installs a lightweight durable-Session reference guard.
   Construction captures only the database path; SQLite remains unopened until
   quarantine or deletion needs a reference check.

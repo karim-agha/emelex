@@ -27,12 +27,22 @@
   catalog's 96-byte bound. Revisions, cursors, pagination origins, and file
   paths also validate.
 - Composite search cursors are bounded, opaque, and scoped to normalized
-  query, canonical filters, a domain-separated credential fingerprint, and the
-  exact optional workload/Metal-budget fit profile. Neither token nor
-  fingerprint is encoded directly into the cursor. Schema v2 rejects older
-  cursors whose scope omitted fit inputs. Upstream cursor text is treated as
-  bounded printable opaque data and re-encoded through URL query-pair APIs.
+  query, MLX catalog selection, canonical filters, a domain-separated
+  credential fingerprint, and the exact optional workload/Metal-budget fit
+  profile. Neither token nor fingerprint is encoded directly into the cursor.
+  Schema v3 rejects older cursors whose scope omitted catalog or fit inputs.
+  Dynamic storage availability stays outside cursor identity; a resumed page
+  does not revisit earlier ranks when free space changes. Upstream cursor text
+  is treated as bounded printable opaque data and re-encoded through URL
+  query-pair APIs.
 - Search ranking survives concurrent metadata preflight.
+- `HubSearch::mlx_library` maps the website's MLX-library selection to the Hub
+  API's `filter=mlx` parameter without modifying optional user search text.
+- Profiled CLI searches reject candidates whose exact selected runtime
+  transfer plus `max(64 MiB, 5%)` exceeds available Emelex Home filesystem
+  space. Search probes availability before accepting ranked page members, so
+  rejected candidates do not underfill the page. Download performs the same
+  check again against live availability.
 - Candidate-local incompatibility, malformed candidate metadata, and HTTP
   missing/gone failures become bounded page diagnostics instead of aborting
   unrelated candidates. Transport, authentication, rate-limit, and server

@@ -72,7 +72,9 @@ redirects, and final URLs with queries. Hub clients disable automatic
 
 `hub capabilities` lists the predicates backed by remote evidence; stronger
 installed-only claims such as runtime-verified MTP are intentionally
-unavailable during remote search.
+unavailable during remote search. CLI Hub searches always use Hugging Face's
+MLX catalog filter, preserve optional user search text, and return only
+candidates fitting this Mac's Metal budget and available Emelex Home storage.
 When interactive onboarding needs image or audio input, remote discovery uses
 Hugging Face's advertised-input metadata only. That is a candidate hint, not a
 runtime claim; every downloaded checkpoint must pass local capability

@@ -189,9 +189,9 @@ pub(crate) enum ThinkingArg {
 pub(crate) enum HubCommand {
 	/// List filters supported during remote catalog discovery.
 	Capabilities,
-	/// Search Hub ranking and filter by evidence-backed traits.
+	/// Search MLX Hub ranking for models compatible with this machine.
 	Search {
-		/// Optional Hub search text.
+		/// Optional Hub search text; MLX and local-fit filters always apply.
 		query: Option<String>,
 		/// Required remote trait; repeat for conjunction. Run `hub capabilities` for choices.
 		#[arg(long = "require")]
@@ -199,7 +199,7 @@ pub(crate) enum HubCommand {
 		/// Opaque next-page cursor.
 		#[arg(long)]
 		cursor: Option<String>,
-		/// Print every candidate diagnostic instead of the bounded summary.
+		/// Print grouped candidate diagnostics instead of only their count.
 		#[arg(long)]
 		verbose: bool,
 	},

@@ -18,17 +18,26 @@ redirect downgrades to HTTP.
 
 Search preserves Hub rank, preflights candidates with bounded concurrency,
 returns only models matching validated remote-evidence trait filters, and
-retains candidate-local diagnostics. Candidate incompatibility, malformed
-candidate metadata, and missing or gone repositories do not hide unrelated
-models; transport, authentication, rate-limit, and server failures abort the
-page instead of masquerading as an empty result. Its opaque composite cursor
-carries a bounded printable upstream cursor plus an intra-page offset and is
-scoped to normalized query, filters, a domain-separated credential
-fingerprint, and the client's exact workload/Metal-budget fit profile, so
-locally filtered results beyond the first 20 remain reachable without crossing
-credential or fit scopes. Neither token nor fingerprint appears in the cursor.
-Cursor schema v2 rejects older opaque cursors rather than resuming them under
-incomplete scope.
+retains candidate-local diagnostics. `HubSearch::mlx_library` adds Hugging
+Face's `filter=mlx` catalog constraint independently of optional search text;
+the CLI enables it for direct search and onboarding. Candidate incompatibility,
+malformed candidate metadata, and missing or gone repositories do not hide
+unrelated models; transport, authentication, rate-limit, and server failures
+abort the page instead of masquerading as an empty result. Profiled CLI search
+also removes results whose exact selected runtime download cannot fit the
+Emelex Home filesystem with the same safety margin used before transfer.
+Storage is probed for each search and rejected candidates do not consume the
+rank-preserving result-page limit. Download rechecks live space.
+
+The opaque composite cursor carries a bounded printable upstream cursor plus
+an intra-page offset and is scoped to normalized query, MLX catalog selection,
+trait filters, a domain-separated credential fingerprint, and the client's
+exact workload/Metal-budget fit profile, so locally filtered results beyond the
+first 20 remain reachable without crossing credential or fit scopes. Dynamic
+storage availability is deliberately outside cursor identity; a resumed page
+does not revisit earlier ranks when free space changes. Neither token nor
+fingerprint appears in the cursor. Cursor schema v3 rejects older opaque cursors
+rather than resuming them under incomplete scope.
 
 Remote search distinguishes metadata-advertised MTP from installed runtime
 verification. Layout validation is an internal part of runtime verification,

@@ -35,6 +35,8 @@ architecture and file-plan compatibility without initializing Metal or
 claiming machine fit. Fit-aware discovery uses an explicit workload and Metal
 working-set budget. Unknown architectures, missing `model_type`, unsupported
 or ambiguous layouts, and profiled models that exceed the budget fail closed.
+CLI Hub discovery also applies Hugging Face's MLX catalog filter and removes
+downloads that do not fit currently available Emelex Home filesystem space.
 
 Security boundaries are approval-driven, not a sandbox guarantee. Shell runs
 `/bin/sh -c` on the host after approval. Web access intentionally permits any

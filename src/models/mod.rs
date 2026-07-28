@@ -4,13 +4,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
 	collections::BTreeSet,
-	ffi::CString,
 	fs::{self, OpenOptions},
 	io::{Read as _, Write as _},
-	os::unix::{
-		ffi::OsStrExt as _,
-		fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
-	},
+	os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
 	path::{Path, PathBuf},
 	sync::{Arc, OnceLock, mpsc},
 	time::{Duration, SystemTime},
@@ -28,7 +24,7 @@ use crate::{
 	home::{EmelexHome, create_owner_subdir},
 	hub::{
 		DownloadCancellation, DownloadObserver, DownloadOperationGuard, DownloadReporter,
-		HubClient, HubError,
+		HubClient, HubError, required_download_storage_bytes,
 	},
 	model::{
 		CompatibilityReport, HubModelId, InspectionError, InstalledModel, LocalModelName,
@@ -2369,27 +2365,20 @@ fn valid_quarantine_reason(reason: &str) -> bool {
 }
 
 fn preflight_disk(path: &Path, transfer_bytes: u64) -> Result<(), ModelsError> {
-	let encoded = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-		ModelsError::Configuration("storage path contains an interior NUL".to_string())
+	let available = crate::home::available_disk_bytes(path).map_err(|source| {
+		if matches!(
+			source.kind(),
+			std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
+		) {
+			ModelsError::Configuration(source.to_string())
+		} else {
+			ModelsError::Io {
+				path: path.to_path_buf(),
+				source,
+			}
+		}
 	})?;
-	let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-	// SAFETY: `encoded` is NUL-terminated and alive for the call; `stats`
-	// points to writable storage that is read only after a zero return.
-	let status = unsafe { libc::statvfs(encoded.as_ptr(), stats.as_mut_ptr()) };
-	if status != 0 {
-		return Err(ModelsError::Io {
-			path: path.to_path_buf(),
-			source: std::io::Error::last_os_error(),
-		});
-	}
-	// SAFETY: `statvfs` returned zero and initialized the output structure.
-	let stats = unsafe { stats.assume_init() };
-	let available = u64::from(stats.f_bavail)
-		.checked_mul(stats.f_frsize)
-		.ok_or_else(|| ModelsError::Configuration("available disk size overflow".to_string()))?;
-	let margin = (64_u64 << 20).max(transfer_bytes / 20);
-	let required = transfer_bytes
-		.checked_add(margin)
+	let required = required_download_storage_bytes(transfer_bytes)
 		.ok_or_else(|| ModelsError::Configuration("required disk size overflow".to_string()))?;
 	if available < required {
 		return Err(ModelsError::InsufficientDisk {
