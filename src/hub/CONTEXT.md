@@ -88,6 +88,20 @@
   to `DownloadIdleTimeout`; a reqwest inner timeout must not race into the
   generic request-error surface. Already-persisted partial bytes remain staged.
 - Every completed file has an Emelex-computed SHA-256.
+- A retry may reuse a nonempty staging directory only when every entry exactly
+  names one planned local file or its `.part` prefix. Entries are owner-owned
+  `0600` regular files with one link and no extended ACL. Symlinks, unexpected
+  names, and both forms for one file fail closed.
+- A planned completed file is securely reopened and snapshot-checked, then
+  reused only after exact size, computed SHA-256, and any Hub-provided LFS
+  SHA-256 pass. Reuse emits `FileStarted { resumed: total, total }` followed by
+  `FileVerified`; no request or rename occurs.
+- At most four planned files transfer concurrently. The scheduler preserves
+  plan order in returned records. On the first error it stops admitting files,
+  cancels its linked child authority, drains every active sibling, and returns
+  the first observed error. Dropping the scheduler cancels the same child.
+- Events may interleave across active files, but each file's event order and
+  synchronous observer serialization remain intact.
 - `TransferStarted` and `TransferCompleted` observer events bracket all file
   events with the immutable plan's exact file and byte totals. Completion means
   every planned file is verified and staged, not that model certification or

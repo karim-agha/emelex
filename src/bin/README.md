@@ -63,13 +63,16 @@ CLI search also requires remote tool-use evidence, applies Hugging Face's MLX
 catalog scope, and enforces local Metal/storage fit. Zero-installed chat
 onboarding keeps that tool-use requirement. These are CLI additions; library
 `HubSearch` keeps caller-selected requirements generic. Human results use
-compact multi-line model cards showing exact-revision download state and
-validated quantization. Because every result is already MLX-scoped, cards omit
-a redundant runtime row and show MTP separately when advertised. On a human
-terminal, those cards become one inline, height-bounded viewport on stdout:
-arrow keys move the selection rail through the displayed results, Enter
-downloads that exact revision, and Escape or `q` settles the results without
-downloading. No second compact selector is appended.
+compact multi-line cards containing only model name, quantization, weights,
+memory, context, and tasks. A checkmark marks an exact installed revision;
+active and resumable paused transfers are labeled from durable model-manager
+state. On a human terminal, those cards become one inline, height-bounded
+viewport on stdout. Up and down move the selection rail, while left and right
+move through cached cursor pages rendered only as
+`< Prev | Page N | Next>`. Enter on an installed revision returns through the
+normal `chat --model` dispatch. Enter on any other revision downloads that
+exact revision, then asks whether to start chat. Escape or `q` closes the
+browser. No second selector or opaque cursor text is appended.
 The viewport reserves one physical cursor row, remeasures its prior frame
 after terminal resizes, and reads Ctrl-C as a cancellation key instead of
 raising an interrupt inside raw input cleanup.
@@ -78,17 +81,19 @@ collapse to a count unless `--verbose` is present, while `--json` retains the
 complete structured page.
 
 TTY downloads render one independently animated live region with exact
-aggregate bytes, completion percentage, verified-file count, a recent
-persisted-byte speed and ETA when meaningful, and the current file. Resumed
-bytes count toward completion but never toward network speed. Transfer
-completion changes the label to finalizing until local certification and
-publication return. Redirected human output stays deterministic and omits
-chunk-level progress spam; JSON event schemas remain unchanged. Ctrl-C
-cooperatively cancels transfer, hashing, or retry waits before returning. An
-independently scheduled signal watcher sets the same cancellation flag during
-synchronous local inspection/load phases, and a final checkpoint precedes
-publication. Live regions use buffered redraws, bounded widths, and drop-safe
-cursor restoration without an alternate screen.
+aggregate bytes, completion percentage, verified-file count, recent
+persisted-byte speed and ETA when meaningful, plus one animated progress row
+for every active file. Up to four planned files transfer concurrently while
+returned manifest records remain in plan order. Resumed bytes count toward
+completion but never toward network speed. Transfer completion changes the
+label to finalizing until local certification and publication return.
+Redirected human output stays deterministic and omits chunk-level progress
+spam; JSON event schemas remain unchanged. Ctrl-C cooperatively pauses a
+resumable transfer before returning. An independently scheduled signal watcher
+sets the same cancellation flag during synchronous local inspection/load
+phases, and a final checkpoint precedes publication. Live regions use buffered
+redraws, bounded widths, and drop-safe cursor restoration without an alternate
+screen.
 
 `hub auth login` reads the token from a hidden prompt. `--token-stdin` switches
 to one bounded UTF-8 line on stdin; `--json` login requires this non-interactive

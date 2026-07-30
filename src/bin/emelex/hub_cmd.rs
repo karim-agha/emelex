@@ -12,13 +12,15 @@ use anyhow::Context as _;
 use emelex::{
 	Emelex,
 	hub::{
-		DownloadCancellation, DownloadControl, DownloadEvent, DownloadObserver, HubDiagnostic,
-		HubModel, HubQuantization, HubQuantizationMode, HubSearch, REMOTE_FILTERS,
+		DownloadCancellation, DownloadControl, DownloadEvent, DownloadObserver, HubClient,
+		HubDiagnostic, HubModel, HubQuantization, HubQuantizationMode, HubSearch, HubSearchPage,
+		REMOTE_FILTERS,
 	},
 	model::{
-		HubModelId, InstalledModel, Modality, ModelSnapshotId, ModelTraits, MtpSupport,
-		ResolvedRevision, Task, TraitFilter,
+		HubModelId, InstalledModel, ModelRef, ModelSnapshotId, ModelTraits, ResolvedRevision, Task,
+		TraitFilter,
 	},
+	models::{HubTransferState, HubTransferStatus},
 };
 
 use super::{
@@ -29,10 +31,15 @@ use super::{
 };
 
 const EMPTY_SEARCH_MESSAGE: &str = "No compatible MLX models matched this search on this machine.";
-const EMPTY_SEARCH_PAGE_MESSAGE: &str =
-	"No compatible MLX models on this ranked page; use the next cursor to continue.";
+const EMPTY_SEARCH_PAGE_MESSAGE: &str = "No compatible MLX models on this page.";
 const SEARCH_CARD_WIDTH: usize = 64;
 const CLI_REQUIRED_SEARCH_TRAIT: &str = "interaction:tools";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HubRunOutcome {
+	Done,
+	StartChat(ModelRef),
+}
 
 pub(crate) async fn run(
 	emelex: &Emelex,
@@ -40,14 +47,15 @@ pub(crate) async fn run(
 	json: bool,
 	stdout_palette: Palette,
 	stderr_palette: Palette,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HubRunOutcome> {
 	match command {
 		HubCommand::Auth { command } => {
-			hub_auth_cmd::run(emelex.home(), command, json, stdout_palette, stderr_palette)
+			hub_auth_cmd::run(emelex.home(), command, json, stdout_palette, stderr_palette)?;
+			Ok(HubRunOutcome::Done)
 		}
 		HubCommand::Capabilities => {
 			if json {
-				output::json_line(&REMOTE_FILTERS)
+				output::json_line(&REMOTE_FILTERS)?;
 			} else {
 				output::stdout_line(&stdout_palette.bold("Remote model filters"))?;
 				output::stdout_line(
@@ -62,8 +70,8 @@ pub(crate) async fn run(
 					))?;
 					output::stdout_line(&format!("    {}", capability.meaning))?;
 				}
-				Ok(())
 			}
+			Ok(HubRunOutcome::Done)
 		}
 		HubCommand::Search {
 			query,
@@ -84,19 +92,22 @@ pub(crate) async fn run(
 			.await
 		}
 		HubCommand::Inspect { model, verbose } => {
-			inspect(emelex, &model, verbose, json, stdout_palette).await
+			inspect(emelex, &model, verbose, json, stdout_palette).await?;
+			Ok(HubRunOutcome::Done)
 		}
 		HubCommand::Download { model } => {
 			download(emelex, &model, json, stdout_palette, stderr_palette)
 				.await
-				.map(drop)
+				.map(drop)?;
+			Ok(HubRunOutcome::Done)
 		}
 	}
 }
 
 #[allow(
 	clippy::too_many_arguments,
-	reason = "CLI presentation inputs remain explicit at the command boundary"
+	clippy::too_many_lines,
+	reason = "CLI search keeps discovery, terminal selection, and the resulting action explicit"
 )]
 async fn search(
 	emelex: &Emelex,
@@ -107,7 +118,7 @@ async fn search(
 	json: bool,
 	stdout_palette: Palette,
 	stderr_palette: Palette,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HubRunOutcome> {
 	let requirements = cli_search_requirements(require)?;
 	let mut search = HubSearch::default()
 		.mlx_library()
@@ -121,7 +132,7 @@ async fn search(
 	let models = emelex
 		.models()
 		.context("initialize fit-aware model catalog")?;
-	let page = wait_for_hub("searching Hugging Face", json, async {
+	let first_page = wait_for_hub("searching Hugging Face", json, async {
 		models
 			.hub()
 			.search(&search)
@@ -130,19 +141,30 @@ async fn search(
 	})
 	.await?;
 	if json {
-		return output::json_line(&page);
+		output::json_line(&first_page)?;
+		return Ok(HubRunOutcome::Done);
 	}
-	let installed_hub = if page.items.is_empty() {
-		InstalledHubIndex::new()
+	let local_hub = if first_page.items.is_empty() && first_page.next_cursor.is_none() {
+		LocalHubIndex::default()
 	} else {
-		let snapshots = wait_for_hub("checking downloaded models", false, async {
-			models
-				.installed_hub_snapshots()
-				.await
-				.context("list installed Hub snapshots")
+		let (snapshots, transfers) = wait_for_hub("checking local model state", false, async {
+			tokio::try_join!(
+				async {
+					models
+						.installed_hub_snapshots()
+						.await
+						.context("list installed Hub snapshots")
+				},
+				async {
+					models
+						.hub_transfer_statuses()
+						.await
+						.context("list Hub transfer statuses")
+				},
+			)
 		})
 		.await?;
-		installed_hub_index(&snapshots)
+		local_hub_index(&snapshots, &transfers)
 	};
 	let selection_enabled = search_selection_enabled(
 		json,
@@ -151,30 +173,70 @@ async fn search(
 			io::stdout().is_terminal(),
 			io::stderr().is_terminal(),
 		],
-	) && !page.items.is_empty();
-	let selected = if selection_enabled {
-		select_search_result(&page.items, &installed_hub, page.scanned, stdout_palette)?
+	) && (!first_page.items.is_empty() || first_page.next_cursor.is_some());
+	let (page, choice) = if selection_enabled {
+		let result = select_search_result(
+			models.hub(),
+			&search,
+			first_page,
+			&local_hub,
+			stdout_palette,
+		)
+		.await?;
+		(result.page, result.choice)
 	} else {
-		None
+		(first_page, SearchBrowseChoice::RenderPage)
+	};
+	let selected = match choice {
+		SearchBrowseChoice::RenderPage => None,
+		SearchBrowseChoice::Closed => return Ok(HubRunOutcome::Done),
+		SearchBrowseChoice::Selected(model) => Some(*model),
 	};
 	if page.items.is_empty() {
 		output::stdout_line(empty_search_message(page.next_cursor.is_some()))?;
-	} else if let Some(selected) = selected {
-		let model = page
-			.items
-			.get(selected)
-			.context("Hub selection returned an invalid result index")?;
-		let status = search_install_status(&model.id, &model.revision, &installed_hub);
+	} else if let Some(model) = &selected {
+		let status = search_install_status(&model.id, &model.revision, &local_hub);
 		output::stdout_line(&render_search_model(model, status, stdout_palette))?;
 	} else {
 		for (index, model) in page.items.iter().enumerate() {
 			if index > 0 {
 				output::stdout_line("")?;
 			}
-			let status = search_install_status(&model.id, &model.revision, &installed_hub);
+			let status = search_install_status(&model.id, &model.revision, &local_hub);
 			output::stdout_line(&render_search_model(model, status, stdout_palette))?;
 		}
 	}
+	render_search_diagnostics(&page, verbose, stderr_palette)?;
+	output::stderr_line(&stderr_palette.dim(&search_summary_line(page.items.len(), page.scanned)))?;
+	let Some(model) = selected else {
+		return Ok(HubRunOutcome::Done);
+	};
+	let status = search_install_status(&model.id, &model.revision, &local_hub);
+	let (id, revision) = match search_open_action(&model, status) {
+		SearchOpenAction::Chat(model) => return Ok(HubRunOutcome::StartChat(model)),
+		SearchOpenAction::Download { id, revision } => (id, revision),
+	};
+	let installed = download_revision(
+		emelex,
+		&id,
+		&revision,
+		false,
+		stdout_palette,
+		stderr_palette,
+	)
+	.await?;
+	if confirm_start_chat(installed.reference())? {
+		Ok(HubRunOutcome::StartChat(installed.reference().clone()))
+	} else {
+		Ok(HubRunOutcome::Done)
+	}
+}
+
+fn render_search_diagnostics(
+	page: &HubSearchPage,
+	verbose: bool,
+	stderr_palette: Palette,
+) -> anyhow::Result<()> {
 	if verbose && !page.diagnostics.is_empty() {
 		output::stderr_line(&stderr_palette.yellow("Skipped candidates:"))?;
 		for (candidate, messages) in grouped_diagnostics(&page.diagnostics) {
@@ -186,45 +248,41 @@ async fn search(
 	} else if !page.diagnostics.is_empty() {
 		output::stderr_line(&stderr_palette.dim(&hidden_diagnostics_line(page.diagnostics.len())))?;
 	}
-	output::stderr_line(&stderr_palette.dim(&search_summary_line(page.items.len(), page.scanned)))?;
-	if let Some(cursor) = &page.next_cursor {
-		output::stderr_line(&stderr_palette.dim(&next_cursor_line(cursor)))?;
-	}
-	if let Some(selected) = selected {
-		let model = page
-			.items
-			.get(selected)
-			.context("Hub selection returned an invalid result index")?;
-		download_revision(
-			emelex,
-			&model.id,
-			&model.revision,
-			false,
-			stdout_palette,
-			stderr_palette,
-		)
-		.await?;
-	}
 	Ok(())
 }
 
-fn cli_search_requirements(require: Vec<TraitFilter>) -> anyhow::Result<Vec<TraitFilter>> {
-	let mut requirements = require.into_iter().collect::<BTreeSet<_>>();
-	requirements.insert(
-		TraitFilter::parse(CLI_REQUIRED_SEARCH_TRAIT)
-			.context("build implicit CLI Hub search requirement")?,
-	);
-	Ok(requirements.into_iter().collect())
+fn confirm_start_chat(model: &ModelRef) -> anyhow::Result<bool> {
+	let model = model.to_string();
+	let model = output::terminal_safe_inline(&model);
+	dialoguer::Confirm::new()
+		.with_prompt(format!("Start an interactive chat with {model}?"))
+		.default(true)
+		.interact()
+		.context("read post-download chat choice")
 }
 
-fn select_search_result(
-	items: &[HubModel],
-	installed: &InstalledHubIndex,
-	scanned: usize,
+#[derive(Debug, Clone)]
+struct SearchBrowseResult {
+	page: HubSearchPage,
+	choice: SearchBrowseChoice,
+}
+
+#[derive(Debug, Clone)]
+enum SearchBrowseChoice {
+	RenderPage,
+	Closed,
+	Selected(Box<HubModel>),
+}
+
+async fn select_search_result(
+	hub: &HubClient,
+	search: &HubSearch,
+	first_page: HubSearchPage,
+	local: &LocalHubIndex,
 	palette: Palette,
-) -> anyhow::Result<Option<usize>> {
+) -> anyhow::Result<SearchBrowseResult> {
 	let mut region = LiveRegion::stdout();
-	let result = run_search_selector(&mut region, items, installed, scanned, palette);
+	let result = run_search_selector(&mut region, hub, search, first_page, local, palette).await;
 	let cleanup = region.clear();
 	match (result, cleanup) {
 		(Ok(selected), Ok(())) => Ok(selected),
@@ -236,36 +294,158 @@ fn select_search_result(
 	}
 }
 
-fn run_search_selector(
+fn cli_search_requirements(require: Vec<TraitFilter>) -> anyhow::Result<Vec<TraitFilter>> {
+	let mut requirements = require.into_iter().collect::<BTreeSet<_>>();
+	requirements.insert(
+		TraitFilter::parse(CLI_REQUIRED_SEARCH_TRAIT)
+			.context("build implicit CLI Hub search requirement")?,
+	);
+	Ok(requirements.into_iter().collect())
+}
+
+#[derive(Debug, Clone)]
+struct CachedSearchPage {
+	page: HubSearchPage,
+	selected: usize,
+}
+
+async fn run_search_selector(
 	region: &mut LiveRegion,
-	items: &[HubModel],
-	installed: &InstalledHubIndex,
-	scanned: usize,
+	hub: &HubClient,
+	search: &HubSearch,
+	first_page: HubSearchPage,
+	local: &LocalHubIndex,
 	palette: Palette,
-) -> anyhow::Result<Option<usize>> {
-	if items.is_empty() {
-		return Ok(None);
-	}
+) -> anyhow::Result<SearchBrowseResult> {
 	if region.size().0 < 2 {
-		return Ok(None);
+		return Ok(SearchBrowseResult {
+			page: first_page,
+			choice: SearchBrowseChoice::RenderPage,
+		});
 	}
-	let mut selected = 0;
+	let mut pages = vec![CachedSearchPage {
+		page: first_page,
+		selected: 0,
+	}];
+	let mut current = 0_usize;
+	let mut requested_cursors = search.cursor.iter().cloned().collect::<BTreeSet<_>>();
 	loop {
+		let page = pages
+			.get(current)
+			.context("Hub search browser lost its current page")?;
+		let has_previous = current > 0;
+		let cached_next = current + 1 < pages.len();
+		let next_cursor = unused_next_cursor(&page.page, &requested_cursors);
+		let has_next = cached_next || next_cursor.is_some();
 		let frame = render_search_selector_frame(
-			items,
-			installed,
-			selected,
-			scanned,
+			&page.page.items,
+			local,
+			page.selected,
+			page.page.scanned,
+			current + 1,
+			has_previous,
+			has_next,
 			region.size(),
 			palette,
 		);
 		region.draw(&frame)?;
-		match search_selector_action(&region.read_key()?, selected, items.len()) {
-			SearchSelectorAction::Move(next) => selected = next,
-			SearchSelectorAction::Select => return Ok(Some(selected)),
-			SearchSelectorAction::Cancel => return Ok(None),
+		match search_selector_action(
+			&region.read_key()?,
+			page.selected,
+			page.page.items.len(),
+			has_previous,
+			has_next,
+		) {
+			SearchSelectorAction::Move(next) => {
+				pages
+					.get_mut(current)
+					.context("Hub search browser lost its current page")?
+					.selected = next;
+			}
+			SearchSelectorAction::Select => {
+				let page = pages
+					.get(current)
+					.context("Hub search browser lost its selected page")?;
+				let selected = page
+					.page
+					.items
+					.get(page.selected)
+					.cloned()
+					.context("Hub selection returned an invalid result index")?;
+				return Ok(SearchBrowseResult {
+					page: page.page.clone(),
+					choice: SearchBrowseChoice::Selected(Box::new(selected)),
+				});
+			}
+			SearchSelectorAction::PreviousPage => current = current.saturating_sub(1),
+			SearchSelectorAction::NextPage if cached_next => current += 1,
+			SearchSelectorAction::NextPage => {
+				let cursor = next_cursor.context("Hub search page cannot advance")?;
+				requested_cursors.insert(cursor.clone());
+				let mut next_search = search.clone();
+				next_search.cursor = Some(cursor);
+				let next_page =
+					fetch_search_page(region, hub, &next_search, current + 2, palette).await?;
+				pages.push(CachedSearchPage {
+					page: next_page,
+					selected: 0,
+				});
+				current += 1;
+			}
+			SearchSelectorAction::Cancel => {
+				let page = pages
+					.get(current)
+					.context("Hub search browser lost its closing page")?;
+				return Ok(SearchBrowseResult {
+					page: page.page.clone(),
+					choice: SearchBrowseChoice::Closed,
+				});
+			}
 			SearchSelectorAction::Interrupt => anyhow::bail!("Hub model selection interrupted"),
 			SearchSelectorAction::Ignore => {}
+		}
+	}
+}
+
+fn unused_next_cursor(
+	page: &HubSearchPage,
+	requested_cursors: &BTreeSet<String>,
+) -> Option<String> {
+	page.next_cursor
+		.as_ref()
+		.filter(|cursor| !requested_cursors.contains(*cursor))
+		.cloned()
+}
+
+async fn fetch_search_page(
+	region: &mut LiveRegion,
+	hub: &HubClient,
+	search: &HubSearch,
+	page: usize,
+	palette: Palette,
+) -> anyhow::Result<HubSearchPage> {
+	const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+	let operation = hub.search(search);
+	let cancellation = tokio::signal::ctrl_c();
+	let mut interval = tokio::time::interval(Duration::from_millis(120));
+	interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	tokio::pin!(operation);
+	tokio::pin!(cancellation);
+	let mut frame = 0_usize;
+	loop {
+		tokio::select! {
+			result = &mut operation => {
+				return result.context("search Hugging Face");
+			}
+			signal = &mut cancellation => {
+				signal.context("listen for Hub search cancellation")?;
+				anyhow::bail!("Hub model search interrupted");
+			}
+			_ = interval.tick() => {
+				let spinner = palette.cyan(FRAMES[frame % FRAMES.len()]);
+				region.draw(&format!("{spinner} Loading Page {}…", page.max(1)))?;
+				frame = frame.wrapping_add(1);
+			}
 		}
 	}
 }
@@ -274,6 +454,8 @@ fn run_search_selector(
 enum SearchSelectorAction {
 	Move(usize),
 	Select,
+	PreviousPage,
+	NextPage,
 	Cancel,
 	Interrupt,
 	Ignore,
@@ -283,13 +465,17 @@ fn search_selector_action(
 	key: &dialoguer::console::Key,
 	selected: usize,
 	item_count: usize,
+	has_previous: bool,
+	has_next: bool,
 ) -> SearchSelectorAction {
 	use dialoguer::console::Key;
 
-	if item_count == 0 {
-		return SearchSelectorAction::Cancel;
-	}
 	match key {
+		Key::ArrowLeft | Key::Char('h' | '<') if has_previous => SearchSelectorAction::PreviousPage,
+		Key::ArrowRight | Key::Char('l' | '>') if has_next => SearchSelectorAction::NextPage,
+		Key::Escape | Key::Char('q') => SearchSelectorAction::Cancel,
+		Key::CtrlC => SearchSelectorAction::Interrupt,
+		_ if item_count == 0 => SearchSelectorAction::Ignore,
 		Key::ArrowDown | Key::Tab | Key::Char('j') => {
 			SearchSelectorAction::Move((selected + 1) % item_count)
 		}
@@ -301,41 +487,64 @@ fn search_selector_action(
 		Key::Home => SearchSelectorAction::Move(0),
 		Key::End => SearchSelectorAction::Move(item_count - 1),
 		Key::Enter | Key::Char(' ') => SearchSelectorAction::Select,
-		Key::Escape | Key::Char('q') => SearchSelectorAction::Cancel,
-		Key::CtrlC => SearchSelectorAction::Interrupt,
 		_ => SearchSelectorAction::Ignore,
 	}
 }
 
-type InstalledHubIndex = BTreeMap<HubModelId, BTreeSet<ResolvedRevision>>;
+#[derive(Debug, Clone, Default)]
+struct LocalHubIndex {
+	installed: BTreeMap<HubModelId, BTreeSet<ResolvedRevision>>,
+	transfers: BTreeMap<ModelSnapshotId, HubTransferState>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchInstallStatus {
 	Downloaded,
+	Downloading,
+	Paused,
 	DifferentRevision,
 	NotDownloaded,
 }
 
-impl SearchInstallStatus {
-	const fn label(self) -> &'static str {
-		match self {
-			Self::Downloaded => "downloaded",
-			Self::DifferentRevision => "different revision downloaded",
-			Self::NotDownloaded => "not downloaded",
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchOpenAction {
+	Chat(ModelRef),
+	Download {
+		id: HubModelId,
+		revision: ResolvedRevision,
+	},
+}
+
+fn search_open_action(model: &HubModel, status: SearchInstallStatus) -> SearchOpenAction {
+	if status == SearchInstallStatus::Downloaded {
+		SearchOpenAction::Chat(ModelRef::Hub(model.id.clone()))
+	} else {
+		SearchOpenAction::Download {
+			id: model.id.clone(),
+			revision: model.revision.clone(),
 		}
 	}
 }
 
-fn installed_hub_index(installed: &[ModelSnapshotId]) -> InstalledHubIndex {
-	let mut index = InstalledHubIndex::new();
+fn local_hub_index(
+	installed: &[ModelSnapshotId],
+	transfers: &[HubTransferStatus],
+) -> LocalHubIndex {
+	let mut index = LocalHubIndex::default();
 	for installed in installed {
 		let ModelSnapshotId::Hub { id, revision } = installed else {
 			continue;
 		};
 		index
+			.installed
 			.entry(id.clone())
 			.or_default()
 			.insert(revision.clone());
+	}
+	for transfer in transfers {
+		index
+			.transfers
+			.insert(transfer.snapshot_id().clone(), transfer.state());
 	}
 	index
 }
@@ -343,12 +552,20 @@ fn installed_hub_index(installed: &[ModelSnapshotId]) -> InstalledHubIndex {
 fn search_install_status(
 	id: &HubModelId,
 	revision: &ResolvedRevision,
-	installed: &InstalledHubIndex,
+	local: &LocalHubIndex,
 ) -> SearchInstallStatus {
-	match installed.get(id) {
+	let snapshot = ModelSnapshotId::Hub {
+		id: id.clone(),
+		revision: revision.clone(),
+	};
+	match local.installed.get(id) {
 		Some(revisions) if revisions.contains(revision) => SearchInstallStatus::Downloaded,
-		Some(_) => SearchInstallStatus::DifferentRevision,
-		None => SearchInstallStatus::NotDownloaded,
+		_ => match local.transfers.get(&snapshot) {
+			Some(HubTransferState::Downloading) => SearchInstallStatus::Downloading,
+			Some(HubTransferState::Paused) => SearchInstallStatus::Paused,
+			_ if local.installed.contains_key(id) => SearchInstallStatus::DifferentRevision,
+			_ => SearchInstallStatus::NotDownloaded,
+		},
 	}
 }
 
@@ -360,6 +577,15 @@ const fn search_selection_enabled(
 }
 
 fn render_search_model(model: &HubModel, status: SearchInstallStatus, palette: Palette) -> String {
+	render_search_model_at_width(model, status, SEARCH_CARD_WIDTH, palette)
+}
+
+fn render_search_model_at_width(
+	model: &HubModel,
+	status: SearchInstallStatus,
+	width: usize,
+	palette: Palette,
+) -> String {
 	let sizing = model.traits.sizing.as_ref();
 	render_search_card(
 		&SearchCardData {
@@ -367,26 +593,31 @@ fn render_search_model(model: &HubModel, status: SearchInstallStatus, palette: P
 			status,
 			quantization: model.quantization,
 			weights_bytes: sizing.and_then(|sizing| sizing.weights_bytes),
-			memory: model.fit.as_ref().map(|fit| {
-				(
-					fit.required_bytes,
-					fit.budget_bytes,
-					fit.workload.batch_size(),
-					fit.workload.context_tokens(),
-				)
-			}),
+			memory_bytes: model
+				.fit
+				.as_ref()
+				.map(|fit| fit.required_bytes)
+				.or_else(|| sizing.and_then(|sizing| sizing.estimated_residency_bytes)),
 			max_context_tokens: sizing.and_then(|sizing| sizing.max_context_tokens),
 			traits: &model.traits,
 		},
+		width,
 		palette,
 	)
 }
 
+#[allow(
+	clippy::too_many_arguments,
+	reason = "pure selector rendering keeps viewport and page state explicit"
+)]
 fn render_search_selector_frame(
 	items: &[HubModel],
-	installed: &InstalledHubIndex,
+	local: &LocalHubIndex,
 	selected: usize,
 	scanned: usize,
+	page: usize,
+	has_previous: bool,
+	has_next: bool,
 	(rows, columns): (u16, u16),
 	palette: Palette,
 ) -> String {
@@ -397,18 +628,26 @@ fn render_search_selector_frame(
 	}
 	let selected = selected.min(items.len().saturating_sub(1));
 	if rows <= 2 {
-		return render_tiny_search_selector(items, installed, selected, rows, columns, palette);
+		return render_tiny_search_selector(
+			items,
+			local,
+			selected,
+			rows,
+			columns,
+			page,
+			has_previous,
+			has_next,
+			palette,
+		);
 	}
-	let compact = columns < 48 || rows < 12;
 	let cards = items
 		.iter()
 		.enumerate()
 		.map(|(index, model)| {
 			search_selector_card(
 				model,
-				search_install_status(&model.id, &model.revision, installed),
+				search_install_status(&model.id, &model.revision, local),
 				index == selected,
-				compact,
 				columns,
 				palette,
 			)
@@ -447,49 +686,48 @@ fn render_search_selector_frame(
 			used += 1;
 		}
 	}
-	let position = format!("{}/{}", selected + 1, items.len());
-	let footer = if columns < 52 {
-		format!("↑↓ move · enter · esc · {position}")
-	} else {
-		format!("↑↓ move  ·  enter download  ·  esc close  ·  {position}")
-	};
-	frame.push(fit_line(&palette.dim(&footer), columns));
+	frame.push(fit_line(
+		&pagination_line(page, has_previous, has_next, palette),
+		columns,
+	));
 	frame.truncate(rows);
 	frame.join("\n")
 }
 
+#[allow(
+	clippy::too_many_arguments,
+	reason = "tiny rendering receives the same explicit selector state as the full viewport"
+)]
 fn render_tiny_search_selector(
 	items: &[HubModel],
-	installed: &InstalledHubIndex,
+	local: &LocalHubIndex,
 	selected: usize,
 	rows: usize,
 	columns: usize,
+	page: usize,
+	has_previous: bool,
+	has_next: bool,
 	palette: Palette,
 ) -> String {
-	let model = &items[selected];
-	let quantization = compact_quantization(model.quantization);
-	if rows == 1 {
-		return fit_line(
-			&format!("{} {quantization} · {}", palette.cyan("❯"), model.id),
-			columns,
-		);
+	let footer = fit_line(
+		&pagination_line(page, has_previous, has_next, palette),
+		columns,
+	);
+	if rows == 1 || items.is_empty() {
+		return footer;
 	}
-	let status = search_install_status(&model.id, &model.revision, installed);
-	let status = match status {
-		SearchInstallStatus::Downloaded => palette.green(status.label()),
-		SearchInstallStatus::DifferentRevision => palette.yellow(status.label()),
-		SearchInstallStatus::NotDownloaded => palette.dim(status.label()),
-	};
+	let model = &items[selected];
+	let status = search_install_status(&model.id, &model.revision, local);
 	[
-		fit_line(&format!("{} {}", palette.cyan("❯"), model.id), columns),
 		fit_line(
 			&format!(
-				"  {quantization} · {status} · {}/{} · ↑↓ enter esc",
-				selected + 1,
-				items.len()
+				"{} {}",
+				palette.cyan("❯"),
+				search_model_name(model.id.as_str(), status, palette)
 			),
 			columns,
 		),
+		footer,
 	]
 	.join("\n")
 }
@@ -498,31 +736,11 @@ fn search_selector_card(
 	model: &HubModel,
 	status: SearchInstallStatus,
 	selected: bool,
-	compact: bool,
 	columns: usize,
 	palette: Palette,
 ) -> Vec<String> {
-	let rendered = if compact {
-		let status = match status {
-			SearchInstallStatus::Downloaded => palette.green(status.label()),
-			SearchInstallStatus::DifferentRevision => palette.yellow(status.label()),
-			SearchInstallStatus::NotDownloaded => palette.dim(status.label()),
-		};
-		let weights = model
-			.traits
-			.sizing
-			.as_ref()
-			.and_then(|sizing| sizing.weights_bytes);
-		format!(
-			"{}\n  {} · {} · {} weights",
-			palette.cyan(model.id.as_str()),
-			status,
-			compact_quantization(model.quantization),
-			optional_bytes(weights),
-		)
-	} else {
-		render_search_model(model, status, palette)
-	};
+	let card_width = columns.saturating_sub(2).max(1);
+	let rendered = render_search_model_at_width(model, status, card_width, palette);
 	rendered
 		.lines()
 		.enumerate()
@@ -575,48 +793,58 @@ struct SearchCardData<'a> {
 	status: SearchInstallStatus,
 	quantization: HubQuantization,
 	weights_bytes: Option<u64>,
-	memory: Option<(u64, u64, usize, usize)>,
+	memory_bytes: Option<u64>,
 	max_context_tokens: Option<usize>,
 	traits: &'a ModelTraits,
 }
 
-fn render_search_card(card: &SearchCardData<'_>, palette: Palette) -> String {
-	let id = output::terminal_safe_inline(card.id);
-	let status = match card.status {
-		SearchInstallStatus::Downloaded => palette.green(card.status.label()),
-		SearchInstallStatus::DifferentRevision => palette.yellow(card.status.label()),
-		SearchInstallStatus::NotDownloaded => palette.dim(card.status.label()),
-	};
-	let mut lines = vec![
-		palette.cyan(&id),
-		search_field("Status", &status),
-		search_field("Quant", &quantization_summary(card.quantization)),
-		search_field("Weights", &optional_bytes(card.weights_bytes)),
+fn render_search_card(card: &SearchCardData<'_>, width: usize, palette: Palette) -> String {
+	let metrics = [
+		format!("Quant {}", compact_quantization(card.quantization)),
+		format!("Weights {}", optional_bytes(card.weights_bytes)),
+		format!("Memory {}", optional_bytes(card.memory_bytes)),
+		format!("Context {}", optional_tokens(card.max_context_tokens)),
 	];
-	if let Some((required, budget, batch_size, context_tokens)) = card.memory {
-		lines.push(search_field(
-			"Memory",
-			&format!("{} required", bytes(required)),
-		));
-		lines.push(format!(
-			"          at batch {batch_size} · {} tokens",
-			optional_tokens(Some(context_tokens))
-		));
-		lines.push(search_field("Budget", &format!("{} Metal", bytes(budget))));
+	let mut lines = vec![search_model_name(card.id, card.status, palette)];
+	lines.extend(wrap_search_segments("  ", &metrics, width));
+	let tasks = search_task_labels(card.traits);
+	if tasks.is_empty() {
+		lines.push(search_field("Tasks", "unknown"));
 	} else {
-		lines.push(search_field("Memory", "requirement unknown"));
-		lines.push(search_field("Budget", "unknown"));
+		lines.extend(wrap_search_values("Tasks", &tasks, width));
 	}
-	lines.push(search_field(
-		"Context",
-		&format!("{} max", optional_tokens(card.max_context_tokens)),
-	));
-	lines.extend(search_capability_lines(card.traits));
 	lines.join("\n")
+}
+
+fn search_model_name(id: &str, status: SearchInstallStatus, palette: Palette) -> String {
+	let id = palette.cyan(&output::terminal_safe_inline(id));
+	match status {
+		SearchInstallStatus::Downloaded => format!("{} {id}", palette.green("✓")),
+		SearchInstallStatus::Downloading => format!("{id} {}", palette.cyan("[downloading]")),
+		SearchInstallStatus::Paused => format!("{id} {}", palette.yellow("[paused]")),
+		SearchInstallStatus::DifferentRevision | SearchInstallStatus::NotDownloaded => id,
+	}
 }
 
 fn search_field(label: &str, value: &str) -> String {
 	format!("  {label:<7} {value}")
+}
+
+fn pagination_line(page: usize, has_previous: bool, has_next: bool, palette: Palette) -> String {
+	let previous = if has_previous {
+		palette.cyan("< Prev")
+	} else {
+		palette.dim("< Prev")
+	};
+	let next = if has_next {
+		palette.cyan("Next>")
+	} else {
+		palette.dim("Next>")
+	};
+	format!(
+		"{previous} | {} | {next}",
+		palette.bold(&format!("Page {}", page.max(1)))
+	)
 }
 
 fn quantization_summary(quantization: HubQuantization) -> String {
@@ -666,7 +894,7 @@ fn compact_quantization(quantization: HubQuantization) -> String {
 	}
 }
 
-fn search_capability_lines(traits: &ModelTraits) -> Vec<String> {
+fn search_task_labels(traits: &ModelTraits) -> Vec<&'static str> {
 	let mut tasks = Vec::new();
 	for task in &traits.tasks {
 		let label = match task {
@@ -681,48 +909,34 @@ fn search_capability_lines(traits: &ModelTraits) -> Vec<String> {
 			tasks.push(label);
 		}
 	}
-	let mut inputs = Vec::new();
-	for input in &traits.input {
-		let label = match input {
-			Modality::Text => None,
-			Modality::Image => Some("image"),
-			Modality::Audio => Some("audio"),
-			_ => Some("other"),
-		};
-		if let Some(label) = label
-			&& !inputs.contains(&label)
-		{
-			inputs.push(label);
-		}
-	}
-	let mut lines = Vec::new();
-	match traits.mtp {
-		MtpSupport::Absent => {}
-		MtpSupport::Advertised => lines.push(search_field("MTP", "advertised")),
-		MtpSupport::RuntimeVerified => lines.push(search_field("MTP", "verified")),
-		_ => lines.push(search_field("MTP", "unknown")),
-	}
-	for (label, values) in [("Tasks", tasks.as_slice()), ("Inputs", inputs.as_slice())] {
-		if !values.is_empty() {
-			lines.extend(wrap_search_values(label, values));
-		}
-	}
-	if lines.is_empty() {
-		lines.push(search_field("Details", "capabilities unknown"));
-	}
-	lines
+	tasks
 }
 
-fn wrap_search_values(label: &str, values: &[&str]) -> Vec<String> {
+fn wrap_search_segments(prefix: &str, values: &[String], width: usize) -> Vec<String> {
+	let values = values.iter().map(String::as_str).collect::<Vec<_>>();
+	wrap_search_line(prefix, prefix, &values, width)
+}
+
+fn wrap_search_values(label: &str, values: &[&str], width: usize) -> Vec<String> {
 	let prefix = format!("  {label:<7} ");
 	let continuation = "          ";
+	wrap_search_line(&prefix, continuation, values, width)
+}
+
+fn wrap_search_line(
+	prefix: &str,
+	continuation: &str,
+	values: &[&str],
+	width: usize,
+) -> Vec<String> {
+	let width = width.max(1);
 	let mut lines = Vec::new();
-	let mut line = prefix;
+	let mut line = prefix.to_string();
 	let mut has_value = false;
 	for value in values {
 		let separator = if has_value { " · " } else { "" };
 		let projected = line.chars().count() + separator.chars().count() + value.chars().count();
-		if has_value && projected > SEARCH_CARD_WIDTH {
+		if has_value && projected > width {
 			lines.push(line);
 			line = continuation.to_string();
 			has_value = false;
@@ -780,11 +994,6 @@ fn search_summary_line(results: usize, scanned: usize) -> String {
 			"candidates"
 		}
 	)
-}
-
-fn next_cursor_line(cursor: &str) -> String {
-	let cursor = output::terminal_safe_inline(cursor);
-	format!("next cursor:\n  {cursor}")
 }
 
 async fn inspect(
@@ -1300,7 +1509,6 @@ struct DownloadFileProgress {
 
 #[derive(Debug, Clone)]
 struct DownloadRetry {
-	path: String,
 	attempt: usize,
 	reason: String,
 }
@@ -1313,8 +1521,8 @@ struct DownloadUiState {
 	total_bytes: u64,
 	files: BTreeMap<String, DownloadFileProgress>,
 	verified: BTreeSet<String>,
-	current_path: Option<String>,
-	retry: Option<DownloadRetry>,
+	active: BTreeSet<String>,
+	retries: BTreeMap<String, DownloadRetry>,
 	network_bytes: u64,
 	samples: VecDeque<(Instant, u64)>,
 	last_network_at: Option<Instant>,
@@ -1329,8 +1537,8 @@ impl DownloadUiState {
 			total_bytes: 0,
 			files: BTreeMap::new(),
 			verified: BTreeSet::new(),
-			current_path: None,
-			retry: None,
+			active: BTreeSet::new(),
+			retries: BTreeMap::new(),
 			network_bytes: 0,
 			samples: VecDeque::new(),
 			last_network_at: None,
@@ -1343,6 +1551,12 @@ impl DownloadUiState {
 				self.phase = DownloadPhase::Transferring;
 				self.total_files = *files;
 				self.total_bytes = *total;
+				self.files.clear();
+				self.verified.clear();
+				self.active.clear();
+				self.retries.clear();
+				self.network_bytes = 0;
+				self.last_network_at = None;
 				self.samples.clear();
 				self.samples.push_back((now, self.network_bytes));
 			}
@@ -1352,8 +1566,8 @@ impl DownloadUiState {
 				total,
 			} => {
 				self.phase = DownloadPhase::Transferring;
-				self.current_path = Some(path.clone());
-				self.retry = None;
+				self.active.insert(path.clone());
+				self.retries.remove(path);
 				let file = self.files.entry(path.clone()).or_default();
 				file.received = (*resumed).min(*total);
 				file.total = *total;
@@ -1364,8 +1578,8 @@ impl DownloadUiState {
 				total,
 			} => {
 				self.phase = DownloadPhase::Transferring;
-				self.current_path = Some(path.clone());
-				self.retry = None;
+				self.active.insert(path.clone());
+				self.retries.remove(path);
 				let file = self.files.entry(path.clone()).or_default();
 				let received = (*received).min(*total);
 				let delta = if received >= file.received {
@@ -1388,26 +1602,29 @@ impl DownloadUiState {
 				reason,
 			} => {
 				self.phase = DownloadPhase::Transferring;
-				self.current_path = Some(path.clone());
-				self.retry = Some(DownloadRetry {
-					path: path.clone(),
-					attempt: *attempt,
-					reason: reason.clone(),
-				});
+				self.active.insert(path.clone());
+				self.retries.insert(
+					path.clone(),
+					DownloadRetry {
+						attempt: *attempt,
+						reason: reason.clone(),
+					},
+				);
 			}
 			DownloadEvent::FileVerified { path, .. } => {
-				self.current_path = Some(path.clone());
 				self.verified.insert(path.clone());
+				self.active.remove(path);
 				if let Some(file) = self.files.get_mut(path) {
 					file.received = file.total;
 				}
-				self.retry = None;
+				self.retries.remove(path);
 			}
 			DownloadEvent::TransferCompleted { files, total } => {
 				self.phase = DownloadPhase::Finalizing;
 				self.total_files = *files;
 				self.total_bytes = *total;
-				self.retry = None;
+				self.active.clear();
+				self.retries.clear();
 			}
 			_ => {}
 		}
@@ -1556,16 +1773,6 @@ fn render_download_frame(
 	if state.phase == DownloadPhase::Finalizing {
 		return fit_line(&format!("{spinner} Finalizing {model}"), columns);
 	}
-	if let Some(retry) = &state.retry {
-		let path = output::terminal_safe_inline(&retry.path);
-		let reason = output::terminal_safe_inline(&retry.reason);
-		let line = format!(
-			"{} Retrying {path} · attempt {} · {reason}",
-			palette.yellow(FRAMES[frame % FRAMES.len()]),
-			retry.attempt
-		);
-		return fit_line(&line, columns);
-	}
 
 	let received = state.received_bytes();
 	let percent = received
@@ -1573,51 +1780,94 @@ fn render_download_frame(
 		.checked_div(state.total_bytes)
 		.unwrap_or(0)
 		.min(100);
+	let mut lines = Vec::new();
 	if columns < 52 {
-		return fit_line(
+		lines.push(fit_line(
 			&format!(
-				"{spinner} Downloading {percent:>3}% · {}/{}",
+				"{spinner} {percent:>3}% {model} · {}/{}",
 				bytes(received),
 				bytes(state.total_bytes)
 			),
 			columns,
-		);
-	}
-
-	let bar_width = if columns >= 96 {
-		24
-	} else if columns >= 72 {
-		16
+		));
 	} else {
-		10
-	};
-	let bar = progress_bar(percent, bar_width, palette);
-	let mut lines = vec![fit_line(
-		&format!("{spinner} Downloading  {bar}  {percent:>3}%"),
-		columns,
-	)];
-	let mut details = vec![
-		format!("{} / {}", bytes(received), bytes(state.total_bytes)),
-		format!("{}/{} verified", state.verified.len(), state.total_files),
-	];
-	if let Some(speed) = state.bytes_per_second(now) {
-		details.insert(1, format!("{}/s", bytes(speed)));
-		let remaining = state.total_bytes.saturating_sub(received);
-		details.insert(2, remaining_time(remaining.div_ceil(speed)));
-	}
-	lines.push(fit_line(
-		&palette.dim(&format!("  {}", details.join(" · "))),
-		columns,
-	));
-	if columns >= 72
-		&& let Some(path) = &state.current_path
-	{
+		let bar_width = if columns >= 96 { 24 } else { 16 };
+		let bar = progress_bar(percent, bar_width, palette);
 		lines.push(fit_line(
-			&palette.dim(&format!("  {}", output::terminal_safe_inline(path))),
+			&format!("{spinner} Downloading {model}  {bar}  {percent:>3}%"),
+			columns,
+		));
+		let mut details = vec![
+			format!("{} / {}", bytes(received), bytes(state.total_bytes)),
+			format!("{}/{} verified", state.verified.len(), state.total_files),
+		];
+		if let Some(speed) = state.bytes_per_second(now) {
+			details.insert(1, format!("{}/s", bytes(speed)));
+			let remaining = state.total_bytes.saturating_sub(received);
+			details.insert(2, remaining_time(remaining.div_ceil(speed)));
+		}
+		lines.push(fit_line(
+			&palette.dim(&format!("  Overall · {}", details.join(" · "))),
 			columns,
 		));
 	}
+	for (index, path) in state.active.iter().enumerate() {
+		let progress = state.files.get(path).cloned().unwrap_or_default();
+		lines.push(render_download_file_row(
+			path,
+			&progress,
+			state.retries.get(path),
+			frame.wrapping_add(index),
+			columns,
+			palette,
+		));
+	}
 	lines.join("\n")
+}
+
+fn render_download_file_row(
+	path: &str,
+	progress: &DownloadFileProgress,
+	retry: Option<&DownloadRetry>,
+	frame: usize,
+	columns: usize,
+	palette: Palette,
+) -> String {
+	const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+	let path = output::terminal_safe_inline(path);
+	if let Some(retry) = retry {
+		let reason = output::terminal_safe_inline(&retry.reason);
+		return fit_line(
+			&format!(
+				"  {} Retrying {path} · attempt {} · {reason}",
+				palette.yellow(FRAMES[frame % FRAMES.len()]),
+				retry.attempt
+			),
+			columns,
+		);
+	}
+	let percent = progress
+		.received
+		.saturating_mul(100)
+		.checked_div(progress.total)
+		.unwrap_or(0)
+		.min(100);
+	let spinner = palette.cyan(FRAMES[frame % FRAMES.len()]);
+	let line = if columns >= 72 {
+		format!(
+			"  {spinner} {} {percent:>3}% · {path} · {}/{}",
+			progress_bar(percent, 10, palette),
+			bytes(progress.received),
+			bytes(progress.total)
+		)
+	} else {
+		format!(
+			"  {spinner} {percent:>3}% · {path} · {}/{}",
+			bytes(progress.received),
+			bytes(progress.total)
+		)
+	};
+	fit_line(&line, columns)
 }
 
 fn progress_bar(percent: u64, width: usize, palette: Palette) -> String {
@@ -1759,33 +2009,32 @@ mod tests {
 	fn search_card_is_compact_human_readable_and_complete() {
 		let mut traits = ModelTraits::default();
 		traits.mlx = true;
-		traits.input.extend([Modality::Text, Modality::Image]);
-		traits
-			.tasks
-			.extend([Task::TextGeneration, Task::Chat, Task::ToolUse]);
-		traits.mtp = MtpSupport::Advertised;
+		traits.tasks.extend([
+			Task::TextGeneration,
+			Task::Chat,
+			Task::ToolUse,
+			Task::Reasoning,
+		]);
 
 		let rendered = render_search_card(
 			&SearchCardData {
 				id: "mlx-community/Qwen3.5-4B-4bit",
-				status: SearchInstallStatus::NotDownloaded,
+				status: SearchInstallStatus::Downloaded,
 				quantization: configured_quantization("affine", 4, 64, false),
 				weights_bytes: Some(4_u64 << 30),
-				memory: Some((6_u64 << 30, 16_u64 << 30, 1, 16_384)),
+				memory_bytes: Some(6_u64 << 30),
 				max_context_tokens: Some(32_768),
 				traits: &traits,
 			},
+			SEARCH_CARD_WIDTH,
 			Palette::stdout(crate::style::ColorMode::Never),
 		);
 
 		assert_eq!(
 			rendered,
-			"mlx-community/Qwen3.5-4B-4bit\n  Status  not downloaded\n  Quant   4-bit affine · \
-			 group 64\n  Weights 4.0 GiB\n  Memory  6.0 GiB required\n          at batch 1 · 16.4k \
-			 tokens\n  Budget  16 GiB Metal\n  Context 32.8k max\n  MTP     advertised\n  Tasks   text \
-			 generation · chat · tools\n  Inputs  image"
+			"✓ mlx-community/Qwen3.5-4B-4bit\n  Quant 4-bit · Weights 4.0 GiB · Memory \
+			 6.0 GiB · Context 32.8k\n  Tasks   text generation · chat · tools · reasoning"
 		);
-		assert!(!rendered.contains("Runtime"));
 		assert!(
 			rendered
 				.lines()
@@ -1801,20 +2050,60 @@ mod tests {
 				status: SearchInstallStatus::Downloaded,
 				quantization: HubQuantization::Unknown,
 				weights_bytes: None,
-				memory: None,
+				memory_bytes: None,
 				max_context_tokens: None,
 				traits: &ModelTraits::default(),
 			},
+			SEARCH_CARD_WIDTH,
 			Palette::stdout(crate::style::ColorMode::Never),
 		);
 
 		assert_eq!(
 			rendered,
-			"owner/model\u{240a}forged\u{2409}row\u{fffd}\n  Status  downloaded\n  Quant   \
-			 unknown\n  Weights unknown\n  Memory  requirement unknown\n  Budget  unknown\n  Context unknown \
-			 max\n  Details capabilities unknown"
+			"✓ owner/model\u{240a}forged\u{2409}row\u{fffd}\n  Quant unknown · Weights unknown · Memory \
+			 unknown\n  Context unknown\n  Tasks   unknown"
 		);
-		assert_eq!(rendered.lines().count(), 8);
+		assert_eq!(rendered.lines().count(), 4);
+	}
+
+	#[test]
+	fn search_card_preserves_every_requested_field_when_narrow() {
+		let model = search_model("owner/model", 'a');
+		let rendered = render_search_model_at_width(
+			&model,
+			SearchInstallStatus::NotDownloaded,
+			38,
+			Palette::stdout(crate::style::ColorMode::Never),
+		);
+
+		for field in [
+			"owner/model",
+			"Quant",
+			"Weights",
+			"Memory",
+			"Context",
+			"Tasks",
+		] {
+			assert!(rendered.contains(field), "missing {field}: {rendered}");
+		}
+	}
+
+	#[test]
+	fn search_status_badges_distinguish_downloaded_active_and_paused_models() {
+		let palette = Palette::stdout(crate::style::ColorMode::Never);
+
+		assert_eq!(
+			search_model_name("owner/model", SearchInstallStatus::Downloaded, palette),
+			"✓ owner/model"
+		);
+		assert_eq!(
+			search_model_name("owner/model", SearchInstallStatus::Downloading, palette),
+			"owner/model [downloading]"
+		);
+		assert_eq!(
+			search_model_name("owner/model", SearchInstallStatus::Paused, palette),
+			"owner/model [paused]"
+		);
 	}
 
 	#[test]
@@ -1833,18 +2122,42 @@ mod tests {
 		let id = HubModelId::parse("owner/model").expect("valid Hub ID");
 		let current = ResolvedRevision::parse("a".repeat(40)).expect("valid revision");
 		let different = ResolvedRevision::parse("b".repeat(40)).expect("valid revision");
-		let mut installed = InstalledHubIndex::new();
+		let mut installed = LocalHubIndex::default();
 
 		assert_eq!(
 			search_install_status(&id, &current, &installed),
 			SearchInstallStatus::NotDownloaded
 		);
-		installed.entry(id.clone()).or_default().insert(different);
+		let snapshot = ModelSnapshotId::Hub {
+			id: id.clone(),
+			revision: current.clone(),
+		};
+		installed
+			.transfers
+			.insert(snapshot.clone(), HubTransferState::Downloading);
+		assert_eq!(
+			search_install_status(&id, &current, &installed),
+			SearchInstallStatus::Downloading
+		);
+		installed
+			.transfers
+			.insert(snapshot.clone(), HubTransferState::Paused);
+		assert_eq!(
+			search_install_status(&id, &current, &installed),
+			SearchInstallStatus::Paused
+		);
+		installed.transfers.remove(&snapshot);
+		installed
+			.installed
+			.entry(id.clone())
+			.or_default()
+			.insert(different);
 		assert_eq!(
 			search_install_status(&id, &current, &installed),
 			SearchInstallStatus::DifferentRevision
 		);
 		installed
+			.installed
 			.entry(id.clone())
 			.or_default()
 			.insert(current.clone());
@@ -1855,14 +2168,38 @@ mod tests {
 	}
 
 	#[test]
+	fn search_open_routes_only_the_exact_downloaded_revision_to_chat() {
+		let model = search_model("owner/model", 'a');
+		assert_eq!(
+			search_open_action(&model, SearchInstallStatus::Downloaded),
+			SearchOpenAction::Chat(ModelRef::Hub(model.id.clone()))
+		);
+		for status in [
+			SearchInstallStatus::Downloading,
+			SearchInstallStatus::Paused,
+			SearchInstallStatus::DifferentRevision,
+			SearchInstallStatus::NotDownloaded,
+		] {
+			assert_eq!(
+				search_open_action(&model, status),
+				SearchOpenAction::Download {
+					id: model.id.clone(),
+					revision: model.revision.clone(),
+				}
+			);
+		}
+	}
+
+	#[test]
 	fn inline_search_selector_marks_the_cards_without_a_duplicate_list() {
 		let items = vec![
 			search_model("mlx-community/first-4bit", 'a'),
 			search_model("mlx-community/second-4bit", 'b'),
 			search_model("mlx-community/third-4bit", 'c'),
 		];
-		let mut installed = InstalledHubIndex::new();
+		let mut installed = LocalHubIndex::default();
 		installed
+			.installed
 			.entry(items[0].id.clone())
 			.or_default()
 			.insert(items[0].revision.clone());
@@ -1872,14 +2209,17 @@ mod tests {
 			&installed,
 			1,
 			17,
+			2,
+			true,
+			true,
 			(24, 80),
 			Palette::stdout(crate::style::ColorMode::Never),
 		);
 
 		assert!(frame.contains("❯ mlx-community/second-4bit"));
-		assert!(frame.contains("┃   Status  not downloaded"));
-		assert!(frame.contains("Quant   4-bit affine · group 64"));
-		assert!(frame.contains("↑↓ move  ·  enter download  ·  esc close  ·  2/3"));
+		assert!(frame.contains("┃   Quant 4-bit"));
+		assert!(frame.contains("  ✓ mlx-community/first-4bit"));
+		assert!(frame.contains("< Prev | Page 2 | Next>"));
 		assert!(!frame.contains("Choose a model"));
 		assert_eq!(frame.matches('❯').count(), 1);
 		assert!(frame.lines().count() <= 24);
@@ -1899,16 +2239,21 @@ mod tests {
 
 		let frame = render_search_selector_frame(
 			&items,
-			&InstalledHubIndex::new(),
+			&LocalHubIndex::default(),
 			0,
 			200,
+			1,
+			false,
+			true,
 			(8, 40),
 			Palette::stdout(crate::style::ColorMode::Never),
 		);
 
 		assert!(frame.contains('❯'));
-		assert!(frame.contains("4-bit"));
-		assert!(frame.contains("1/2"));
+		for field in ["Quant", "Weights", "Memory", "Context", "Tasks"] {
+			assert!(frame.contains(field), "missing {field}: {frame}");
+		}
+		assert!(frame.contains("< Prev | Page 1 | Next>"));
 		assert!(frame.lines().count() <= 8);
 		assert!(
 			frame
@@ -1925,18 +2270,30 @@ mod tests {
 		for terminal_rows in 1..=5 {
 			let frame = render_search_selector_frame(
 				&items,
-				&InstalledHubIndex::new(),
+				&LocalHubIndex::default(),
 				0,
 				1,
+				1,
+				false,
+				false,
 				(terminal_rows, 80),
 				palette,
 			);
 			assert!(frame.lines().count() < usize::from(terminal_rows));
 		}
-		let tiny =
-			render_search_selector_frame(&items, &InstalledHubIndex::new(), 0, 1, (3, 80), palette);
-		assert!(tiny.contains("4-bit"));
-		assert!(tiny.contains("not downloaded"));
+		let tiny = render_search_selector_frame(
+			&items,
+			&LocalHubIndex::default(),
+			0,
+			1,
+			1,
+			false,
+			false,
+			(3, 80),
+			palette,
+		);
+		assert!(tiny.contains("mlx-community/tiny-4bit"));
+		assert!(tiny.contains("< Prev | Page 1 | Next>"));
 	}
 
 	#[test]
@@ -1944,35 +2301,43 @@ mod tests {
 		use dialoguer::console::Key;
 
 		assert_eq!(
-			search_selector_action(&Key::ArrowDown, 2, 3),
+			search_selector_action(&Key::ArrowDown, 2, 3, false, false),
 			SearchSelectorAction::Move(0)
 		);
 		assert_eq!(
-			search_selector_action(&Key::ArrowUp, 0, 3),
+			search_selector_action(&Key::ArrowUp, 0, 3, false, false),
 			SearchSelectorAction::Move(2)
 		);
 		assert_eq!(
-			search_selector_action(&Key::PageDown, 1, 10),
+			search_selector_action(&Key::PageDown, 1, 10, false, false),
 			SearchSelectorAction::Move(6)
 		);
 		assert_eq!(
-			search_selector_action(&Key::Home, 8, 10),
+			search_selector_action(&Key::Home, 8, 10, false, false),
 			SearchSelectorAction::Move(0)
 		);
 		assert_eq!(
-			search_selector_action(&Key::End, 1, 10),
+			search_selector_action(&Key::End, 1, 10, false, false),
 			SearchSelectorAction::Move(9)
 		);
 		assert_eq!(
-			search_selector_action(&Key::Enter, 1, 3),
+			search_selector_action(&Key::Enter, 1, 3, false, false),
 			SearchSelectorAction::Select
 		);
 		assert_eq!(
-			search_selector_action(&Key::Escape, 1, 3),
+			search_selector_action(&Key::ArrowLeft, 1, 3, true, true),
+			SearchSelectorAction::PreviousPage
+		);
+		assert_eq!(
+			search_selector_action(&Key::ArrowRight, 1, 3, true, true),
+			SearchSelectorAction::NextPage
+		);
+		assert_eq!(
+			search_selector_action(&Key::Escape, 1, 3, false, false),
 			SearchSelectorAction::Cancel
 		);
 		assert_eq!(
-			search_selector_action(&Key::CtrlC, 1, 3),
+			search_selector_action(&Key::CtrlC, 1, 3, false, false),
 			SearchSelectorAction::Interrupt
 		);
 	}
@@ -2021,7 +2386,7 @@ mod tests {
 		);
 		assert_eq!(
 			empty_search_message(true),
-			"No compatible MLX models on this ranked page; use the next cursor to continue."
+			"No compatible MLX models on this page."
 		);
 		assert_eq!(
 			search_summary_line(0, 200),
@@ -2035,9 +2400,33 @@ mod tests {
 			hidden_diagnostics_line(1),
 			"1 search diagnostic hidden; rerun with --verbose or --json"
 		);
+	}
+
+	#[test]
+	fn pagination_uses_page_numbers_without_exposing_cursors() {
 		assert_eq!(
-			next_cursor_line("page\nforged\tvalue\u{202e}"),
-			"next cursor:\n  page\u{240a}forged\u{2409}value\u{fffd}"
+			pagination_line(
+				2,
+				true,
+				true,
+				Palette::stdout(crate::style::ColorMode::Never)
+			),
+			"< Prev | Page 2 | Next>"
+		);
+		let page = serde_json::from_value::<HubSearchPage>(serde_json::json!({
+			"items": [],
+			"next_cursor": "opaque",
+			"scanned": 0,
+			"diagnostics": [],
+		}))
+		.expect("search page");
+		assert_eq!(
+			unused_next_cursor(&page, &BTreeSet::new()).as_deref(),
+			Some("opaque")
+		);
+		assert_eq!(
+			unused_next_cursor(&page, &BTreeSet::from(["opaque".to_string()])),
+			None
 		);
 	}
 
@@ -2171,9 +2560,9 @@ mod tests {
 		);
 		assert!(retry.contains("Retrying"));
 		assert!(retry.contains("attempt 2"));
-		assert!(!retry.contains('\n'));
 		assert!(!retry.contains('\t'));
 		assert!(!retry.contains('\u{202e}'));
+		assert_eq!(retry.lines().count(), 3);
 
 		state.observe(
 			&DownloadEvent::TransferCompleted {
@@ -2190,6 +2579,88 @@ mod tests {
 			Palette::stderr(crate::style::ColorMode::Never),
 		);
 		assert_eq!(finalizing, "⠙ Finalizing owner/model");
+	}
+
+	#[test]
+	fn download_progress_renders_every_active_file_and_independent_retry() {
+		let id = HubModelId::parse("owner/model").expect("valid Hub ID");
+		let mut state = DownloadUiState::new(&id);
+		let now = Instant::now();
+		state.observe(
+			&DownloadEvent::TransferStarted {
+				files: 3,
+				total: 300,
+			},
+			now,
+		);
+		for (path, received) in [
+			("first.safetensors", 80),
+			("second.safetensors", 50),
+			("third.safetensors", 20),
+		] {
+			state.observe(
+				&DownloadEvent::FileStarted {
+					path: path.to_string(),
+					resumed: 0,
+					total: 100,
+				},
+				now,
+			);
+			state.observe(
+				&DownloadEvent::Progress {
+					path: path.to_string(),
+					received,
+					total: 100,
+				},
+				now + Duration::from_secs(1),
+			);
+		}
+		state.observe(
+			&DownloadEvent::Retrying {
+				path: "second.safetensors".to_string(),
+				attempt: 1,
+				reason: "connection reset".to_string(),
+			},
+			now + Duration::from_secs(1),
+		);
+
+		let frame = render_download_frame(
+			&state,
+			2,
+			now + Duration::from_secs(1),
+			110,
+			Palette::stderr(crate::style::ColorMode::Never),
+		);
+		assert!(frame.contains(" 50%"));
+		for path in [
+			"first.safetensors",
+			"second.safetensors",
+			"third.safetensors",
+		] {
+			assert!(
+				frame.contains(path),
+				"missing active row for {path}: {frame}"
+			);
+		}
+		assert!(frame.contains("Retrying second.safetensors · attempt 1"));
+
+		state.observe(
+			&DownloadEvent::FileVerified {
+				path: "first.safetensors".to_string(),
+				sha256: "a".repeat(64),
+			},
+			now + Duration::from_secs(2),
+		);
+		let frame = render_download_frame(
+			&state,
+			3,
+			now + Duration::from_secs(2),
+			110,
+			Palette::stderr(crate::style::ColorMode::Never),
+		);
+		assert!(!frame.lines().any(|line| line.contains("first.safetensors")));
+		assert!(frame.contains("second.safetensors"));
+		assert!(frame.contains("third.safetensors"));
 	}
 
 	#[test]

@@ -18,10 +18,14 @@ cd your-project
 emelex chat
 ```
 
-On a terminal, Hub search shows downloaded state and quantization for each
-result. Use arrow keys and Enter to download one; Escape or `q` keeps the
-results without downloading. `emelex hub download [NAMESPACE/]REPO` remains
-available for direct, non-interactive installs.
+On a terminal, Hub search shows compact model, quantization, weight, memory,
+context, and task details. Exact downloaded revisions carry a checkmark;
+active and paused transfers carry their status. Up and down move between
+models, left and right move between numbered pages, and Enter opens a
+downloaded model in chat. Enter on any other result downloads its exact
+revision, shows concurrent per-file and overall progress, then offers to start
+chat. Escape or `q` closes the browser. `emelex hub download
+[NAMESPACE/]REPO` remains available for direct installs.
 
 Without `--model` or a configured default, `emelex chat` automatically uses
 the sole installed model. With multiple installed models it opens an arrow-key

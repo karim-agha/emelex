@@ -24,6 +24,18 @@ fn manager(config: Config) -> (tempfile::TempDir, ModelManager) {
 	(directory, manager)
 }
 
+fn hub_transfer_identity() -> (HubModelId, ResolvedRevision) {
+	(
+		HubModelId::parse("owner/resumable").expect("valid Hub ID"),
+		ResolvedRevision::parse("c".repeat(40)).expect("valid revision"),
+	)
+}
+
+fn write_owner_file(path: &Path, bytes: &[u8]) {
+	fs::write(path, bytes).expect("write owner file");
+	set_mode(path, 0o600).expect("owner-only file");
+}
+
 fn runtime_files(root: &Path) -> Vec<ModelFile> {
 	let contents = [
 		("config.json", br"{}".as_slice()),
@@ -595,6 +607,344 @@ fn hub_snapshot_inventory_observes_preexisting_cancellation() {
 		.expect_err("cancelled inventory must stop");
 
 	assert!(matches!(error, ModelsError::Hub(HubError::Cancelled)));
+}
+
+#[tokio::test]
+async fn hub_transfer_status_prefers_downloading_then_reports_paused() {
+	let (_directory, manager) = manager(Config::default());
+	let (id, revision) = hub_transfer_identity();
+	let mut transfer = manager
+		.acquire_hub_transfer_workspace(&id, &revision, None)
+		.await
+		.expect("transfer lock");
+	manager
+		.prepare_hub_transfer(&mut transfer)
+		.expect("transfer payload");
+	let partial = transfer.staging_path().join("model.safetensors.part");
+	write_owner_file(&partial, b"partial");
+
+	let statuses = manager
+		.hub_transfer_statuses()
+		.await
+		.expect("active transfer status");
+	assert_eq!(
+		statuses,
+		vec![HubTransferStatus {
+			snapshot_id: ModelSnapshotId::Hub {
+				id: id.clone(),
+				revision: revision.clone(),
+			},
+			state: HubTransferState::Downloading,
+		}]
+	);
+
+	drop(transfer);
+
+	let statuses = manager
+		.hub_transfer_statuses()
+		.await
+		.expect("paused transfer status");
+	assert_eq!(statuses[0].state(), HubTransferState::Paused);
+	assert_eq!(
+		statuses[0].snapshot_id(),
+		&ModelSnapshotId::Hub { id, revision }
+	);
+	assert_eq!(fs::read(&partial).expect("retained partial"), b"partial");
+
+	let manifest = partial
+		.parent()
+		.expect("payload directory")
+		.join(MANIFEST_NAME);
+	let stamp = partial
+		.parent()
+		.expect("payload directory")
+		.join(VERIFIED_STAMP_NAME);
+	write_owner_file(&manifest, b"prepared manifest");
+	write_owner_file(&stamp, b"prepared stamp");
+	set_mode(&stamp, 0o400).expect("read-only prepared stamp");
+	assert_eq!(
+		manager
+			.hub_transfer_statuses()
+			.await
+			.expect("prepared transfer scan")
+			.len(),
+		1,
+		"safe pre-publication metadata must remain resumable"
+	);
+
+	set_mode(&partial, 0o644).expect("unsafe partial mode");
+	assert!(
+		manager
+			.hub_transfer_statuses()
+			.await
+			.expect("unsafe transfer scan")
+			.is_empty(),
+		"unsafe payload must not be advertised as resumable"
+	);
+}
+
+#[tokio::test]
+async fn same_revision_transfer_waits_then_resumes_one_workspace() {
+	let (_directory, manager) = manager(Config::default());
+	let (id, revision) = hub_transfer_identity();
+	let mut first = manager
+		.acquire_hub_transfer_workspace(&id, &revision, None)
+		.await
+		.expect("first transfer lock");
+	manager
+		.prepare_hub_transfer(&mut first)
+		.expect("first transfer payload");
+	let partial = first.staging_path().join("model.safetensors.part");
+	write_owner_file(&partial, b"retained-prefix");
+	let second_manager = manager.clone();
+	let second_id = id.clone();
+	let second_revision = revision.clone();
+	let waiter = tokio::spawn(async move {
+		second_manager
+			.acquire_hub_transfer_workspace(&second_id, &second_revision, None)
+			.await
+	});
+	tokio::time::sleep(Duration::from_millis(75)).await;
+	assert!(!waiter.is_finished(), "duplicate transfer bypassed lock");
+
+	drop(first);
+
+	let mut second = tokio::time::timeout(Duration::from_secs(2), waiter)
+		.await
+		.expect("second transfer acquires released lock")
+		.expect("transfer task")
+		.expect("second transfer lock");
+	assert_eq!(second.path, manager.hub_transfer_directory(&id, &revision));
+	manager
+		.prepare_hub_transfer(&mut second)
+		.expect("resume retained payload");
+	assert_eq!(
+		fs::read(second.staging_path().join("model.safetensors.part")).expect("resumed partial"),
+		b"retained-prefix"
+	);
+}
+
+#[tokio::test]
+async fn waiting_for_same_revision_lock_observes_cancellation() {
+	let (_directory, manager) = manager(Config::default());
+	let (id, revision) = hub_transfer_identity();
+	let first = manager
+		.acquire_hub_transfer_workspace(&id, &revision, None)
+		.await
+		.expect("first transfer lock");
+	let cancellation = DownloadCancellation::default();
+	let waiting_manager = manager.clone();
+	let waiting_id = id.clone();
+	let waiting_revision = revision.clone();
+	let waiting_cancellation = cancellation.clone();
+	let waiter = tokio::spawn(async move {
+		waiting_manager
+			.acquire_hub_transfer_workspace(
+				&waiting_id,
+				&waiting_revision,
+				Some(&waiting_cancellation),
+			)
+			.await
+	});
+	tokio::time::sleep(Duration::from_millis(75)).await;
+	cancellation.cancel();
+
+	let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+		.await
+		.expect("cancelled waiter stops")
+		.expect("waiter task");
+	let Err(error) = result else {
+		panic!("cancelled lock wait must fail");
+	};
+	assert!(matches!(error, ModelsError::Hub(HubError::Cancelled)));
+	drop(first);
+}
+
+#[tokio::test]
+async fn successful_hub_transfer_cleanup_removes_status_but_keeps_lock_inode() {
+	let (_directory, manager) = manager(Config::default());
+	let (id, revision) = hub_transfer_identity();
+	let mut transfer = manager
+		.acquire_hub_transfer_workspace(&id, &revision, None)
+		.await
+		.expect("transfer lock");
+	manager
+		.prepare_hub_transfer(&mut transfer)
+		.expect("transfer payload");
+	write_owner_file(
+		&transfer.staging_path().join("model.safetensors.part"),
+		b"partial",
+	);
+
+	manager
+		.finish_hub_transfer(&mut transfer, "completed-transfer")
+		.expect("successful transfer cleanup");
+
+	assert!(!transfer.staging_path().exists());
+	assert!(
+		transfer.path.join(HUB_TRANSFER_LOCK_NAME).is_file(),
+		"stable coordination inode must remain"
+	);
+	assert!(!transfer.path.join(HUB_TRANSFER_RECORD_NAME).exists());
+	assert!(
+		manager
+			.hub_transfer_statuses()
+			.await
+			.expect("transfer statuses")
+			.is_empty()
+	);
+}
+
+#[tokio::test]
+async fn terminal_hub_failure_discards_payload_but_cancellation_retains_it() {
+	let (_directory, manager) = manager(Config::default());
+	let (id, revision) = hub_transfer_identity();
+	let mut transfer = manager
+		.acquire_hub_transfer_workspace(&id, &revision, None)
+		.await
+		.expect("transfer lock");
+	manager
+		.prepare_hub_transfer(&mut transfer)
+		.expect("transfer payload");
+	write_owner_file(
+		&transfer.staging_path().join("model.safetensors.part"),
+		b"partial",
+	);
+
+	manager
+		.handle_hub_transfer_failure(&mut transfer, &ModelsError::Hub(HubError::Cancelled))
+		.expect("retain cancellation state");
+	assert!(transfer.staging_path().is_dir());
+	assert!(transfer.path.join(HUB_TRANSFER_RECORD_NAME).is_file());
+
+	manager
+		.handle_hub_transfer_failure(
+			&mut transfer,
+			&ModelsError::Hub(HubError::Hash {
+				path: "model.safetensors".to_string(),
+				expected: "a".repeat(64),
+				actual: "b".repeat(64),
+			}),
+		)
+		.expect("discard poisoned state");
+	assert!(!transfer.staging_path().exists());
+	assert!(!transfer.path.join(HUB_TRANSFER_RECORD_NAME).exists());
+	assert!(
+		manager
+			.hub_transfer_statuses()
+			.await
+			.expect("transfer statuses")
+			.is_empty()
+	);
+}
+
+#[test]
+fn hub_transfer_preflight_counts_only_missing_owned_bytes() {
+	let staging = tempfile::tempdir().expect("staging directory");
+	write_owner_file(&staging.path().join("complete.bin"), b"complete");
+	write_owner_file(&staging.path().join("partial.bin.part"), b"four");
+	write_owner_file(
+		&staging.path().join("oversized.bin.part"),
+		b"larger-than-plan",
+	);
+	let remaining = remaining_hub_transfer_file_bytes(
+		[
+			("complete.bin", 8),
+			("partial.bin", 10),
+			("absent.bin", 7),
+			("oversized.bin", 5),
+		],
+		staging.path(),
+	)
+	.expect("remaining transfer bytes");
+	assert_eq!(remaining, 13);
+
+	let unsafe_path = staging.path().join("unsafe.bin");
+	write_owner_file(&unsafe_path, b"x");
+	set_mode(&unsafe_path, 0o644).expect("unsafe fixture mode");
+	let error = remaining_hub_transfer_file_bytes([("unsafe.bin", 1)], staging.path())
+		.expect_err("unsafe staged file must fail closed");
+	assert!(matches!(error, ModelsError::UnsafeInstall(path) if path == unsafe_path));
+}
+
+#[test]
+fn moved_hub_staging_is_quarantined_synchronously() {
+	let (_directory, manager) = manager(Config::default());
+	let (id, revision) = hub_transfer_identity();
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.expect("test runtime");
+	let mut transfer = runtime
+		.block_on(manager.acquire_hub_transfer_workspace(&id, &revision, None))
+		.expect("transfer lock");
+	manager
+		.prepare_hub_transfer(&mut transfer)
+		.expect("transfer payload");
+	write_owner_file(
+		&transfer.staging_path().join("model.safetensors"),
+		b"complete",
+	);
+	let mut staging = transfer.take_staging().expect("transfer staging");
+	let destination = manager.home.models_dir().join("post-rename-failure");
+	fs::rename(staging.path(), &destination).expect("simulate atomic publication");
+	staging.moved_to(&destination);
+	staging
+		.quarantine_now("failed", Some(ModelSnapshotId::Hub { id, revision }))
+		.expect("synchronous post-rename quarantine");
+
+	drop(staging);
+	drop(transfer);
+
+	assert!(
+		!destination.exists(),
+		"post-rename failure left destination visible"
+	);
+}
+
+#[test]
+fn post_rename_publication_failure_is_quarantined_before_return() {
+	let (_directory, manager) = manager(Config::default());
+	let staging = manager
+		.create_staging("post-rename-failure")
+		.expect("staging");
+	let files = runtime_files(staging.path());
+	let expected_name = LocalModelName::parse("expected").expect("expected name");
+	let expected = ModelManifest::new(
+		ModelRef::Local(expected_name.clone()),
+		ModelSource::LocalImport {
+			original_path: PathBuf::from("/tmp/expected"),
+		},
+		None,
+		files.clone(),
+		verified_local_traits(&files),
+		VerificationStatus::Verified,
+		None,
+	)
+	.expect("expected manifest");
+	let forged = ModelManifest::new(
+		ModelRef::Local(LocalModelName::parse("forged").expect("forged name")),
+		ModelSource::LocalImport {
+			original_path: PathBuf::from("/tmp/forged"),
+		},
+		None,
+		files.clone(),
+		verified_local_traits(&files),
+		VerificationStatus::Verified,
+		None,
+	)
+	.expect("forged manifest");
+	write_manifest(staging.path(), &forged).expect("forged staging manifest");
+	let destination = manager.local_destination(&expected_name, &snapshot_digest(&files));
+
+	manager
+		.publish(staging, &destination, &expected, None)
+		.expect_err("mismatched published manifest must fail");
+
+	assert!(
+		!destination.exists(),
+		"failed publication remained visible after mutation lock release"
+	);
 }
 
 #[test]

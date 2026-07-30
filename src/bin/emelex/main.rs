@@ -34,7 +34,7 @@ pub(crate) mod terminal_ui;
 pub(crate) mod web_search;
 
 use anyhow::Context as _;
-use args::{Cli, Command, HubCommand};
+use args::{ChatArgs, Cli, Command, HubCommand};
 use clap::Parser as _;
 use emelex::{Emelex, home::EmelexHome, hub::HubCredentials};
 
@@ -105,7 +105,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 			generate_cmd::run(&emelex, args, cli.json, stdout_palette, stderr_palette).await
 		}
 		Command::Hub { command } => {
-			hub_cmd::run(&emelex, command, cli.json, stdout_palette, stderr_palette).await
+			match hub_cmd::run(&emelex, command, cli.json, stdout_palette, stderr_palette).await? {
+				hub_cmd::HubRunOutcome::Done => Ok(()),
+				hub_cmd::HubRunOutcome::StartChat(model) => {
+					chat_cmd::run(
+						&emelex,
+						ChatArgs::for_model(model),
+						cli.json,
+						stdout_palette,
+						stderr_palette,
+					)
+					.await
+				}
+			}
 		}
 		Command::Model { command } => {
 			models_cmd::run_model(&emelex, command, cli.json, stdout_palette, stderr_palette)

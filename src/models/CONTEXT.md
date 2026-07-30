@@ -18,15 +18,35 @@
 - Controlled Hub installs checkpoint cancellation around local verification,
   inspection, load probing, manifest creation, and publication. Staged hashes
   use cancellable async chunks; the final checkpoint precedes the atomic rename.
+- One arity-safe transfer workspace exists per exact Hub revision under Emelex
+  Home. Its stable lock inode is never removed. Callers acquire that lock with
+  cooperative cancellation, recheck the installed snapshot while holding it,
+  and only then transfer or resume, so same-revision downloads cannot run
+  concurrently.
+- A transfer record binds its owner-only payload to the exact model ID and
+  revision. Valid complete files and `.part` prefixes survive cancellation,
+  observer failure, transient transport failure, and retriable I/O. Resume
+  preflight charges only missing bytes. Terminal protocol, integrity, and
+  certification failures quarantine the payload and remove the record.
+- `hub_transfer_statuses` treats the lock as authoritative: a valid workspace
+  whose lock is held is `Downloading`; the same workspace unlocked is
+  `Paused`. Invalid records, unsafe payloads, and successful lock-only
+  coordination directories are omitted.
+- Successful publication removes the transfer record and redundant payload but
+  preserves the lock inode. Before the atomic rename, Hub staging remains
+  resumable. A later publication failure quarantines the moved destination
+  synchronously while the snapshot-mutation lock is still held; guard Drop
+  never schedules a delayed move of a published destination.
 - Both download APIs own cancel-on-future-drop authority, including the plain
   reporter API. Dropped joins may leave blocking workers running briefly, but
   they observe the owned cancellation at the final pre-rename checkpoint.
   Controlled operations link to, but never mutate, caller cancellation.
   Cancellation is cooperative: once that checkpoint wins, rename may commit.
-- `StagingGuard::Drop` only dispatches best-effort quarantine work to one named
-  background worker. Its nonblocking queue contains only tiny tasks for
+- `StagingGuard::Drop` retains pre-rename Hub transfer payloads. For ordinary
+  pre-publication staging it only dispatches best-effort quarantine work to one
+  named background worker. Its nonblocking queue contains only tiny tasks for
   already-existing staging directories; no overflow threads or quarantine I/O
-  run from an async runtime worker.
+  run from an async runtime worker. Published destinations are never queued.
 - Controlled verification dispatches inventory walks, stamp reads, and secure
   contained opens to blocking workers, with cancellation checks around every
   join. Descriptor hashing uses cancellable async chunks.
@@ -37,8 +57,8 @@
   immutable manifest or loading MLX. Selection may combine positive current
   static evidence with recorded runtime-only evidence, but current inspection
   cannot erase the latter.
-- Interactive Hub status uses a cancellation-safe Hub-only snapshot scan. It
-  does not inspect or hash caller-owned linked imports.
+- Interactive Hub status uses cancellation-safe Hub-only snapshot and transfer
+  scans. It does not inspect or hash caller-owned linked imports.
 - Owned snapshot paths and all link records stay under the selected Emelex
   Home. A link record may name one canonical caller-owned external target.
 - Hub snapshot paths carry an explicit `unnamespaced` or `namespaced`
@@ -58,7 +78,8 @@
 - A healthy local name/digest collision across ownership modes or canonical
   link targets is a typed conflict. Import preserves the existing record;
   authority changes require exact removal followed by re-import.
-- Failed staging and removals move to Emelex quarantine.
+- Terminal failed staging and removals move to Emelex quarantine. Resumable Hub
+  transfer failures remain in their exact-revision workspace.
 - Owned snapshots remain self-contained for offline load. A linked model uses
   no network but depends on its external target remaining locally available.
 - A descriptor-bound verification stamp permits a persistent hash fast path

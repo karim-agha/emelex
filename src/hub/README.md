@@ -85,17 +85,29 @@ are ignored.
 
 Downloads pin a full commit SHA, reject alternate indexes, adapters, extra
 weights, and ambiguous variants, then select an explicit root-level runtime
-set. Transfers resume into owner-only staging files, enforce sizes and LFS
-digests, compute SHA-256 for every file, and leave publication to the model
-manager. The controlled API supports fallible observers and cooperative
-cancellation through transfer, hashing, and retry waits. Hashing uses async
-chunk reads owned by the calling future, so dropping a download cannot leave a
-detached multi-gigabyte hash worker running. Header, error-body, and successful
-body stalls share one deterministic per-file idle classification even when
-reqwest's inner read timer wins the race with Emelex's cancellation-aware
-timer; resumable partial bytes remain staged.
+set. Up to four planned files transfer concurrently. The bounded scheduler
+retains plan order in its returned manifest records, stops admitting files
+after the first failure, cooperatively cancels and drains active siblings, and
+never leaves detached sibling futures. Transfers resume into owner-only
+staging files, enforce sizes and LFS digests, compute SHA-256 for every file,
+and leave publication to the model manager. The controlled API supports
+fallible observers and cooperative cancellation through transfer, hashing,
+and retry waits. Hashing uses async chunk reads owned by the calling future,
+so dropping a download cannot leave a detached multi-gigabyte hash worker
+running. Header, error-body, and successful body stalls share one deterministic
+per-file idle classification even when reqwest's inner read timer wins the race
+with Emelex's cancellation-aware timer; resumable partial bytes remain staged.
+Staging may be empty or contain a subset of the plan's exact local completed
+names or `.part` names. Every staged entry must remain an owner-owned `0600`
+regular file with one link and no extended ACL; symlinks, unexpected names,
+and simultaneous completed/partial state for one file are rejected. Completed
+files are securely reopened, size-checked, hashed, checked against any expected
+LFS SHA-256, and reused without another request or rename.
 Observer lifecycles bracket the file events with exact planned file and byte
 totals after staging validation and after every file is verified and staged.
-Those totals include resumable prefixes, allowing callers to present truthful
-aggregate completion without mistaking transfer completion for final model
-certification or publication.
+Per-file lifecycles remain ordered, while events for different active files may
+interleave. Observer callbacks remain serialized on the calling future. Those
+totals include resumable prefixes. A reused completed file emits
+`FileStarted` with `resumed == total`, then `FileVerified`, allowing callers to
+present truthful aggregate completion without mistaking transfer completion
+for final model certification or publication.

@@ -71,7 +71,7 @@ pub(crate) enum Command {
 }
 
 /// Interactive chat options.
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, PartialEq, Args)]
 #[allow(
 	clippy::struct_excessive_bools,
 	reason = "these booleans are independent command-line switches"
@@ -115,6 +115,25 @@ pub(crate) struct ChatArgs {
 	pub(crate) approve_all: bool,
 	/// Optional first turn; non-interactive mode reads UTF-8 stdin when absent.
 	pub(crate) prompt: Option<String>,
+}
+
+impl ChatArgs {
+	/// Build arguments equivalent to `emelex chat --model=<model>`.
+	pub(crate) const fn for_model(model: ModelRef) -> Self {
+		Self {
+			model: Some(model),
+			resume: None,
+			system: None,
+			max_tokens: None,
+			temperature: None,
+			thinking: None,
+			no_tools: false,
+			no_web: false,
+			with_web_search: false,
+			approve_all: false,
+			prompt: None,
+		}
+	}
 }
 
 /// Top-level resume alias.
@@ -207,7 +226,7 @@ pub(crate) enum HubCommand {
 		/// Run `hub capabilities` for choices.
 		#[arg(long = "require")]
 		require: Vec<TraitFilter>,
-		/// Opaque next-page cursor.
+		/// Opaque page cursor for non-interactive automation.
 		#[arg(long)]
 		cursor: Option<String>,
 		/// Print grouped candidate diagnostics instead of only their count.
@@ -453,6 +472,18 @@ mod tests {
 	use clap::Parser as _;
 
 	use super::*;
+
+	#[test]
+	fn model_chat_constructor_matches_parser_defaults() {
+		let parsed = Cli::try_parse_from(["emelex", "chat", "--model=owner/model"])
+			.expect("model chat command");
+		let Command::Chat(parsed) = parsed.command else {
+			panic!("expected chat command");
+		};
+		let model = ModelRef::parse("owner/model").expect("valid model reference");
+
+		assert_eq!(parsed, ChatArgs::for_model(model));
+	}
 
 	#[test]
 	fn resume_alias_and_optional_chat_target_parse() {

@@ -70,28 +70,33 @@
   model-manager client's local Metal/storage fit. Zero-installed chat
   onboarding preserves the same tool-use requirement through its invocation
   filters. Library `HubSearch` remains generic and adds no CLI requirements.
-  Human results render as labeled vertical cards: local status comes from one
-  verified inventory pass and distinguishes the exact revision, a different
-  installed revision, and no installed revision. Quantization comes only from
-  validated exact-revision config. The memory row names its evaluated workload
-  separately from the model's maximum context, capability groups wrap with
-  hanging indentation, and the MLX-only search does not repeat a runtime row.
+  Human results render compact model-name, quantization, weights, memory,
+  context, and task rows. Local status combines one verified installed
+  inventory pass with exact-revision durable transfer records: installed
+  revisions carry a checkmark, a held transfer lock is downloading, and a
+  valid unlocked resumable workspace is paused. Quantization and sizing come
+  only from validated exact-revision evidence.
   A human stdin/stdout/stderr terminal turns those same results into one
   stdout-owned inline viewport; it must never append a second selector list.
   The selected card carries a visible rail, frames fit the current terminal
-  height, reserve one cursor row, and stay below its wrap column. Enter
-  revalidates and downloads that displayed revision; Escape or `q` exits
-  successfully; raw Ctrl-C becomes the explicit interrupt action. Buffered
-  redraws recompute prior-frame height at the current terminal width, preserve
-  scrollback, and restore cursor visibility on every exit path.
+  height, reserve one cursor row, and stay below its wrap column. Up/down moves
+  within a page. Left/right traverses cached opaque-cursor pages, but human
+  output exposes only `< Prev | Page N | Next>`. Enter on an exact installed
+  revision dispatches through normal `chat --model` semantics. Otherwise it
+  revalidates and downloads the displayed revision, reports readiness, and
+  offers chat. Escape or `q` exits successfully; raw Ctrl-C becomes the
+  explicit interrupt action. Buffered redraws recompute prior-frame height at
+  the current terminal width, preserve scrollback, and restore cursor
+  visibility on every exit path.
   Redirected or JSON searches never read selection input. Default diagnostics
   show only a count, verbose diagnostics group by sanitized candidate ID, and
   JSON stays complete.
 - Human TTY downloads start in a truthful preparing phase, consume exact
   transfer lifecycle totals, coalesce state into an independently animated live
-  region, and remain in finalizing after transfer until certification and
-  publication return. Resumed prefixes contribute to completion but not
-  throughput. Redirected output is deterministic and excludes chunk-level
+  region, show overall progress plus every active file, and remain in
+  finalizing after transfer until certification and publication return. At
+  most four files are active. Resumed prefixes contribute to completion but
+  not throughput. Redirected output is deterministic and excludes chunk-level
   progress; existing JSON event records remain byte-compatible.
 - Preferred local import uses singular `model import PATH`, with an optional
   `--name`; other lifecycle commands remain plural `models`. Import defaults to

@@ -18,7 +18,7 @@ use std::{
 };
 
 use base64::Engine as _;
-use futures::{StreamExt as _, future::join_all};
+use futures::{StreamExt as _, future::join_all, stream::FuturesUnordered};
 use reqwest::{StatusCode, Url, header};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
@@ -43,6 +43,7 @@ const MAX_SEARCH_CURSOR_BYTES: usize = 2 << 10;
 const MAX_UPSTREAM_CURSOR_BYTES: usize = 1 << 10;
 const HUB_MLX_FILTER: &str = "mlx";
 const SEARCH_CURSOR_VERSION: u8 = 3;
+const DOWNLOAD_FILE_CONCURRENCY: usize = 4;
 
 /// One catalog query.
 #[derive(Debug, Clone, Default)]
@@ -775,9 +776,9 @@ pub struct HubClient {
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct TestPublishGate {
-	entered: AtomicBool,
+	entered: std::sync::atomic::AtomicUsize,
 	release: AtomicBool,
-	completed: AtomicBool,
+	completed: std::sync::atomic::AtomicUsize,
 }
 
 impl HubClient {
@@ -1416,7 +1417,9 @@ impl HubClient {
 		read_body(response, limit, path).await.map(Some)
 	}
 
-	/// Download a complete plan into an empty Emelex-owned staging directory.
+	/// Download a complete plan into an Emelex-owned staging directory.
+	///
+	/// Safe completed files and partial prefixes from the same plan are reused.
 	///
 	/// Returns validated manifest file records in plan order.
 	///
@@ -1499,9 +1502,18 @@ impl HubClient {
 		validate_download_plan(plan)?;
 		check_cancelled(callbacks.cancellation)?;
 		let staging_path = staging.to_path_buf();
-		tokio::task::spawn_blocking(move || validate_download_staging(&staging_path))
-			.await
-			.map_err(blocking_hub_task_error)??;
+		let staging_plan = plan.clone();
+		tokio::task::spawn_blocking(move || {
+			validate_download_staging(&staging_path, &staging_plan)
+		})
+		.await
+		.map_err(blocking_hub_task_error)??;
+		let mut operation = DownloadOperationGuard::new(callbacks.cancellation);
+		let operation_cancellation = operation.cancellation().clone();
+		let callbacks = DownloadCallbacks {
+			cancellation: Some(&operation_cancellation),
+			..callbacks
+		};
 		emit(
 			callbacks,
 			&DownloadEvent::TransferStarted {
@@ -1509,11 +1521,48 @@ impl HubClient {
 				total: plan.total_bytes(),
 			},
 		)?;
-		let mut installed = Vec::with_capacity(plan.files().len());
-		for file in plan.files() {
-			check_cancelled(callbacks.cancellation)?;
-			installed.push(self.download_file(plan, file, staging, callbacks).await?);
+		let mut installed = vec![None; plan.files().len()];
+		let mut pending = FuturesUnordered::new();
+		let mut next = 0_usize;
+		let download = |index| async move {
+			(
+				index,
+				self.download_file(plan, &plan.files()[index], staging, callbacks)
+					.await,
+			)
+		};
+		while next < plan.files().len() && pending.len() < DOWNLOAD_FILE_CONCURRENCY {
+			pending.push(download(next));
+			next += 1;
 		}
+		let mut first_error = None;
+		while let Some((index, result)) = pending.next().await {
+			match result {
+				Ok(file) if first_error.is_none() => {
+					installed[index] = Some(file);
+					if next < plan.files().len() {
+						pending.push(download(next));
+						next += 1;
+					}
+				}
+				Ok(_) => {}
+				Err(error) => {
+					if first_error.is_none() {
+						first_error = Some(error);
+						operation.cancellation().cancel();
+					}
+				}
+			}
+		}
+		if let Some(error) = first_error {
+			return Err(error);
+		}
+		let installed = installed
+			.into_iter()
+			.collect::<Option<Vec<_>>>()
+			.ok_or_else(|| {
+				HubError::Protocol("download scheduler omitted a planned file".to_string())
+			})?;
 		emit(
 			callbacks,
 			&DownloadEvent::TransferCompleted {
@@ -1521,6 +1570,7 @@ impl HubClient {
 				total: plan.total_bytes(),
 			},
 		)?;
+		operation.finish();
 		Ok(installed)
 	}
 
@@ -1538,6 +1588,11 @@ impl HubClient {
 		let local_path = local_runtime_path(&remote.path);
 		let destination = staging.join(local_path);
 		let part = staging.join(format!("{local_path}.part"));
+		if let Some(completed) =
+			reuse_completed_file(remote, &destination, local_path, callbacks).await?
+		{
+			return Ok(completed);
+		}
 		let mut part_identity = None;
 		let mut attempt = 0_usize;
 		loop {
@@ -1576,25 +1631,8 @@ impl HubClient {
 			}
 		}
 		let (size, digest, snapshot) =
-			hash_file(part.clone(), callbacks.cancellation.cloned()).await?;
-		if size != remote.size {
-			return Err(HubError::Size {
-				path: remote.path.clone(),
-				expected: remote.size,
-				actual: size,
-			});
-		}
-		if remote
-			.expected_sha256
-			.as_ref()
-			.is_some_and(|expected| expected != &digest)
-		{
-			return Err(HubError::Hash {
-				path: remote.path.clone(),
-				expected: remote.expected_sha256.clone().unwrap_or_default(),
-				actual: digest,
-			});
-		}
+			hash_file(part.clone(), part_identity, callbacks.cancellation.cloned()).await?;
+		validate_staged_file_integrity(remote, size, &digest)?;
 		emit(
 			callbacks,
 			&DownloadEvent::FileVerified {
@@ -1612,7 +1650,7 @@ impl HubClient {
 		tokio::task::spawn_blocking(move || {
 			#[cfg(test)]
 			if let Some(gate) = &publish_gate {
-				gate.entered.store(true, Ordering::Release);
+				gate.entered.fetch_add(1, Ordering::AcqRel);
 				while !gate.release.load(Ordering::Acquire) {
 					std::thread::sleep(Duration::from_millis(1));
 				}
@@ -1626,7 +1664,7 @@ impl HubClient {
 			})();
 			#[cfg(test)]
 			if let Some(gate) = publish_gate {
-				gate.completed.store(true, Ordering::Release);
+				gate.completed.fetch_add(1, Ordering::AcqRel);
 			}
 			result
 		})
@@ -3049,6 +3087,81 @@ pub(crate) fn required_download_storage_bytes(transfer_bytes: u64) -> Option<u64
 	transfer_bytes.checked_add(margin)
 }
 
+async fn reuse_completed_file(
+	remote: &RemoteFile,
+	destination: &Path,
+	local_path: &str,
+	callbacks: DownloadCallbacks<'_>,
+) -> Result<Option<ModelFile>, HubError> {
+	check_cancelled(callbacks.cancellation)?;
+	let inspect_path = destination.to_path_buf();
+	let (size, identity) =
+		tokio::task::spawn_blocking(move || inspect_partial(&inspect_path, None))
+			.await
+			.map_err(blocking_hub_task_error)??;
+	let Some(identity) = identity else {
+		return Ok(None);
+	};
+	if size != remote.size {
+		return Err(HubError::Size {
+			path: remote.path.clone(),
+			expected: remote.size,
+			actual: size,
+		});
+	}
+	emit(
+		callbacks,
+		&DownloadEvent::FileStarted {
+			path: remote.path.clone(),
+			resumed: remote.size,
+			total: remote.size,
+		},
+	)?;
+	let (size, digest, _) = hash_file(
+		destination.to_path_buf(),
+		Some(identity),
+		callbacks.cancellation.cloned(),
+	)
+	.await?;
+	validate_staged_file_integrity(remote, size, &digest)?;
+	emit(
+		callbacks,
+		&DownloadEvent::FileVerified {
+			path: remote.path.clone(),
+			sha256: digest.clone(),
+		},
+	)?;
+	ModelFile::new(local_path.to_string(), remote.size, digest)
+		.map(Some)
+		.map_err(|error| HubError::Protocol(error.to_string()))
+}
+
+fn validate_staged_file_integrity(
+	remote: &RemoteFile,
+	size: u64,
+	digest: &str,
+) -> Result<(), HubError> {
+	if size != remote.size {
+		return Err(HubError::Size {
+			path: remote.path.clone(),
+			expected: remote.size,
+			actual: size,
+		});
+	}
+	if let Some(expected) = remote
+		.expected_sha256
+		.as_ref()
+		.filter(|expected| expected.as_str() != digest)
+	{
+		return Err(HubError::Hash {
+			path: remote.path.clone(),
+			expected: expected.clone(),
+			actual: digest.to_string(),
+		});
+	}
+	Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
 	device: u64,
@@ -3065,7 +3178,7 @@ struct FileSnapshot {
 	changed_nanoseconds: i64,
 }
 
-fn validate_download_staging(staging: &Path) -> Result<(), HubError> {
+fn validate_download_staging(staging: &Path, plan: &DownloadPlan) -> Result<(), HubError> {
 	let staging_directory = OpenOptions::new()
 		.read(true)
 		.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -3098,22 +3211,51 @@ fn validate_download_staging(staging: &Path) -> Result<(), HubError> {
 			),
 		});
 	}
-	let mut entries = std::fs::read_dir(staging).map_err(|source| HubError::Io {
+	let mut allowed = BTreeMap::new();
+	for remote in plan.files() {
+		let local_path = local_runtime_path(remote.path()).to_string();
+		for name in [local_path.clone(), format!("{local_path}.part")] {
+			if allowed.insert(name, local_path.clone()).is_some() {
+				return Err(HubError::Protocol(
+					"download plan has colliding staging paths".to_string(),
+				));
+			}
+		}
+	}
+	let entries = std::fs::read_dir(staging).map_err(|source| HubError::Io {
 		path: staging.to_path_buf(),
 		source,
 	})?;
-	if entries
-		.next()
-		.transpose()
-		.map_err(|source| HubError::Io {
+	let mut seen = BTreeSet::new();
+	for entry in entries {
+		let entry = entry.map_err(|source| HubError::Io {
 			path: staging.to_path_buf(),
 			source,
-		})?
-		.is_some()
-	{
-		return Err(HubError::Protocol(
-			"download staging must be empty".to_string(),
-		));
+		})?;
+		let path = entry.path();
+		let name = entry.file_name().into_string().map_err(|_| {
+			HubError::Protocol(format!(
+				"download staging contains a non-UTF-8 entry: {}",
+				path.display()
+			))
+		})?;
+		let Some(local_path) = allowed.get(&name) else {
+			return Err(HubError::Protocol(format!(
+				"download staging entry does not match the plan: {}",
+				path.display()
+			)));
+		};
+		if !seen.insert(local_path) {
+			return Err(HubError::Protocol(format!(
+				"download staging contains both completed and partial state for {local_path:?}"
+			)));
+		}
+		let metadata = std::fs::symlink_metadata(&path).map_err(|source| HubError::Io {
+			path: path.clone(),
+			source,
+		})?;
+		let snapshot = file_snapshot(&path, &metadata)?;
+		validate_file_snapshot(&path, &snapshot)?;
 	}
 	Ok(())
 }
@@ -3247,6 +3389,7 @@ fn open_partial(
 
 async fn hash_file(
 	path: PathBuf,
+	expected_identity: Option<FileIdentity>,
 	cancellation: Option<DownloadCancellation>,
 ) -> Result<(u64, String, FileSnapshot), HubError> {
 	check_cancelled(cancellation.as_ref())?;
@@ -3266,6 +3409,12 @@ async fn hash_file(
 		})?;
 		let snapshot = file_snapshot(&open_path, &metadata)?;
 		validate_partial_acl(&open_path, &file)?;
+		if expected_identity.is_some_and(|expected| expected != snapshot.identity) {
+			return Err(HubError::Protocol(format!(
+				"staged download identity changed before hashing: {}",
+				open_path.display()
+			)));
+		}
 		Ok::<_, HubError>((file, snapshot))
 	})
 	.await
@@ -3816,6 +3965,45 @@ mod tests {
 		task: tokio::task::JoinHandle<Vec<Vec<u8>>>,
 	}
 
+	#[derive(Debug)]
+	enum ControlledDownloadResponse {
+		Success,
+		Missing,
+	}
+
+	struct ControlledDownloadRequest {
+		path: String,
+		respond: tokio::sync::oneshot::Sender<ControlledDownloadResponse>,
+	}
+
+	struct ControlledDownloadServer {
+		endpoint: String,
+		requests: tokio::sync::mpsc::UnboundedReceiver<ControlledDownloadRequest>,
+		stop: Option<tokio::sync::oneshot::Sender<()>>,
+		task: Option<tokio::task::JoinHandle<()>>,
+	}
+
+	impl ControlledDownloadServer {
+		async fn finish(mut self) {
+			if let Some(stop) = self.stop.take() {
+				let _ = stop.send(());
+			}
+			self.task
+				.take()
+				.expect("controlled server task")
+				.await
+				.expect("join controlled server");
+		}
+	}
+
+	impl Drop for ControlledDownloadServer {
+		fn drop(&mut self) {
+			if let Some(task) = &self.task {
+				task.abort();
+			}
+		}
+	}
+
 	async fn loopback_server(behavior: LoopbackBehavior) -> LoopbackServer {
 		let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
 			.await
@@ -3844,6 +4032,100 @@ mod tests {
 			requests
 		});
 		LoopbackSequence { endpoint, task }
+	}
+
+	async fn controlled_download_server() -> ControlledDownloadServer {
+		let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+			.await
+			.expect("bind controlled download");
+		let endpoint = format!(
+			"http://{}",
+			listener.local_addr().expect("controlled download address")
+		);
+		let (requests_sender, requests) = tokio::sync::mpsc::unbounded_channel();
+		let (stop, mut stopped) = tokio::sync::oneshot::channel();
+		let task = tokio::spawn(async move {
+			let mut handlers = tokio::task::JoinSet::new();
+			loop {
+				tokio::select! {
+					_ = &mut stopped => break,
+					accepted = listener.accept() => {
+						let (socket, _) = accepted.expect("accept controlled download");
+						let requests_sender = requests_sender.clone();
+						handlers.spawn(async move {
+							serve_controlled_download(socket, requests_sender).await;
+						});
+					}
+					joined = handlers.join_next(), if !handlers.is_empty() => {
+						joined.expect("controlled handler").expect("join controlled handler");
+					}
+				}
+			}
+			drop(requests_sender);
+			while let Some(joined) = handlers.join_next().await {
+				joined.expect("join remaining controlled handler");
+			}
+		});
+		ControlledDownloadServer {
+			endpoint,
+			requests,
+			stop: Some(stop),
+			task: Some(task),
+		}
+	}
+
+	async fn serve_controlled_download(
+		mut socket: tokio::net::TcpStream,
+		requests: tokio::sync::mpsc::UnboundedSender<ControlledDownloadRequest>,
+	) {
+		let mut request = Vec::new();
+		let mut buffer = [0_u8; 1024];
+		while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+			let read = socket
+				.read(&mut buffer)
+				.await
+				.expect("read controlled request");
+			if read == 0 {
+				return;
+			}
+			request.extend_from_slice(&buffer[..read]);
+			assert!(
+				request.len() <= 16 << 10,
+				"controlled request headers too large"
+			);
+		}
+		let request = String::from_utf8(request).expect("controlled request UTF-8");
+		let target = request
+			.split_ascii_whitespace()
+			.nth(1)
+			.expect("controlled request target");
+		let path = target
+			.rsplit('/')
+			.next()
+			.expect("controlled request path")
+			.to_string();
+		let (respond, response) = tokio::sync::oneshot::channel();
+		if requests
+			.send(ControlledDownloadRequest { path, respond })
+			.is_err()
+		{
+			return;
+		}
+		let Ok(response) = response.await else {
+			return;
+		};
+		let (status, body) = match response {
+			ControlledDownloadResponse::Success => ("200 OK", b"x".as_slice()),
+			ControlledDownloadResponse::Missing => ("404 Not Found", b"missing".as_slice()),
+		};
+		let headers = format!(
+			"HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+			body.len()
+		);
+		if socket.write_all(headers.as_bytes()).await.is_ok() {
+			let _ = socket.write_all(body).await;
+			let _ = socket.shutdown().await;
+		}
 	}
 
 	async fn serve_loopback(
@@ -3958,6 +4240,22 @@ mod tests {
 			total_bytes: remote.size(),
 		};
 		(plan, remote)
+	}
+
+	fn concurrent_download_plan(paths: &[&str]) -> DownloadPlan {
+		let digest = hex::encode(sha2::Sha256::digest(b"x"));
+		let files = paths
+			.iter()
+			.map(|path| {
+				RemoteFile::new((*path).to_string(), 1, Some(digest.clone()))
+					.expect("concurrent remote fixture")
+			})
+			.collect::<Vec<_>>();
+		DownloadPlan {
+			model: model(),
+			total_bytes: u64::try_from(files.len()).expect("concurrent fixture bytes"),
+			files,
+		}
 	}
 
 	fn download_staging() -> tempfile::TempDir {
@@ -4097,34 +4395,248 @@ mod tests {
 		assert!(!staging.path().join("config.json.part").exists());
 	}
 
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	#[allow(
+		clippy::too_many_lines,
+		reason = "the concurrency regression keeps admission, overlap, and plan-order assertions together"
+	)]
+	async fn file_downloads_overlap_with_a_four_file_limit_and_return_in_plan_order() {
+		const PATHS: [&str; 6] = [
+			"config.json",
+			"tokenizer.json",
+			"model-00001.safetensors",
+			"model-00002.safetensors",
+			"model-00003.safetensors",
+			"model-00004.safetensors",
+		];
+		let mut server = controlled_download_server().await;
+		let client = loopback_client(&server.endpoint);
+		let staging = download_staging();
+		let staging_path = staging.path().to_path_buf();
+		let plan = concurrent_download_plan(&PATHS);
+		let events = Arc::new(Mutex::new(Vec::new()));
+		let observed = Arc::clone(&events);
+		let observer: DownloadObserver = Arc::new(move |event| {
+			observed
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.push(event.clone());
+			Ok(DownloadControl::Continue)
+		});
+		let download = tokio::spawn(async move {
+			client
+				.download_controlled(&plan, &staging_path, Some(&observer), None)
+				.await
+		});
+
+		let mut active = BTreeMap::new();
+		for _ in 0..DOWNLOAD_FILE_CONCURRENCY {
+			let request = tokio::time::timeout(Duration::from_secs(3), server.requests.recv())
+				.await
+				.expect("concurrent request")
+				.expect("controlled request channel");
+			active.insert(request.path, request.respond);
+		}
+		assert_eq!(
+			active.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+			PATHS[..DOWNLOAD_FILE_CONCURRENCY].iter().copied().collect()
+		);
+		assert!(
+			tokio::time::timeout(Duration::from_millis(100), server.requests.recv())
+				.await
+				.is_err(),
+			"fifth file started before one of four active files completed"
+		);
+
+		active
+			.remove(PATHS[3])
+			.expect("fourth planned response")
+			.send(ControlledDownloadResponse::Success)
+			.expect("release fourth planned response");
+		let fifth = tokio::time::timeout(Duration::from_secs(3), server.requests.recv())
+			.await
+			.expect("fifth concurrent request")
+			.expect("controlled request channel");
+		assert_eq!(fifth.path, PATHS[4]);
+		active.insert(fifth.path, fifth.respond);
+		assert!(
+			tokio::time::timeout(Duration::from_millis(100), server.requests.recv())
+				.await
+				.is_err(),
+			"sixth file started while four files remained active"
+		);
+
+		active
+			.remove(PATHS[4])
+			.expect("fifth planned response")
+			.send(ControlledDownloadResponse::Success)
+			.expect("release fifth planned response");
+		let sixth = tokio::time::timeout(Duration::from_secs(3), server.requests.recv())
+			.await
+			.expect("sixth concurrent request")
+			.expect("controlled request channel");
+		assert_eq!(sixth.path, PATHS[5]);
+		active.insert(sixth.path, sixth.respond);
+		for respond in active.into_values() {
+			respond
+				.send(ControlledDownloadResponse::Success)
+				.expect("release controlled response");
+		}
+
+		let installed = tokio::time::timeout(Duration::from_secs(3), download)
+			.await
+			.expect("bounded download completion")
+			.expect("join bounded download")
+			.expect("bounded download");
+		assert_eq!(
+			installed.iter().map(ModelFile::path).collect::<Vec<_>>(),
+			PATHS
+		);
+		let events = events
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.clone();
+		assert!(matches!(
+			events.first(),
+			Some(DownloadEvent::TransferStarted { files: 6, total: 6 })
+		));
+		assert!(matches!(
+			events.last(),
+			Some(DownloadEvent::TransferCompleted { files: 6, total: 6 })
+		));
+		let first_verified = events
+			.iter()
+			.position(|event| matches!(event, DownloadEvent::FileVerified { .. }))
+			.expect("first verified event");
+		assert_eq!(
+			events[..first_verified]
+				.iter()
+				.filter(|event| matches!(event, DownloadEvent::FileStarted { .. }))
+				.count(),
+			DOWNLOAD_FILE_CONCURRENCY
+		);
+		for path in PATHS {
+			let started = events
+				.iter()
+				.position(|event| {
+					matches!(event, DownloadEvent::FileStarted { path: event_path, .. } if event_path == path)
+				})
+				.expect("file started event");
+			let verified = events
+				.iter()
+				.position(|event| {
+					matches!(event, DownloadEvent::FileVerified { path: event_path, .. } if event_path == path)
+				})
+				.expect("file verified event");
+			assert!(started < verified);
+		}
+		server.finish().await;
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn first_file_error_cancels_and_drains_active_siblings_without_admitting_more() {
+		const PATHS: [&str; 5] = [
+			"config.json",
+			"tokenizer.json",
+			"model-00001.safetensors",
+			"model-00002.safetensors",
+			"model-00003.safetensors",
+		];
+		let mut server = controlled_download_server().await;
+		let client = loopback_client(&server.endpoint);
+		let staging = download_staging();
+		let staging_path = staging.path().to_path_buf();
+		let plan = concurrent_download_plan(&PATHS);
+		let events = Arc::new(Mutex::new(Vec::new()));
+		let observed = Arc::clone(&events);
+		let observer: DownloadObserver = Arc::new(move |event| {
+			observed
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.push(event.clone());
+			Ok(DownloadControl::Continue)
+		});
+		let download = tokio::spawn(async move {
+			client
+				.download_controlled(&plan, &staging_path, Some(&observer), None)
+				.await
+		});
+
+		let mut active = BTreeMap::new();
+		for _ in 0..DOWNLOAD_FILE_CONCURRENCY {
+			let request = tokio::time::timeout(Duration::from_secs(3), server.requests.recv())
+				.await
+				.expect("active request")
+				.expect("controlled request channel");
+			active.insert(request.path, request.respond);
+		}
+		active
+			.remove(PATHS[0])
+			.expect("failing response")
+			.send(ControlledDownloadResponse::Missing)
+			.expect("release failing response");
+
+		let error = tokio::time::timeout(Duration::from_secs(3), download)
+			.await
+			.expect("failed batch drains active siblings")
+			.expect("join failed batch")
+			.expect_err("batch must fail");
+		assert!(matches!(
+			error,
+			HubError::Http {
+				status: StatusCode::NOT_FOUND,
+				..
+			}
+		));
+		assert!(
+			tokio::time::timeout(Duration::from_millis(100), server.requests.recv())
+				.await
+				.is_err(),
+			"scheduler admitted another file after its first error"
+		);
+		let events = events
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.clone();
+		assert!(matches!(
+			events.first(),
+			Some(DownloadEvent::TransferStarted { files: 5, total: 5 })
+		));
+		assert!(
+			events
+				.iter()
+				.all(|event| !matches!(event, DownloadEvent::TransferCompleted { .. }))
+		);
+		for respond in active.into_values() {
+			let _ = respond.send(ControlledDownloadResponse::Success);
+		}
+		server.finish().await;
+	}
+
 	#[tokio::test]
 	async fn download_events_bracket_files_with_exact_transfer_totals() {
-		let bytes = b"abcdef";
 		let server = loopback_sequence_server(vec![
 			LoopbackBehavior::Response {
 				status: "200 OK",
-				headers: vec!["Content-Length: 6".to_string()],
-				body: bytes.to_vec(),
+				headers: vec!["Content-Length: 1".to_string()],
+				body: b"x".to_vec(),
 			},
 			LoopbackBehavior::Response {
 				status: "200 OK",
 				headers: vec!["Content-Length: 1".to_string()],
-				body: b"t".to_vec(),
+				body: b"x".to_vec(),
 			},
 			LoopbackBehavior::Response {
 				status: "200 OK",
 				headers: vec!["Content-Length: 1".to_string()],
-				body: b"w".to_vec(),
+				body: b"x".to_vec(),
 			},
 		])
 		.await;
 		let client = loopback_client(&server.endpoint);
 		let staging = download_staging();
-		let (mut plan, _) = test_download_plan("config.json", bytes);
-		let (_, tokenizer) = test_download_plan("tokenizer.json", b"t");
-		let (_, weights) = test_download_plan("model.safetensors", b"w");
-		plan.files.extend([tokenizer, weights]);
-		plan.total_bytes = 8;
+		let plan =
+			concurrent_download_plan(&["config.json", "tokenizer.json", "model.safetensors"]);
 		let events = Arc::new(Mutex::new(Vec::new()));
 		let observed = Arc::clone(&events);
 		let observer: DownloadObserver = Arc::new(move |event| {
@@ -4133,7 +4645,7 @@ mod tests {
 					format!("started:{files}:{total}")
 				}
 				DownloadEvent::FileStarted { path, .. } => format!("file:{path}"),
-				DownloadEvent::Progress { .. } => "progress".to_string(),
+				DownloadEvent::Progress { path, .. } => format!("progress:{path}"),
 				DownloadEvent::FileVerified { path, .. } => format!("verified:{path}"),
 				DownloadEvent::TransferCompleted { files, total } => {
 					format!("completed:{files}:{total}")
@@ -4156,49 +4668,30 @@ mod tests {
 			.lock()
 			.unwrap_or_else(std::sync::PoisonError::into_inner)
 			.clone();
-		assert_eq!(events.first().map(String::as_str), Some("started:3:8"));
-		assert_eq!(events.last().map(String::as_str), Some("completed:3:8"));
-		assert!(
-			events
-				.windows(2)
-				.any(|events| events == ["progress", "verified:config.json"])
-		);
+		assert_eq!(events.first().map(String::as_str), Some("started:3:3"));
+		assert_eq!(events.last().map(String::as_str), Some("completed:3:3"));
+		let progress = events
+			.iter()
+			.position(|event| event == "progress:config.json")
+			.expect("config progress event");
+		let verified = events
+			.iter()
+			.position(|event| event == "verified:config.json")
+			.expect("config verified event");
+		assert!(progress < verified);
 		server.task.await.expect("server task");
 	}
 
 	#[tokio::test]
 	async fn dropping_public_download_before_commit_cancels_only_its_linked_child() {
-		let bytes = b"verified";
-		let server = loopback_server(LoopbackBehavior::Response {
-			status: "200 OK",
-			headers: vec![format!("Content-Length: {}", bytes.len())],
-			body: bytes.to_vec(),
-		})
-		.await;
+		const PATHS: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+		let mut server = controlled_download_server().await;
 		let gate = Arc::new(TestPublishGate::default());
 		let mut client = loopback_client(&server.endpoint);
 		client.publish_gate = Some(Arc::clone(&gate));
 		let staging = download_staging();
 		let staging_path = staging.path().to_path_buf();
-		let destination = staging_path.join("config.json");
-		let partial = staging_path.join("config.json.part");
-		let (mut plan, _) = test_download_plan("config.json", bytes);
-		for (path, body) in [
-			("tokenizer.json", b"{}".as_slice()),
-			("model.safetensors", b"weights".as_slice()),
-		] {
-			let remote = RemoteFile::new(
-				path.to_string(),
-				u64::try_from(body.len()).expect("fixture size"),
-				Some(hex::encode(sha2::Sha256::digest(body))),
-			)
-			.expect("complete-plan file");
-			plan.total_bytes = plan
-				.total_bytes
-				.checked_add(remote.size())
-				.expect("complete-plan bytes");
-			plan.files.push(remote);
-		}
+		let plan = concurrent_download_plan(&PATHS);
 		let caller = DownloadCancellation::default();
 		let task_caller = caller.clone();
 		let task = tokio::spawn(async move {
@@ -4206,8 +4699,18 @@ mod tests {
 				.download_controlled(&plan, &staging_path, None, Some(&task_caller))
 				.await
 		});
+		for _ in PATHS {
+			let request = tokio::time::timeout(Duration::from_secs(3), server.requests.recv())
+				.await
+				.expect("publication request")
+				.expect("controlled request channel");
+			request
+				.respond
+				.send(ControlledDownloadResponse::Success)
+				.expect("release publication response");
+		}
 		tokio::time::timeout(Duration::from_secs(3), async {
-			while !gate.entered.load(Ordering::Acquire) {
+			while gate.entered.load(Ordering::Acquire) < PATHS.len() {
 				tokio::task::yield_now().await;
 			}
 		})
@@ -4223,16 +4726,18 @@ mod tests {
 		assert!(!caller.is_cancelled());
 		gate.release.store(true, Ordering::Release);
 		tokio::time::timeout(Duration::from_secs(3), async {
-			while !gate.completed.load(Ordering::Acquire) {
+			while gate.completed.load(Ordering::Acquire) < PATHS.len() {
 				tokio::task::yield_now().await;
 			}
 		})
 		.await
 		.expect("detached publication phase exits");
 
-		assert!(!destination.exists());
-		assert!(partial.exists());
-		server.task.await.expect("server task");
+		for path in PATHS {
+			assert!(!staging.path().join(path).exists());
+			assert!(staging.path().join(format!("{path}.part")).exists());
+		}
+		server.finish().await;
 	}
 
 	#[tokio::test]
@@ -4444,7 +4949,53 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn oversized_transfer_does_not_clobber_existing_destination() {
+	async fn completed_file_with_wrong_size_is_not_redownloaded_or_clobbered() {
+		let client = loopback_client("http://127.0.0.1:1");
+		let staging = download_staging();
+		let destination = staging.path().join("config.json");
+		write_partial(&destination, b"keep");
+		let (plan, remote) = test_download_plan("config.json", b"abcdef");
+
+		let error = client
+			.download_file(&plan, &remote, staging.path(), callbacks(None, None))
+			.await
+			.expect_err("wrong completed size");
+
+		assert!(matches!(
+			error,
+			HubError::Size {
+				expected: 6,
+				actual: 4,
+				..
+			}
+		));
+		assert_eq!(std::fs::read(destination).expect("existing file"), b"keep");
+		assert!(!staging.path().join("config.json.part").exists());
+	}
+
+	#[tokio::test]
+	async fn completed_file_with_wrong_hash_is_not_redownloaded_or_clobbered() {
+		let client = loopback_client("http://127.0.0.1:1");
+		let staging = download_staging();
+		let destination = staging.path().join("config.json");
+		write_partial(&destination, b"ABCDEF");
+		let (plan, remote) = test_download_plan("config.json", b"abcdef");
+
+		let error = client
+			.download_file(&plan, &remote, staging.path(), callbacks(None, None))
+			.await
+			.expect_err("wrong completed hash");
+
+		assert!(matches!(error, HubError::Hash { .. }));
+		assert_eq!(
+			std::fs::read(destination).expect("existing file"),
+			b"ABCDEF"
+		);
+		assert!(!staging.path().join("config.json.part").exists());
+	}
+
+	#[tokio::test]
+	async fn oversized_transfer_does_not_publish_destination() {
 		let server = loopback_server(LoopbackBehavior::Response {
 			status: "200 OK",
 			headers: vec!["Content-Length: 7".to_string()],
@@ -4454,7 +5005,6 @@ mod tests {
 		let client = loopback_client(&server.endpoint);
 		let staging = download_staging();
 		let destination = staging.path().join("config.json");
-		std::fs::write(&destination, b"keep").expect("existing destination");
 		let (plan, remote) = test_download_plan("config.json", b"abcdef");
 
 		let error = client
@@ -4470,49 +5020,123 @@ mod tests {
 				..
 			}
 		));
-		assert_eq!(std::fs::read(destination).expect("existing file"), b"keep");
+		assert!(!destination.exists());
 		server.task.await.expect("server task");
 	}
 
 	#[tokio::test]
-	async fn verified_rename_never_clobbers_existing_destination() {
-		let bytes = b"abcdef";
-		let server = loopback_server(LoopbackBehavior::Response {
-			status: "200 OK",
-			headers: vec!["Content-Length: 6".to_string()],
-			body: bytes.to_vec(),
-		})
-		.await;
-		let client = loopback_client(&server.endpoint);
+	async fn completed_plan_files_are_hashed_and_reused_without_network() {
+		const PATHS: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+		let client = loopback_client("http://127.0.0.1:1");
 		let staging = download_staging();
-		let destination = staging.path().join("config.json");
-		std::fs::write(&destination, b"keep").expect("existing destination");
-		let (plan, remote) = test_download_plan("config.json", bytes);
+		for path in PATHS {
+			write_partial(&staging.path().join(path), b"x");
+		}
+		let plan = concurrent_download_plan(&PATHS);
+		let events = Arc::new(Mutex::new(Vec::new()));
+		let observed = Arc::clone(&events);
+		let observer: DownloadObserver = Arc::new(move |event| {
+			observed
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.push(event.clone());
+			Ok(DownloadControl::Continue)
+		});
 
-		assert!(
-			client
-				.download_file(&plan, &remote, staging.path(), callbacks(None, None))
-				.await
-				.is_err()
-		);
-		assert_eq!(std::fs::read(destination).expect("existing file"), b"keep");
+		let installed = client
+			.download_controlled(&plan, staging.path(), Some(&observer), None)
+			.await
+			.expect("reuse completed plan");
+
 		assert_eq!(
-			std::fs::read(staging.path().join("config.json.part")).expect("verified partial"),
-			bytes
+			installed.iter().map(ModelFile::path).collect::<Vec<_>>(),
+			PATHS
 		);
-		server.task.await.expect("server task");
+		let events = events
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		for path in PATHS {
+			assert!(events.iter().any(|event| {
+				matches!(
+					event,
+					DownloadEvent::FileStarted {
+						path: event_path,
+						resumed: 1,
+						total: 1
+					} if event_path == path
+				)
+			}));
+			assert!(events.iter().any(|event| {
+				matches!(
+					event,
+					DownloadEvent::FileVerified {
+						path: event_path,
+						..
+					} if event_path == path
+				)
+			}));
+			assert!(!staging.path().join(format!("{path}.part")).exists());
+		}
+		drop(events);
 	}
 
 	#[test]
-	fn staging_validation_rejects_nonempty_and_acl_directories() {
+	fn staging_validation_accepts_empty_or_planned_partial_state() {
+		let (plan, _) = test_download_plan("config.json", b"abcdef");
 		let empty = download_staging();
-		validate_download_staging(empty.path()).expect("empty secure staging");
-		std::fs::write(empty.path().join("unexpected"), b"x").expect("unexpected file");
-		assert!(matches!(
-			validate_download_staging(empty.path()),
-			Err(HubError::Protocol(message)) if message.contains("must be empty")
-		));
+		validate_download_staging(empty.path(), &plan).expect("empty secure staging");
+		write_partial(&empty.path().join("config.json.part"), b"abc");
+		validate_download_staging(empty.path(), &plan).expect("planned partial staging");
+	}
 
+	#[test]
+	fn staging_validation_rejects_unplanned_entries() {
+		let (plan, _) = test_download_plan("config.json", b"abcdef");
+		let staging = download_staging();
+		write_partial(&staging.path().join("unexpected"), b"x");
+		assert!(matches!(
+			validate_download_staging(staging.path(), &plan),
+			Err(HubError::Protocol(message)) if message.contains("does not match the plan")
+		));
+	}
+
+	#[test]
+	fn staging_validation_rejects_completed_and_partial_state_for_one_file() {
+		let (plan, _) = test_download_plan("config.json", b"abcdef");
+		let staging = download_staging();
+		write_partial(&staging.path().join("config.json"), b"abcdef");
+		write_partial(&staging.path().join("config.json.part"), b"abc");
+		assert!(matches!(
+			validate_download_staging(staging.path(), &plan),
+			Err(HubError::Protocol(message)) if message.contains("both completed and partial")
+		));
+	}
+
+	#[test]
+	fn staging_validation_rejects_symlinks_and_insecure_modes() {
+		let (plan, _) = test_download_plan("config.json", b"abcdef");
+		let linked = download_staging();
+		let target_directory = tempfile::tempdir().expect("symlink target directory");
+		let target = target_directory.path().join("target");
+		write_partial(&target, b"abcdef");
+		std::os::unix::fs::symlink(&target, linked.path().join("config.json"))
+			.expect("staging symlink");
+		assert!(validate_download_staging(linked.path(), &plan).is_err());
+
+		let insecure = download_staging();
+		let path = insecure.path().join("config.json.part");
+		write_partial(&path, b"abc");
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+			.expect("insecure staging mode");
+		assert!(matches!(
+			validate_download_staging(insecure.path(), &plan),
+			Err(HubError::Protocol(message)) if message.contains("0600 regular file")
+		));
+	}
+
+	#[test]
+	fn staging_validation_rejects_acl_directories() {
+		let (plan, _) = test_download_plan("config.json", b"abcdef");
 		let acl = download_staging();
 		let output = Command::new("/bin/chmod")
 			.args([
@@ -4528,7 +5152,7 @@ mod tests {
 			String::from_utf8_lossy(&output.stderr)
 		);
 		assert!(matches!(
-			validate_download_staging(acl.path()),
+			validate_download_staging(acl.path(), &plan),
 			Err(HubError::Io { source, .. })
 				if source.kind() == std::io::ErrorKind::PermissionDenied
 		));

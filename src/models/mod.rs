@@ -3,10 +3,13 @@
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
-	collections::BTreeSet,
-	fs::{self, OpenOptions},
+	collections::{BTreeMap, BTreeSet},
+	fs::{self, File, OpenOptions},
 	io::{Read as _, Write as _},
-	os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+	os::{
+		fd::AsRawFd as _,
+		unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+	},
 	path::{Path, PathBuf},
 	sync::{Arc, OnceLock, mpsc},
 	time::{Duration, SystemTime},
@@ -21,10 +24,10 @@ use walkdir::WalkDir;
 use crate::{
 	Client, Error,
 	config::Config,
-	home::{EmelexHome, create_owner_subdir},
+	home::{EmelexHome, create_owner_subdir, effective_user_id, has_extended_acl},
 	hub::{
-		DownloadCancellation, DownloadObserver, DownloadOperationGuard, DownloadReporter,
-		HubClient, HubError, required_download_storage_bytes,
+		DownloadCancellation, DownloadObserver, DownloadOperationGuard, DownloadPlan,
+		DownloadReporter, HubClient, HubError, local_runtime_path, required_download_storage_bytes,
 	},
 	model::{
 		CompatibilityReport, HubModelId, InspectionError, InstalledModel, LocalModelName,
@@ -37,8 +40,12 @@ const MANIFEST_NAME: &str = "emelex-model.json";
 const VERIFIED_STAMP_NAME: &str = ".emelex-verified.json";
 const LINKED_SOURCE_NAME: &str = ".emelex-linked-source";
 const QUARANTINE_RECORD_NAME: &str = "emelex-quarantine.json";
+const HUB_TRANSFER_RECORD_NAME: &str = "emelex-transfer.json";
+const HUB_TRANSFER_LOCK_NAME: &str = ".emelex-transfer.lock";
+const HUB_TRANSFER_PAYLOAD_NAME: &str = "payload";
 const MAX_MANIFEST_BYTES: u64 = 4 << 20;
 const MAX_VERIFICATION_STAMP_BYTES: u64 = 8 << 20;
+const MAX_HUB_TRANSFER_RECORD_BYTES: u64 = 64 << 10;
 
 /// Tri-state per-load setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -206,6 +213,36 @@ pub struct ModelInventory {
 	pub models: Vec<InstalledModel>,
 	/// Invalid entries skipped without hiding healthy snapshots.
 	pub diagnostics: Vec<ModelDiagnostic>,
+}
+
+/// Durable state of one exact Hub transfer workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HubTransferState {
+	/// One process currently owns the workspace lock.
+	Downloading,
+	/// A valid resumable workspace exists without an active owner.
+	Paused,
+}
+
+/// Local transfer state for one exact Hugging Face model revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HubTransferStatus {
+	snapshot_id: ModelSnapshotId,
+	state: HubTransferState,
+}
+
+impl HubTransferStatus {
+	/// Exact Hub model revision represented by the workspace.
+	pub const fn snapshot_id(&self) -> &ModelSnapshotId {
+		&self.snapshot_id
+	}
+
+	/// Whether the workspace is active or paused.
+	pub const fn state(&self) -> HubTransferState {
+		self.state
+	}
 }
 
 /// Failure returned by a snapshot-reference policy.
@@ -466,6 +503,28 @@ impl ModelManager {
 		result
 	}
 
+	/// List valid durable Hub transfer workspaces and their live lock state.
+	///
+	/// Invalid or incomplete workspace records are omitted. A held per-revision
+	/// lock reports [`HubTransferState::Downloading`]; a valid unlocked workspace
+	/// reports [`HubTransferState::Paused`].
+	///
+	/// # Errors
+	///
+	/// Returns an error when the transfer-store root cannot be traversed or the
+	/// blocking status task fails.
+	pub async fn hub_transfer_statuses(&self) -> Result<Vec<HubTransferStatus>, ModelsError> {
+		let mut operation = DownloadOperationGuard::new(None);
+		let manager = self.clone();
+		let cancellation = operation.cancellation().clone();
+		let result =
+			tokio::task::spawn_blocking(move || manager.scan_hub_transfer_statuses(&cancellation))
+				.await
+				.map_err(blocking_model_task_error)?;
+		operation.finish();
+		result
+	}
+
 	/// List healthy snapshots while retaining diagnostics for corrupt entries.
 	///
 	/// # Errors
@@ -576,6 +635,60 @@ impl ModelManager {
 		}
 		check_download_cancellation(Some(cancellation))?;
 		Ok(snapshots.into_iter().collect())
+	}
+
+	fn scan_hub_transfer_statuses(
+		&self,
+		cancellation: &DownloadCancellation,
+	) -> Result<Vec<HubTransferStatus>, ModelsError> {
+		check_download_cancellation(Some(cancellation))?;
+		let root = self.hub_transfer_root();
+		let metadata = match fs::symlink_metadata(&root) {
+			Ok(metadata) => metadata,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+			Err(source) => return Err(ModelsError::Io { path: root, source }),
+		};
+		if !metadata.is_dir() || metadata.file_type().is_symlink() {
+			return Err(ModelsError::UnsafeInstall(root));
+		}
+		validate_owner_directory(&root)?;
+		let mut statuses = BTreeMap::new();
+		for entry in WalkDir::new(&root).follow_links(false).max_depth(6) {
+			check_download_cancellation(Some(cancellation))?;
+			let Ok(entry) = entry else {
+				continue;
+			};
+			if !entry.file_type().is_file() || entry.file_name() != HUB_TRANSFER_RECORD_NAME {
+				continue;
+			}
+			let Some(workspace) = entry.path().parent() else {
+				continue;
+			};
+			let Ok(record) = read_hub_transfer_record(workspace) else {
+				continue;
+			};
+			if self.hub_transfer_directory(&record.model, &record.revision) != workspace
+				|| validate_owner_directory(workspace).is_err()
+				|| validate_hub_transfer_payload(&workspace.join(HUB_TRANSFER_PAYLOAD_NAME))
+					.is_err()
+			{
+				continue;
+			}
+			let state = match try_hub_transfer_lock(workspace, false) {
+				Ok(Some(_lock)) => HubTransferState::Paused,
+				Ok(None) => HubTransferState::Downloading,
+				Err(_) => continue,
+			};
+			statuses.insert(
+				record.snapshot_id(),
+				HubTransferStatus {
+					snapshot_id: record.snapshot_id(),
+					state,
+				},
+			);
+		}
+		check_download_cancellation(Some(cancellation))?;
+		Ok(statuses.into_values().collect())
 	}
 
 	/// Resolve the newest installed snapshot for a stable reference.
@@ -727,124 +840,236 @@ impl ModelManager {
 		cancellation: Option<&DownloadCancellation>,
 	) -> Result<InstalledModel, ModelsError> {
 		check_download_cancellation(cancellation)?;
-		if let Some(expected_revision) = expected_revision
-			&& let Some(existing) = self
+		let mut transfer = if let Some(expected_revision) = expected_revision {
+			let mut transfer = self
+				.acquire_hub_transfer_workspace(id, expected_revision, cancellation)
+				.await?;
+			let existing = match self
 				.reuse_hub_revision_controlled(id, expected_revision, cancellation)
-				.await?
-		{
-			check_download_cancellation(cancellation)?;
-			return Ok(existing);
-		}
-		let plan = self
-			.hub
-			.plan(id)
-			.await
-			.map_err(mark_hub_candidate_certification_error)?;
+				.await
+			{
+				Ok(existing) => existing,
+				Err(error) => {
+					self.handle_hub_transfer_failure(&mut transfer, &error)?;
+					return Err(error);
+				}
+			};
+			if let Some(existing) = existing {
+				check_download_cancellation(cancellation)?;
+				let _ = self.finish_hub_transfer(&mut transfer, "completed-transfer");
+				return Ok(existing);
+			}
+			Some(transfer)
+		} else {
+			None
+		};
+		let plan = match self.hub.plan(id).await {
+			Ok(plan) => plan,
+			Err(error) => {
+				let error = mark_hub_candidate_certification_error(error);
+				if let Some(transfer) = &mut transfer {
+					self.handle_hub_transfer_failure(transfer, &error)?;
+				}
+				return Err(error);
+			}
+		};
 		check_download_cancellation(cancellation)?;
-		if let Some(expected_revision) = expected_revision {
-			ensure_download_revision(id, expected_revision, &plan.model().revision)?;
+		if let Some(expected_revision) = expected_revision
+			&& let Err(error) =
+				ensure_download_revision(id, expected_revision, &plan.model().revision)
+		{
+			if let Some(transfer) = &mut transfer {
+				self.handle_hub_transfer_failure(transfer, &error)?;
+			}
+			return Err(error);
 		}
-		let fit = plan.model().fit.as_ref().ok_or_else(|| {
-			mark_candidate_certification_error(ModelsError::Incompatible(vec![
+		let mut transfer = match transfer.take() {
+			Some(transfer) => transfer,
+			None => {
+				self.acquire_hub_transfer_workspace(id, &plan.model().revision, cancellation)
+					.await?
+			}
+		};
+		let Some(fit) = plan.model().fit.as_ref() else {
+			let error = mark_candidate_certification_error(ModelsError::Incompatible(vec![
 				"Hub plan lacks an exact residency estimate for this invocation".to_string(),
-			]))
-		})?;
-		let workload = self.workload()?;
+			]));
+			self.handle_hub_transfer_failure(&mut transfer, &error)?;
+			return Err(error);
+		};
+		let workload = match self.workload() {
+			Ok(workload) => workload,
+			Err(error) => {
+				self.handle_hub_transfer_failure(&mut transfer, &error)?;
+				return Err(error);
+			}
+		};
 		if fit.budget_bytes != self.metal_budget_bytes || fit.workload != workload || !fit.fits {
-			return Err(mark_candidate_certification_error(
-				ModelsError::Incompatible(vec![format!(
+			let error =
+				mark_candidate_certification_error(ModelsError::Incompatible(vec![format!(
 					"Hub plan does not fit the active workload and Metal budget: required={}, budget={}",
 					fit.required_bytes, self.metal_budget_bytes
-				)]),
-			));
+				)]));
+			self.handle_hub_transfer_failure(&mut transfer, &error)?;
+			return Err(error);
 		}
-		if let Some(existing) = self
+		let existing = match self
 			.reuse_hub_revision_controlled(id, &plan.model().revision, cancellation)
-			.await?
+			.await
 		{
+			Ok(existing) => existing,
+			Err(error) => {
+				self.handle_hub_transfer_failure(&mut transfer, &error)?;
+				return Err(error);
+			}
+		};
+		if let Some(existing) = existing {
 			check_download_cancellation(cancellation)?;
+			let _ = self.finish_hub_transfer(&mut transfer, "completed-transfer");
 			return Ok(existing);
 		}
+		if let Err(error) = self.prepare_hub_transfer(&mut transfer) {
+			self.handle_hub_transfer_failure(&mut transfer, &error)?;
+			return Err(error);
+		}
 		let temp_dir = self.home.temp_dir();
-		let total_bytes = plan.total_bytes();
-		tokio::task::spawn_blocking(move || preflight_disk(&temp_dir, total_bytes))
-			.await
-			.map_err(blocking_model_task_error)??;
+		let staging_path = transfer.staging_path();
+		let preflight_plan = plan.clone();
+		let preflight_path = staging_path.clone();
+		let preflight = match tokio::task::spawn_blocking(move || {
+			let remaining = remaining_hub_transfer_bytes(&preflight_plan, &preflight_path)?;
+			preflight_disk(&temp_dir, remaining)
+		})
+		.await
+		{
+			Ok(preflight) => preflight,
+			Err(join_error) => {
+				let error = blocking_model_task_error(join_error);
+				self.handle_hub_transfer_failure(&mut transfer, &error)?;
+				return Err(error);
+			}
+		};
+		if let Err(error) = preflight {
+			self.handle_hub_transfer_failure(&mut transfer, &error)?;
+			return Err(error);
+		}
 		check_download_cancellation(cancellation)?;
 		let reference = ModelRef::Hub(id.clone());
 		let destination = self.hub_destination(id, plan.model().revision.as_str());
-		let manager = self.clone();
-		let staging = tokio::task::spawn_blocking(move || manager.create_staging("hub"))
-			.await
-			.map_err(blocking_model_task_error)??;
-		check_download_cancellation(cancellation)?;
-		let files = self
+		let files = match self
 			.hub
-			.download_with_controls(&plan, staging.path(), reporter, observer, cancellation)
-			.await?;
+			.download_with_controls(&plan, &staging_path, reporter, observer, cancellation)
+			.await
+		{
+			Ok(files) => files,
+			Err(error) => {
+				let error = ModelsError::Hub(error);
+				self.handle_hub_transfer_failure(&mut transfer, &error)?;
+				return Err(error);
+			}
+		};
 		check_download_cancellation(cancellation)?;
-		verify_files_controlled(staging.path(), &files, cancellation).await?;
+		if let Err(error) = verify_files_controlled(&staging_path, &files, cancellation).await {
+			self.handle_hub_transfer_failure(&mut transfer, &error)?;
+			return Err(error);
+		}
 		check_download_cancellation(cancellation)?;
 		let manager = self.clone();
-		let staging_path = staging.path().to_path_buf();
 		let probe_files = files.clone();
 		let revision = plan.model().revision.clone();
 		let license = plan.model().license.clone();
 		let certification = tokio::task::spawn_blocking(move || {
-			let mut report = inspect_directory(
-				reference.clone(),
-				&staging_path,
-				workload,
-				manager.metal_budget_bytes,
-			)?;
-			if !report.compatible {
-				return Err(ModelsError::Incompatible(report.reasons));
+			let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				let mut report = inspect_directory(
+					reference.clone(),
+					&staging_path,
+					workload,
+					manager.metal_budget_bytes,
+				)?;
+				if !report.compatible {
+					return Err(ModelsError::Incompatible(report.reasons));
+				}
+				let policy = manager.resolve_load_policy(
+					&report.traits,
+					&ModelLoadOptions {
+						speculative_tokens: Some(0),
+						thinking: Some(crate::config::ThinkingMode::Off),
+						reasoning_budget_tokens: LoadOverride::Clear,
+						..ModelLoadOptions::default()
+					},
+				)?;
+				let client = manager.build_client(&staging_path, &policy, &probe_files, None)?;
+				client.runtime_probe()?;
+				report.mark_runtime_loaded(
+					client.supports_mtp(),
+					client.supports_images(),
+					client.supports_audio(),
+				);
+				drop(client);
+				ModelManifest::new(
+					reference,
+					ModelSource::Hub,
+					Some(revision),
+					files,
+					report.traits,
+					VerificationStatus::Verified,
+					license,
+				)
+				.map_err(ModelsError::from)
+			}));
+			match outcome {
+				Ok(Ok(manifest)) => Ok((transfer, manifest)),
+				Ok(Err(error)) => {
+					manager.handle_hub_transfer_failure(&mut transfer, &error)?;
+					Err(error)
+				}
+				Err(payload) => {
+					let _ = manager.finish_hub_transfer(&mut transfer, "failed-transfer");
+					std::panic::resume_unwind(payload);
+				}
 			}
-			let policy = manager.resolve_load_policy(
-				&report.traits,
-				&ModelLoadOptions {
-					speculative_tokens: Some(0),
-					thinking: Some(crate::config::ThinkingMode::Off),
-					reasoning_budget_tokens: LoadOverride::Clear,
-					..ModelLoadOptions::default()
-				},
-			)?;
-			let client = manager.build_client(&staging_path, &policy, &probe_files, None)?;
-			client.runtime_probe()?;
-			report.mark_runtime_loaded(
-				client.supports_mtp(),
-				client.supports_images(),
-				client.supports_audio(),
-			);
-			drop(client);
-			let manifest = ModelManifest::new(
-				reference,
-				ModelSource::Hub,
-				Some(revision),
-				files,
-				report.traits,
-				VerificationStatus::Verified,
-				license,
-			)
-			.map_err(ModelsError::from)?;
-			Ok::<_, ModelsError>((staging, manifest))
 		})
 		.await
 		.map_err(blocking_model_task_error)?;
-		let (staging, manifest) = certification.map_err(mark_candidate_certification_error)?;
+		let (mut transfer, manifest) = certification.map_err(mark_candidate_certification_error)?;
 		check_download_cancellation(cancellation)?;
-		let mutation_lock = self.snapshot_mutation_lock_controlled(cancellation).await?;
+		let mutation_lock = match self.snapshot_mutation_lock_controlled(cancellation).await {
+			Ok(lock) => lock,
+			Err(error) => {
+				self.handle_hub_transfer_failure(&mut transfer, &error)?;
+				return Err(error);
+			}
+		};
 		let manager = self.clone();
 		let owned_cancellation = cancellation.cloned();
 		tokio::task::spawn_blocking(move || {
-			write_manifest(staging.path(), &manifest)?;
-			manager.publish_with_lock(
-				staging,
-				&destination,
-				&manifest,
-				owned_cancellation.as_ref(),
-				mutation_lock,
-			)
+			let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				transfer.take_staging().and_then(|staging| {
+					write_manifest(staging.path(), &manifest).and_then(|()| {
+						manager.publish_with_lock(
+							staging,
+							&destination,
+							&manifest,
+							owned_cancellation.as_ref(),
+							mutation_lock,
+						)
+					})
+				})
+			}));
+			match outcome {
+				Ok(Ok(installed)) => {
+					let _ = manager.finish_hub_transfer(&mut transfer, "completed-transfer");
+					Ok(installed)
+				}
+				Ok(Err(error)) => {
+					manager.handle_hub_transfer_failure(&mut transfer, &error)?;
+					Err(error)
+				}
+				Err(payload) => {
+					let _ = manager.finish_hub_transfer(&mut transfer, "failed-transfer");
+					std::panic::resume_unwind(payload);
+				}
+			}
 		})
 		.await
 		.map_err(blocking_model_task_error)?
@@ -1268,6 +1493,141 @@ impl ModelManager {
 		Ok(removed)
 	}
 
+	async fn acquire_hub_transfer_workspace(
+		&self,
+		id: &HubModelId,
+		revision: &ResolvedRevision,
+		cancellation: Option<&DownloadCancellation>,
+	) -> Result<HubTransferWorkspace, ModelsError> {
+		check_download_cancellation(cancellation)?;
+		let path = self.hub_transfer_directory(id, revision);
+		let home_root = self.home.root().to_path_buf();
+		let prepare_path = path.clone();
+		tokio::task::spawn_blocking(move || prepare_owned_directory(&home_root, &prepare_path))
+			.await
+			.map_err(blocking_model_task_error)??;
+		loop {
+			check_download_cancellation(cancellation)?;
+			let lock_path = path.clone();
+			let lock = tokio::task::spawn_blocking(move || try_hub_transfer_lock(&lock_path, true))
+				.await
+				.map_err(blocking_model_task_error)??;
+			if let Some(lock) = lock {
+				check_download_cancellation(cancellation)?;
+				return Ok(HubTransferWorkspace {
+					path,
+					record: HubTransferRecord::new(id.clone(), revision.clone()),
+					staging: None,
+					_lock: lock,
+				});
+			}
+			tokio::time::sleep(Duration::from_millis(25)).await;
+		}
+	}
+
+	fn prepare_hub_transfer(
+		&self,
+		workspace: &mut HubTransferWorkspace,
+	) -> Result<(), ModelsError> {
+		if workspace.staging.is_some() {
+			return Err(ModelsError::Configuration(
+				"Hub transfer payload is already active".to_string(),
+			));
+		}
+		validate_owner_directory(&workspace.path)?;
+		let record_path = workspace.path.join(HUB_TRANSFER_RECORD_NAME);
+		match fs::symlink_metadata(&record_path) {
+			Ok(_) => {
+				let stored = read_hub_transfer_record(&workspace.path)?;
+				if stored != workspace.record {
+					return Err(ModelsError::UnsafeInstall(record_path));
+				}
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				let payload = workspace.staging_path();
+				match fs::symlink_metadata(&payload) {
+					Ok(_) => return Err(ModelsError::UnsafeInstall(payload)),
+					Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+					Err(source) => {
+						return Err(ModelsError::Io {
+							path: payload,
+							source,
+						});
+					}
+				}
+				write_hub_transfer_record(&workspace.path, &workspace.record)?;
+			}
+			Err(source) => {
+				return Err(ModelsError::Io {
+					path: record_path,
+					source,
+				});
+			}
+		}
+		let payload = prepare_owned_directory(self.home.root(), &workspace.staging_path())?;
+		normalize_hub_transfer_payload(&payload)?;
+		let quarantine_parent =
+			create_owner_subdir(self.home.root(), &["cache", "quarantine", "models"]).map_err(
+				|source| ModelsError::Io {
+					path: self.home.cache_dir().join("quarantine/models"),
+					source,
+				},
+			)?;
+		workspace.staging = Some(StagingGuard {
+			path: payload,
+			cleanup: StagingCleanup::RetainUntilMoved(quarantine_parent),
+			active: true,
+			#[cfg(test)]
+			cleanup_delay: None,
+		});
+		Ok(())
+	}
+
+	fn finish_hub_transfer(
+		&self,
+		workspace: &mut HubTransferWorkspace,
+		payload_reason: &str,
+	) -> Result<(), ModelsError> {
+		if let Some(mut staging) = workspace.staging.take() {
+			staging.commit();
+		}
+		let payload = workspace.staging_path();
+		match fs::symlink_metadata(&payload) {
+			Ok(metadata) => {
+				if !metadata.is_dir() || metadata.file_type().is_symlink() {
+					return Err(ModelsError::UnsafeInstall(payload));
+				}
+				validate_owner_directory(&payload)?;
+				self.move_to_quarantine(
+					&payload,
+					payload_reason,
+					Some(workspace.record.snapshot_id()),
+				)?;
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(source) => {
+				return Err(ModelsError::Io {
+					path: payload,
+					source,
+				});
+			}
+		}
+		remove_hub_transfer_record(&workspace.path)?;
+		sync_directory(&workspace.path)
+	}
+
+	fn handle_hub_transfer_failure(
+		&self,
+		workspace: &mut HubTransferWorkspace,
+		error: &ModelsError,
+	) -> Result<(), ModelsError> {
+		if retain_hub_transfer_after(error) {
+			Ok(())
+		} else {
+			self.finish_hub_transfer(workspace, "failed-transfer")
+		}
+	}
+
 	fn snapshot_mutation_lock(&self) -> Result<crate::home::SnapshotMutationLock, ModelsError> {
 		self.home.lock_snapshot_mutations().map_err(|error| {
 			ModelsError::SnapshotMutationLock(bounded_diagnostic(&error.to_string()))
@@ -1498,7 +1858,7 @@ impl ModelManager {
 			)?;
 		Ok(StagingGuard {
 			path,
-			quarantine_parent,
+			cleanup: StagingCleanup::Quarantine(quarantine_parent),
 			active: true,
 			#[cfg(test)]
 			cleanup_delay: None,
@@ -1549,18 +1909,29 @@ impl ModelManager {
 			source,
 		})?;
 		staging.moved_to(destination);
-		sync_directory(parent)?;
-		let installed = self.load_installed_at(destination)?;
-		if installed.manifest() != expected {
-			return Err(ModelsError::ManifestEncoding(
-				"published link manifest differs from verified staging manifest".to_string(),
-			));
+		let publication = (|| {
+			sync_directory(parent)?;
+			let installed = self.load_installed_at(destination)?;
+			if installed.manifest() != expected {
+				return Err(ModelsError::ManifestEncoding(
+					"published link manifest differs from verified staging manifest".to_string(),
+				));
+			}
+			set_mode(staging.path(), 0o500)?;
+			sync_directory(staging.path())?;
+			sync_directory(parent)?;
+			Ok(installed)
+		})();
+		match publication {
+			Ok(installed) => {
+				staging.commit();
+				Ok(installed)
+			}
+			Err(error) => {
+				staging.quarantine_now("failed", Some(expected.snapshot_id().clone()))?;
+				Err(error)
+			}
 		}
-		set_mode(staging.path(), 0o500)?;
-		sync_directory(staging.path())?;
-		sync_directory(parent)?;
-		staging.commit();
-		Ok(installed)
 	}
 
 	fn publish_with_lock(
@@ -1648,36 +2019,43 @@ impl ModelManager {
 			path: destination.to_path_buf(),
 			source,
 		})?;
-		sync_directory(parent)?;
 		staging.moved_to(destination);
-		let installed = self.load_installed_at(destination)?;
-		if installed.manifest() != expected {
-			return Err(ModelsError::ManifestEncoding(
-				"published manifest differs from verified staging manifest".to_string(),
-			));
+		let publication = (|| {
+			sync_directory(parent)?;
+			let installed = self.load_installed_at(destination)?;
+			if installed.manifest() != expected {
+				return Err(ModelsError::ManifestEncoding(
+					"published manifest differs from verified staging manifest".to_string(),
+				));
+			}
+			set_mode(staging.path(), 0o500)?;
+			sync_directory(staging.path())?;
+			sync_directory(parent)?;
+			Ok(installed)
+		})();
+		match publication {
+			Ok(installed) => {
+				staging.commit();
+				Ok(installed)
+			}
+			Err(error) => {
+				staging.quarantine_now("failed", Some(expected.snapshot_id().clone()))?;
+				Err(error)
+			}
 		}
-		set_mode(staging.path(), 0o500)?;
-		sync_directory(staging.path())?;
-		sync_directory(parent)?;
-		staging.commit();
-		Ok(installed)
 	}
 
 	fn hub_destination(&self, id: &HubModelId, revision: &str) -> PathBuf {
 		let root = self.home.models_dir().join("hub");
-		id.namespace().map_or_else(
-			|| {
-				root.join("unnamespaced")
-					.join(id.repo_name())
-					.join(revision)
-			},
-			|namespace| {
-				root.join("namespaced")
-					.join(namespace)
-					.join(id.repo_name())
-					.join(revision)
-			},
-		)
+		hub_revision_path(&root, id, revision)
+	}
+
+	fn hub_transfer_root(&self) -> PathBuf {
+		self.home.temp_dir().join("models").join("hub")
+	}
+
+	fn hub_transfer_directory(&self, id: &HubModelId, revision: &ResolvedRevision) -> PathBuf {
+		hub_revision_path(&self.hub_transfer_root(), id, revision.as_str())
 	}
 
 	fn local_destination(&self, name: &LocalModelName, digest: &str) -> PathBuf {
@@ -1696,6 +2074,22 @@ impl ModelManager {
 			}
 		}
 	}
+}
+
+fn hub_revision_path(root: &Path, id: &HubModelId, revision: &str) -> PathBuf {
+	id.namespace().map_or_else(
+		|| {
+			root.join("unnamespaced")
+				.join(id.repo_name())
+				.join(revision)
+		},
+		|namespace| {
+			root.join("namespaced")
+				.join(namespace)
+				.join(id.repo_name())
+				.join(revision)
+		},
+	)
 }
 
 /// Revalidate an installed snapshot while the caller holds the Emelex Home
@@ -3377,6 +3771,36 @@ fn preflight_disk(path: &Path, transfer_bytes: u64) -> Result<(), ModelsError> {
 	Ok(())
 }
 
+fn remaining_hub_transfer_bytes(plan: &DownloadPlan, staging: &Path) -> Result<u64, ModelsError> {
+	remaining_hub_transfer_file_bytes(
+		plan.files()
+			.iter()
+			.map(|remote| (local_runtime_path(remote.path()), remote.size())),
+		staging,
+	)
+}
+
+fn remaining_hub_transfer_file_bytes<'a>(
+	files: impl IntoIterator<Item = (&'a str, u64)>,
+	staging: &Path,
+) -> Result<u64, ModelsError> {
+	let mut remaining = 0_u64;
+	for (local_path, expected) in files {
+		let completed = staging.join(local_path);
+		if owned_file_len(&completed)?.is_some() {
+			continue;
+		}
+		let partial = staging.join(format!("{local_path}.part"));
+		let persisted = owned_file_len(&partial)?.unwrap_or(0).min(expected);
+		remaining = remaining
+			.checked_add(expected.saturating_sub(persisted))
+			.ok_or_else(|| {
+				ModelsError::Configuration("remaining Hub transfer byte count overflow".to_string())
+			})?;
+	}
+	Ok(remaining)
+}
+
 fn sync_directory(path: &Path) -> Result<(), ModelsError> {
 	let directory = OpenOptions::new()
 		.read(true)
@@ -3401,12 +3825,350 @@ fn bounded_diagnostic(message: &str) -> String {
 	bounded
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HubTransferRecord {
+	schema_version: u32,
+	model: HubModelId,
+	revision: ResolvedRevision,
+}
+
+impl HubTransferRecord {
+	const SCHEMA_VERSION: u32 = 1;
+
+	const fn new(model: HubModelId, revision: ResolvedRevision) -> Self {
+		Self {
+			schema_version: Self::SCHEMA_VERSION,
+			model,
+			revision,
+		}
+	}
+
+	fn snapshot_id(&self) -> ModelSnapshotId {
+		ModelSnapshotId::Hub {
+			id: self.model.clone(),
+			revision: self.revision.clone(),
+		}
+	}
+}
+
+struct HubTransferLock(File);
+
+impl Drop for HubTransferLock {
+	fn drop(&mut self) {
+		// SAFETY: the descriptor remains live until this guard finishes dropping.
+		unsafe {
+			libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+		}
+	}
+}
+
+struct HubTransferWorkspace {
+	path: PathBuf,
+	record: HubTransferRecord,
+	staging: Option<StagingGuard>,
+	_lock: HubTransferLock,
+}
+
+impl HubTransferWorkspace {
+	fn staging_path(&self) -> PathBuf {
+		self.path.join(HUB_TRANSFER_PAYLOAD_NAME)
+	}
+
+	fn take_staging(&mut self) -> Result<StagingGuard, ModelsError> {
+		self.staging.take().ok_or_else(|| {
+			ModelsError::Configuration("Hub transfer payload was already consumed".to_string())
+		})
+	}
+}
+
+fn validate_owner_directory(path: &Path) -> Result<(), ModelsError> {
+	let directory = OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+		.open(path)
+		.map_err(|source| ModelsError::Io {
+			path: path.to_path_buf(),
+			source,
+		})?;
+	let metadata = directory.metadata().map_err(|source| ModelsError::Io {
+		path: path.to_path_buf(),
+		source,
+	})?;
+	let has_acl = has_extended_acl(&directory).map_err(|source| ModelsError::Io {
+		path: path.to_path_buf(),
+		source,
+	})?;
+	if !metadata.is_dir()
+		|| metadata.uid() != effective_user_id()
+		|| metadata.mode() & 0o777 != 0o700
+		|| has_acl
+	{
+		return Err(ModelsError::UnsafeInstall(path.to_path_buf()));
+	}
+	Ok(())
+}
+
+fn validate_owner_file(path: &Path, file: &File) -> Result<fs::Metadata, ModelsError> {
+	validate_owner_file_modes(path, file, &[0o600])
+}
+
+fn validate_owner_file_modes(
+	path: &Path,
+	file: &File,
+	allowed_modes: &[u32],
+) -> Result<fs::Metadata, ModelsError> {
+	let metadata = file.metadata().map_err(|source| ModelsError::Io {
+		path: path.to_path_buf(),
+		source,
+	})?;
+	let has_acl = has_extended_acl(file).map_err(|source| ModelsError::Io {
+		path: path.to_path_buf(),
+		source,
+	})?;
+	if !metadata.is_file()
+		|| metadata.uid() != effective_user_id()
+		|| metadata.nlink() != 1
+		|| !allowed_modes.contains(&(metadata.mode() & 0o777))
+		|| has_acl
+	{
+		return Err(ModelsError::UnsafeInstall(path.to_path_buf()));
+	}
+	Ok(metadata)
+}
+
+fn owned_file_len(path: &Path) -> Result<Option<u64>, ModelsError> {
+	let file = match OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+		.open(path)
+	{
+		Ok(file) => file,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(source) => {
+			return Err(ModelsError::Io {
+				path: path.to_path_buf(),
+				source,
+			});
+		}
+	};
+	validate_owner_file(path, &file).map(|metadata| Some(metadata.len()))
+}
+
+fn try_hub_transfer_lock(
+	workspace: &Path,
+	create: bool,
+) -> Result<Option<HubTransferLock>, ModelsError> {
+	let path = workspace.join(HUB_TRANSFER_LOCK_NAME);
+	let mut options = OpenOptions::new();
+	options
+		.read(true)
+		.write(true)
+		.mode(0o600)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+	if create {
+		options.create(true);
+	}
+	let file = options.open(&path).map_err(|source| ModelsError::Io {
+		path: path.clone(),
+		source,
+	})?;
+	validate_owner_file(&path, &file)?;
+	loop {
+		// SAFETY: `file` owns a live descriptor and both flock flags are valid.
+		if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+			return Ok(Some(HubTransferLock(file)));
+		}
+		let source = std::io::Error::last_os_error();
+		match source.kind() {
+			std::io::ErrorKind::Interrupted => {}
+			std::io::ErrorKind::WouldBlock => return Ok(None),
+			_ => {
+				return Err(ModelsError::HubTransferLock(format!(
+					"cannot lock {}: {source}",
+					path.display()
+				)));
+			}
+		}
+	}
+}
+
+fn read_hub_transfer_record(workspace: &Path) -> Result<HubTransferRecord, ModelsError> {
+	let path = workspace.join(HUB_TRANSFER_RECORD_NAME);
+	let file = OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+		.open(&path)
+		.map_err(|source| ModelsError::Io {
+			path: path.clone(),
+			source,
+		})?;
+	let metadata = validate_owner_file(&path, &file)?;
+	if metadata.len() > MAX_HUB_TRANSFER_RECORD_BYTES {
+		return Err(ModelsError::ManifestEncoding(
+			"Hub transfer record exceeds 64 KiB".to_string(),
+		));
+	}
+	let capacity = usize::try_from(metadata.len()).map_err(|_| {
+		ModelsError::ManifestEncoding("Hub transfer record size does not fit memory".to_string())
+	})?;
+	let mut bytes = Vec::with_capacity(capacity);
+	file.take(MAX_HUB_TRANSFER_RECORD_BYTES.saturating_add(1))
+		.read_to_end(&mut bytes)
+		.map_err(|source| ModelsError::Io {
+			path: path.clone(),
+			source,
+		})?;
+	if bytes.len() as u64 > MAX_HUB_TRANSFER_RECORD_BYTES {
+		return Err(ModelsError::ManifestEncoding(
+			"Hub transfer record exceeds 64 KiB".to_string(),
+		));
+	}
+	let record: HubTransferRecord = serde_json::from_slice(&bytes)
+		.map_err(|error| ModelsError::ManifestEncoding(error.to_string()))?;
+	if record.schema_version != HubTransferRecord::SCHEMA_VERSION {
+		return Err(ModelsError::ManifestEncoding(
+			"unsupported Hub transfer record schema".to_string(),
+		));
+	}
+	Ok(record)
+}
+
+fn write_hub_transfer_record(
+	workspace: &Path,
+	record: &HubTransferRecord,
+) -> Result<(), ModelsError> {
+	let bytes = serde_json::to_vec(record)
+		.map_err(|error| ModelsError::ManifestEncoding(error.to_string()))?;
+	let path = workspace.join(HUB_TRANSFER_RECORD_NAME);
+	let mut file = OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(0o600)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+		.open(&path)
+		.map_err(|source| ModelsError::Io {
+			path: path.clone(),
+			source,
+		})?;
+	validate_owner_file(&path, &file)?;
+	file.write_all(&bytes)
+		.and_then(|()| file.sync_all())
+		.map_err(|source| ModelsError::Io {
+			path: path.clone(),
+			source,
+		})?;
+	sync_directory(workspace)
+}
+
+fn normalize_hub_transfer_payload(path: &Path) -> Result<(), ModelsError> {
+	validate_owner_directory(path)?;
+	let entries = fs::read_dir(path).map_err(|source| ModelsError::Io {
+		path: path.to_path_buf(),
+		source,
+	})?;
+	for entry in entries {
+		let entry = entry.map_err(|source| ModelsError::Io {
+			path: path.to_path_buf(),
+			source,
+		})?;
+		let entry_path = entry.path();
+		let file = OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+			.open(&entry_path)
+			.map_err(|source| ModelsError::Io {
+				path: entry_path.clone(),
+				source,
+			})?;
+		validate_owner_file_modes(&entry_path, &file, &[0o400, 0o600])?;
+		file.set_permissions(fs::Permissions::from_mode(0o600))
+			.map_err(|source| ModelsError::Io {
+				path: entry_path,
+				source,
+			})?;
+	}
+	for name in [MANIFEST_NAME, VERIFIED_STAMP_NAME] {
+		let internal = path.join(name);
+		match fs::remove_file(&internal) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(source) => {
+				return Err(ModelsError::Io {
+					path: internal,
+					source,
+				});
+			}
+		}
+	}
+	sync_directory(path)
+}
+
+fn validate_hub_transfer_payload(path: &Path) -> Result<(), ModelsError> {
+	validate_owner_directory(path)?;
+	let entries = fs::read_dir(path).map_err(|source| ModelsError::Io {
+		path: path.to_path_buf(),
+		source,
+	})?;
+	let mut seen = BTreeSet::new();
+	for entry in entries {
+		let entry = entry.map_err(|source| ModelsError::Io {
+			path: path.to_path_buf(),
+			source,
+		})?;
+		let entry_path = entry.path();
+		let name = entry
+			.file_name()
+			.into_string()
+			.map_err(|_| ModelsError::UnsafeInstall(entry_path.clone()))?;
+		if !matches!(name.as_str(), MANIFEST_NAME | VERIFIED_STAMP_NAME) {
+			let runtime_name = name.strip_suffix(".part").unwrap_or(&name);
+			if !runtime_file_name(runtime_name) || !seen.insert(runtime_name.to_string()) {
+				return Err(ModelsError::UnsafeInstall(entry_path));
+			}
+		}
+		let file = OpenOptions::new()
+			.read(true)
+			.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+			.open(&entry_path)
+			.map_err(|source| ModelsError::Io {
+				path: entry_path.clone(),
+				source,
+			})?;
+		validate_owner_file_modes(&entry_path, &file, &[0o400, 0o600])?;
+	}
+	Ok(())
+}
+
+fn remove_hub_transfer_record(workspace: &Path) -> Result<(), ModelsError> {
+	let path = workspace.join(HUB_TRANSFER_RECORD_NAME);
+	let file = match OpenOptions::new()
+		.read(true)
+		.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+		.open(&path)
+	{
+		Ok(file) => file,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(source) => return Err(ModelsError::Io { path, source }),
+	};
+	validate_owner_file(&path, &file)?;
+	drop(file);
+	fs::remove_file(&path).map_err(|source| ModelsError::Io { path, source })
+}
+
 struct StagingGuard {
 	path: PathBuf,
-	quarantine_parent: PathBuf,
+	cleanup: StagingCleanup,
 	active: bool,
 	#[cfg(test)]
 	cleanup_delay: Option<Duration>,
+}
+
+enum StagingCleanup {
+	Quarantine(PathBuf),
+	RetainUntilMoved(PathBuf),
+	QuarantineAfterMove(PathBuf),
+	Retain,
 }
 
 struct StagingCleanupTask {
@@ -3466,7 +4228,34 @@ impl StagingGuard {
 	}
 
 	fn moved_to(&mut self, path: &Path) {
+		let cleanup = std::mem::replace(&mut self.cleanup, StagingCleanup::Retain);
+		self.cleanup = match cleanup {
+			StagingCleanup::Quarantine(quarantine_parent)
+			| StagingCleanup::RetainUntilMoved(quarantine_parent) => {
+				StagingCleanup::QuarantineAfterMove(quarantine_parent)
+			}
+			other => other,
+		};
 		self.path = path.to_path_buf();
+	}
+
+	fn quarantine_now(
+		&mut self,
+		reason: &str,
+		snapshot_id: Option<ModelSnapshotId>,
+	) -> Result<(), ModelsError> {
+		let cleanup = std::mem::replace(&mut self.cleanup, StagingCleanup::Retain);
+		let quarantine_parent = match cleanup {
+			StagingCleanup::Quarantine(quarantine_parent)
+			| StagingCleanup::QuarantineAfterMove(quarantine_parent) => quarantine_parent,
+			StagingCleanup::RetainUntilMoved(_) | StagingCleanup::Retain => {
+				return Err(ModelsError::Configuration(
+					"staging path lacks quarantine authority".to_string(),
+				));
+			}
+		};
+		self.active = false;
+		move_to_quarantine(&quarantine_parent, &self.path, reason, snapshot_id).map(drop)
 	}
 }
 
@@ -3476,8 +4265,13 @@ impl Drop for StagingGuard {
 			return;
 		}
 		self.active = false;
+		let quarantine_parent = match std::mem::replace(&mut self.cleanup, StagingCleanup::Retain) {
+			StagingCleanup::Quarantine(quarantine_parent) => quarantine_parent,
+			StagingCleanup::RetainUntilMoved(_)
+			| StagingCleanup::QuarantineAfterMove(_)
+			| StagingCleanup::Retain => return,
+		};
 		let path = std::mem::take(&mut self.path);
-		let quarantine_parent = std::mem::take(&mut self.quarantine_parent);
 		defer_staging_cleanup(StagingCleanupTask {
 			path,
 			quarantine_parent,
@@ -3548,6 +4342,9 @@ pub enum ModelsError {
 	/// Cross-process snapshot/reference mutation lock could not be acquired.
 	#[error("model snapshot mutation lock failed: {0}")]
 	SnapshotMutationLock(String),
+	/// Per-revision Hub transfer lock could not be opened or acquired.
+	#[error("Hub transfer lock failed: {0}")]
+	HubTransferLock(String),
 	/// Static compatibility failed.
 	#[error("model is incompatible: {0:?}")]
 	Incompatible(Vec<String>),
@@ -3615,6 +4412,68 @@ pub enum ModelsError {
 		/// Filesystem-reported available bytes.
 		available: u64,
 	},
+}
+
+fn retain_hub_transfer_after(error: &ModelsError) -> bool {
+	match error {
+		ModelsError::Hub(error) => match error {
+			HubError::Request(_)
+			| HubError::Observer(_)
+			| HubError::Cancelled
+			| HubError::DownloadIdleTimeout { .. } => true,
+			HubError::Http { status, .. } => {
+				*status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+			}
+			HubError::Io { source, .. } => retriable_io_kind(source.kind()),
+			HubError::Size {
+				expected, actual, ..
+			} => actual < expected,
+			HubError::Configuration(_)
+			| HubError::Url(_)
+			| HubError::NotPublic(_)
+			| HubError::Incompatible(_)
+			| HubError::Protocol(_)
+			| HubError::Hash { .. } => false,
+		},
+		ModelsError::Io { source, .. } => retriable_io_kind(source.kind()),
+		ModelsError::InsufficientDisk { .. } => true,
+		ModelsError::Inspection(_)
+		| ModelsError::Manifest(_)
+		| ModelsError::Client(_)
+		| ModelsError::Certification(_)
+		| ModelsError::HubRevisionChanged { .. }
+		| ModelsError::NotInstalled(_)
+		| ModelsError::SnapshotNotInstalled(_)
+		| ModelsError::UnverifiedSnapshot(_)
+		| ModelsError::SnapshotReferenced(_)
+		| ModelsError::ImportOwnershipConflict(_)
+		| ModelsError::ReferenceGuard(_)
+		| ModelsError::SnapshotMutationLock(_)
+		| ModelsError::HubTransferLock(_)
+		| ModelsError::Incompatible(_)
+		| ModelsError::Walk(_)
+		| ModelsError::UnsafeInstall(_)
+		| ModelsError::UnexpectedRuntimeFile(_)
+		| ModelsError::RuntimeInventory { .. }
+		| ModelsError::ManifestEncoding(_)
+		| ModelsError::CorruptFile { .. }
+		| ModelsError::InvalidVerificationStamp(_)
+		| ModelsError::Configuration(_) => false,
+	}
+}
+
+const fn retriable_io_kind(kind: std::io::ErrorKind) -> bool {
+	matches!(
+		kind,
+		std::io::ErrorKind::ConnectionAborted
+			| std::io::ErrorKind::ConnectionRefused
+			| std::io::ErrorKind::ConnectionReset
+			| std::io::ErrorKind::Interrupted
+			| std::io::ErrorKind::TimedOut
+			| std::io::ErrorKind::UnexpectedEof
+			| std::io::ErrorKind::WouldBlock
+			| std::io::ErrorKind::WriteZero
+	)
 }
 
 fn mark_candidate_certification_error(error: ModelsError) -> ModelsError {

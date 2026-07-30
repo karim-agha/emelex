@@ -44,18 +44,42 @@ Hub storage encodes repository arity explicitly:
 catalog without making an unnamespaced repository an ancestor of a
 namespaced one.
 
+Each exact Hub revision also has one durable transfer workspace under
+`temp/models/hub/`, using the same arity-safe path followed by
+`emelex-transfer.json`, a stable `.emelex-transfer.lock`, and a `payload`
+directory. The per-revision advisory lock is acquired before the installed
+snapshot is rechecked. This prevents duplicate transfers across processes:
+another caller waits with cooperative cancellation, then reuses the completed
+install or resumes the same validated payload. Complete planned files and
+bounded `.part` prefixes survive cancellation, observer failure, transient
+transport failure, and retriable I/O. Disk preflight counts only bytes not
+already staged.
+
+`hub_transfer_statuses` exposes valid exact-revision workspaces without
+following links or hashing payloads. A held lock reports `Downloading`; a
+valid unlocked record and payload report `Paused`. Invalid or lock-only
+coordination directories are omitted. Terminal protocol, integrity, and
+certification failures move the payload to recoverable quarantine and remove
+its transfer record. Successful publication also removes the record and any
+redundant payload while leaving the stable lock inode in place, closing the
+unlink-and-recreate race for later callers.
+
 Controlled Hub installs observe cancellation between every local phase.
 Post-transfer hashing is async and chunk-cancellable, and a mandatory final
 checkpoint runs immediately before publication. Cancellation observed before
-that commit point leaves no visible installed destination; once the final
-checkpoint wins, the atomic publication may complete. Every install owns an
-internal cancellation handle, so dropping either download future asks detached
-blocking phases to stop before publication. A controlled download links that
-private handle to caller cancellation without gaining authority to cancel
-sibling operations. Failed staging cleanup is dispatched to one named
-background quarantine worker instead of running filesystem syncs or spawning
-overflow threads in async-future Drop. Inventory/stamp checks and contained
-file opens also run on blocking workers; cancellable hashing remains async.
+that commit point leaves no visible installed destination and retains a
+resumable Hub payload; once the final checkpoint wins, the atomic publication
+may complete. A post-rename failure quarantines the moved destination
+synchronously while the snapshot-mutation lock is still held, so an incomplete
+destination cannot race a later reuse or durable binding.
+Every install owns an internal cancellation handle, so dropping either
+download future asks detached blocking phases to stop before publication. A
+controlled download links that private handle to caller cancellation without
+gaining authority to cancel sibling operations. Non-Hub failed staging cleanup
+and pre-publication Hub cleanup are dispatched to one named background
+quarantine worker instead of running filesystem syncs or spawning overflow
+threads in async-future Drop. Inventory/stamp checks and contained file opens
+also run on blocking workers; cancellable hashing remains async.
 
 `inventory` returns healthy owned snapshots and valid link records plus
 diagnostics for corrupt or unavailable candidates. `resolve` selects the newest
@@ -71,9 +95,10 @@ the immutable manifest. Callers may use current static evidence to fill gaps
 left by an older certification pass while retaining recorded runtime-only
 evidence.
 
-`installed_hub_snapshots` is the cancellation-safe status path for interactive
-Hub discovery. It scans only managed Hub installs, omits corrupt candidates,
-and never hashes caller-owned linked imports.
+`installed_hub_snapshots` and `hub_transfer_statuses` are the
+cancellation-safe status paths for interactive Hub discovery. They scan only
+managed Hub state, omit corrupt candidates, and never hash caller-owned linked
+imports.
 
 Owned loads validate the exact runtime inventory and either hash every file or
 use a descriptor-bound stamp whose metadata still matches. Linked loads never
