@@ -65,9 +65,12 @@
   absence permits stored global credentials.
 - `hub capabilities` renders the library's complete `REMOTE_FILTERS` catalog;
   its displayed syntax and accepted remote predicates cannot drift apart.
-- Every CLI Hub search enables `HubSearch::mlx_library` independently of user
-  text and uses the model-manager client's local Metal/storage fit. Human
-  results render as labeled vertical cards: local status comes from one
+- Every CLI Hub search implicitly requires `interaction:tools`, enables
+  `HubSearch::mlx_library` independently of user text, and uses the
+  model-manager client's local Metal/storage fit. Zero-installed chat
+  onboarding preserves the same tool-use requirement through its invocation
+  filters. Library `HubSearch` remains generic and adds no CLI requirements.
+  Human results render as labeled vertical cards: local status comes from one
   verified inventory pass and distinguishes the exact revision, a different
   installed revision, and no installed revision. Quantization comes only from
   validated exact-revision config. The memory row names its evaluated workload
@@ -107,6 +110,13 @@
   user-driven Hub cursors. Empty-page messages must distinguish one page from
   catalog exhaustion, and local certification failure must leave next-page
   discovery available.
+- New-chat selection honors explicit model then configured default. Otherwise
+  it groups healthy installed snapshots by stable reference and chooses by
+  installed-reference cardinality before capability validation: zero enters
+  onboarding, one is automatic, and multiple use the terminal selector.
+  Redirected and JSON invocations never prompt. A selected model may combine
+  positive current static inspection evidence with runtime-only manifest
+  evidence; a real capability mismatch remains an error.
 - Raw thinking-on selection requires `interaction:thinking_toggle`. Agent and
   chat thinking-on selection require both that trait and
   `interaction:reasoning_history`. A generate-command override reaches model

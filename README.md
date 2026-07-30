@@ -11,7 +11,7 @@ Emelex supports Apple Silicon on macOS 26.5 or newer.
 
 ```sh
 cargo install --locked --path .
-emelex hub search qwen --require interaction:tools
+emelex hub search qwen
 emelex hub capabilities
 emelex model import /path/to/checkpoint --name local-name
 cd your-project
@@ -22,6 +22,12 @@ On a terminal, Hub search shows downloaded state and quantization for each
 result. Use arrow keys and Enter to download one; Escape or `q` keeps the
 results without downloading. `emelex hub download [NAMESPACE/]REPO` remains
 available for direct, non-interactive installs.
+
+Without `--model` or a configured default, `emelex chat` automatically uses
+the sole installed model. With multiple installed models it opens an arrow-key
+selector on a terminal; redirected and JSON invocations require an explicit
+model. The selected checkpoint is then checked against the current chat
+capability requirements.
 
 All owned data defaults to `~/.emelex`. Override it with `--home PATH`, the
 library builder, or `EMELEX_HOME`.
@@ -100,14 +106,17 @@ target.
 `hub capabilities` lists the predicates backed by remote evidence; stronger
 installed-only claims such as runtime-verified MTP are intentionally
 unavailable during remote search. CLI Hub searches always use Hugging Face's
-MLX catalog filter, preserve optional user search text, and return only
-candidates fitting this Mac's Metal budget and available Emelex Home storage.
-When interactive onboarding needs image or audio input, remote discovery uses
-Hugging Face's advertised-input metadata only. That is a candidate hint, not a
-runtime claim; every downloaded checkpoint must pass local capability
-certification before Emelex selects it. Onboarding presents one bounded result
-page at a time while the user explicitly follows opaque next-page cursors,
-including after a candidate fails local certification.
+MLX catalog filter and require remote evidence of tool use, preserve optional
+user search text, and return only candidates fitting this Mac's Metal budget
+and available Emelex Home storage. Zero-installed chat onboarding applies the
+same tool-use requirement. This is CLI policy; library `HubSearch` callers
+receive only the requirements they explicitly configure. When interactive
+onboarding needs image or audio input, remote discovery uses Hugging Face's
+advertised-input metadata only. That is a candidate hint, not a runtime claim;
+every downloaded checkpoint must pass local capability certification before
+Emelex selects it. Onboarding presents one bounded result page at a time while
+the user explicitly follows opaque next-page cursors, including after a
+candidate fails local certification.
 
 ## Library
 

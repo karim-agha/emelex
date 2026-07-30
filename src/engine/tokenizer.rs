@@ -1686,13 +1686,7 @@ fn probe_tool_capability(
 			&serde_json::json!({"probe": TOOL_PROBE_CALL_ARGUMENTS[0]}),
 		)
 	} else {
-		let parsed = crate::engine::tools::parse_tool_calls(&rendered_history, tool_format);
-		parsed.len() == call_count
-			&& parsed.iter().enumerate().all(|(index, call)| {
-				call.name == TOOL_PROBE_NAMES[index]
-					&& call.arguments
-						== serde_json::json!({"probe": TOOL_PROBE_CALL_ARGUMENTS[index]})
-			})
+		parsed_tool_history_round_trips(&declaration, &rendered_history, tool_format, call_count)
 	};
 	let result_envelope = match tool_format {
 		crate::engine::tools::ToolCallFormat::Gemma => gemma_results_round_trip(
@@ -1711,6 +1705,45 @@ fn probe_tool_capability(
 		&& distinguishes_tool_result
 		&& result_envelope
 		&& parsed_round_trip)
+}
+
+// emelex patch (not upstream): templates may include a literal, parseable
+// tool-call example in their static instructions. Preserve fail-closed dynamic
+// history certification by accepting only an identical static-call prefix
+// followed by the exact ordered probe calls.
+fn parsed_tool_history_round_trips(
+	declaration: &str,
+	rendered_history: &str,
+	format: crate::engine::tools::ToolCallFormat,
+	call_count: usize,
+) -> bool {
+	let declared = crate::engine::tools::parse_tool_calls(declaration, format);
+	if declared
+		.iter()
+		.any(|call| TOOL_PROBE_NAMES.contains(&call.name.as_str()))
+	{
+		return false;
+	}
+	let rendered = crate::engine::tools::parse_tool_calls(rendered_history, format);
+	let Some((prefix, probed)) = rendered.split_at_checked(declared.len()) else {
+		return false;
+	};
+	let Some(expected_names) = TOOL_PROBE_NAMES.get(..call_count) else {
+		return false;
+	};
+	let Some(expected_arguments) = TOOL_PROBE_CALL_ARGUMENTS.get(..call_count) else {
+		return false;
+	};
+	prefix.iter().zip(&declared).all(|(actual, expected)| {
+		actual.name == expected.name && actual.arguments == expected.arguments
+	}) && probed.len() == call_count
+		&& probed
+			.iter()
+			.zip(expected_names)
+			.zip(expected_arguments)
+			.all(|((call, name), arguments)| {
+				call.name == *name && call.arguments == serde_json::json!({"probe": arguments})
+			})
 }
 
 fn gemma_result_round_trips(rendered: &str, name: &str, result: &str) -> bool {
@@ -2456,6 +2489,44 @@ mod tests {
 		assert!(capabilities.system_prompt);
 		assert!(capabilities.tools);
 		assert_eq!(format, crate::engine::tools::ToolCallFormat::LlamaJson);
+	}
+
+	#[test]
+	fn qwen_xml_tool_example_does_not_hide_tool_support() {
+		let templates = ChatTemplates::single(
+			r#"
+{% if tools %}
+<tools>{% for tool in tools %}{{ tool|tojson }}{% endfor %}</tools>
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter>example_value</parameter>
+</function>
+</tool_call>
+{% endif %}
+{% for message in messages %}
+	{% if message.tool_calls %}
+		{% for call in message.tool_calls %}
+<tool_call>
+<function={{ call.function.name }}>
+			{% for name, value in call.function.arguments|items %}
+<parameter={{ name }}>{{ value }}</parameter>
+			{% endfor %}
+</function>
+</tool_call>
+		{% endfor %}
+	{% elif message.role == "tool" %}
+<tool_response>{{ message.content }}</tool_response>
+	{% else %}
+<{{ message.role }}>{{ message.content }}</{{ message.role }}>
+	{% endif %}
+{% endfor %}
+"#
+			.to_string(),
+		);
+		let (capabilities, format) =
+			resolve_chat_templates_capabilities(&templates, ("", "")).expect("capability probe");
+		assert!(capabilities.tools);
+		assert_eq!(format, crate::engine::tools::ToolCallFormat::Hermes);
 	}
 
 	#[test]

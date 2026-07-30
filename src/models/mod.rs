@@ -1081,6 +1081,30 @@ impl ModelManager {
 		Ok(report.traits)
 	}
 
+	/// Revalidate and statically inspect one installed snapshot.
+	///
+	/// This derives compatibility with the current Emelex inspection rules
+	/// without loading MLX or changing the immutable installed manifest.
+	///
+	/// # Errors
+	///
+	/// Returns when the managed record changed, its immutable files are no
+	/// longer valid, or static inspection fails.
+	pub fn inspect_installed(
+		&self,
+		installed: &InstalledModel,
+	) -> Result<CompatibilityReport, ModelsError> {
+		self.validate_owned_install(installed)?;
+		let runtime = runtime_directory(installed.path(), installed.manifest())?;
+		inspect_directory(
+			installed.reference().clone(),
+			&runtime,
+			self.workload()?,
+			self.metal_budget_bytes,
+		)
+		.map_err(Into::into)
+	}
+
 	/// Hash, inspect, and runtime-load one installed snapshot.
 	///
 	/// # Errors

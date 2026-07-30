@@ -120,8 +120,10 @@ independently varied declarations and schemas survive rendering, followed by
 two ordered call/argument/result parser round trips for Hermes, Gemma, and
 Laguna (one call for Llama JSON's single-call protocol). System,
 reasoning-history, thinking-toggle, and media capability probes also traverse
-the tools-enabled history. Protocol
-selection comes from the exact selected template, not model-type naming;
+the tools-enabled history. A literal parseable call embedded in static template
+instructions is accepted only when it remains an identical prefix before the
+exact dynamic probe-call suffix; extra or changed calls still fail closed.
+Protocol selection comes from the exact selected template, not model-type naming;
 missing, malformed, or ambiguous tool evidence fails closed to ordinary chat.
 Gemma-native rendering
 normalizes generic assistant calls followed by tool-role results into the

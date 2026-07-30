@@ -17,7 +17,7 @@ use emelex::{
 	},
 	model::{
 		HubModelId, InstalledModel, Modality, ModelSnapshotId, ModelTraits, MtpSupport,
-		ResolvedRevision, Task,
+		ResolvedRevision, Task, TraitFilter,
 	},
 };
 
@@ -32,6 +32,7 @@ const EMPTY_SEARCH_MESSAGE: &str = "No compatible MLX models matched this search
 const EMPTY_SEARCH_PAGE_MESSAGE: &str =
 	"No compatible MLX models on this ranked page; use the next cursor to continue.";
 const SEARCH_CARD_WIDTH: usize = 64;
+const CLI_REQUIRED_SEARCH_TRAIT: &str = "interaction:tools";
 
 pub(crate) async fn run(
 	emelex: &Emelex,
@@ -107,7 +108,10 @@ async fn search(
 	stdout_palette: Palette,
 	stderr_palette: Palette,
 ) -> anyhow::Result<()> {
-	let mut search = HubSearch::default().mlx_library().requirements(require);
+	let requirements = cli_search_requirements(require)?;
+	let mut search = HubSearch::default()
+		.mlx_library()
+		.requirements(requirements);
 	if let Some(query) = query {
 		search = search.query(query);
 	}
@@ -202,6 +206,15 @@ async fn search(
 		.await?;
 	}
 	Ok(())
+}
+
+fn cli_search_requirements(require: Vec<TraitFilter>) -> anyhow::Result<Vec<TraitFilter>> {
+	let mut requirements = require.into_iter().collect::<BTreeSet<_>>();
+	requirements.insert(
+		TraitFilter::parse(CLI_REQUIRED_SEARCH_TRAIT)
+			.context("build implicit CLI Hub search requirement")?,
+	);
+	Ok(requirements.into_iter().collect())
 }
 
 fn select_search_result(
@@ -1711,6 +1724,35 @@ mod tests {
 			"fit": null
 		}))
 		.expect("valid Hub model fixture")
+	}
+
+	#[test]
+	fn cli_search_implicitly_requires_tool_capability() {
+		let requirements = cli_search_requirements(Vec::new()).expect("CLI search requirements");
+
+		assert_eq!(
+			requirements
+				.iter()
+				.map(TraitFilter::as_str)
+				.collect::<Vec<_>>(),
+			[CLI_REQUIRED_SEARCH_TRAIT]
+		);
+	}
+
+	#[test]
+	fn cli_search_deduplicates_explicit_and_implicit_requirements() {
+		let tools = TraitFilter::parse(CLI_REQUIRED_SEARCH_TRAIT).expect("tool capability");
+		let reasoning = TraitFilter::parse("interaction:reasoning").expect("reasoning capability");
+		let requirements = cli_search_requirements(vec![tools.clone(), reasoning, tools])
+			.expect("CLI search requirements");
+
+		assert_eq!(
+			requirements
+				.iter()
+				.map(TraitFilter::as_str)
+				.collect::<Vec<_>>(),
+			["interaction:reasoning", CLI_REQUIRED_SEARCH_TRAIT]
+		);
 	}
 
 	#[test]

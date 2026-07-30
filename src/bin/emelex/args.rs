@@ -199,11 +199,12 @@ pub(crate) enum HubCommand {
 	},
 	/// List filters supported during remote catalog discovery.
 	Capabilities,
-	/// Search MLX Hub ranking for models compatible with this machine.
+	/// Search MLX Hub ranking for tool-capable models compatible with this machine.
 	Search {
-		/// Optional Hub search text; MLX and local-fit filters always apply.
+		/// Optional Hub search text; tool-use, MLX, and local-fit filters always apply.
 		query: Option<String>,
-		/// Required remote trait; repeat for conjunction. Run `hub capabilities` for choices.
+		/// Additional remote trait; repeat for conjunction.
+		/// Run `hub capabilities` for choices.
 		#[arg(long = "require")]
 		require: Vec<TraitFilter>,
 		/// Opaque next-page cursor.

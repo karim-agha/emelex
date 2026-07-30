@@ -65,6 +65,12 @@ accepts only that exact `ModelSnapshotId`; a stable reference cannot remove
 whichever revision happens to be newest. Linked-model removal deletes only the
 managed record and never modifies the external target.
 
+`inspect_installed` revalidates one resolved record and derives static
+compatibility using the current Emelex rules without loading MLX or rewriting
+the immutable manifest. Callers may use current static evidence to fill gaps
+left by an older certification pass while retaining recorded runtime-only
+evidence.
+
 `installed_hub_snapshots` is the cancellation-safe status path for interactive
 Hub discovery. It scans only managed Hub installs, omits corrupt candidates,
 and never hashes caller-owned linked imports.

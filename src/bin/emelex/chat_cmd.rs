@@ -277,7 +277,7 @@ async fn prepare_chat(
 	let installed = match selected_session.as_ref() {
 		Some(session) => resume_model(emelex, session, &required)?,
 		None => {
-			model_select::resolve(
+			model_select::resolve_chat(
 				emelex,
 				args.model.as_ref(),
 				&required,
@@ -487,28 +487,15 @@ fn resume_model(
 		.as_ref()
 		.context("session has no immutable model snapshot")
 		.cloned()?;
-	let selected = emelex
-		.models()
-		.context("initialize model manager")?
-		.resolve_snapshot(&snapshot)
-		.with_context(|| {
-			format!(
-				"session {} requires unavailable model snapshot {snapshot}",
-				session.id
-			)
-		})?;
-	let missing = required
-		.iter()
-		.filter(|filter| !selected.manifest().traits().satisfies(filter))
-		.map(ToString::to_string)
-		.collect::<Vec<_>>();
-	if !missing.is_empty() {
-		bail!(
-			"session model {} lacks required trait(s): {}",
-			selected.reference(),
-			missing.join(", ")
-		);
-	}
+	let models = emelex.models().context("initialize model manager")?;
+	let selected = models.resolve_snapshot(&snapshot).with_context(|| {
+		format!(
+			"session {} requires unavailable model snapshot {snapshot}",
+			session.id
+		)
+	})?;
+	model_select::validate_installed_traits(models, &selected, required)
+		.with_context(|| format!("validate session model {}", selected.reference()))?;
 	Ok(selected)
 }
 

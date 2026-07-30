@@ -32,6 +32,11 @@
   join. Descriptor hashing uses cancellable async chunks.
 - Inventory skips corrupt or unavailable candidates and retains bounded
   per-entry diagnostics.
+- `inspect_installed` is read-only: it revalidates the managed record and
+  derives current static compatibility in memory without changing the
+  immutable manifest or loading MLX. Selection may combine positive current
+  static evidence with recorded runtime-only evidence, but current inspection
+  cannot erase the latter.
 - Interactive Hub status uses a cancellation-safe Hub-only snapshot scan. It
   does not inspect or hash caller-owned linked imports.
 - Owned snapshot paths and all link records stay under the selected Emelex

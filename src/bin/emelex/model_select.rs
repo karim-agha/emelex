@@ -26,30 +26,93 @@ pub(crate) async fn resolve(
 	stdout_palette: Palette,
 	stderr_palette: Palette,
 ) -> anyhow::Result<InstalledModel> {
+	resolve_with_scope(
+		emelex,
+		explicit,
+		required,
+		interactive,
+		stdout_palette,
+		stderr_palette,
+		CandidateScope::Compatible,
+	)
+	.await
+}
+
+/// Resolve a chat model from installed-model cardinality.
+pub(crate) async fn resolve_chat(
+	emelex: &Emelex,
+	explicit: Option<&ModelRef>,
+	required: &[TraitFilter],
+	interactive: bool,
+	stdout_palette: Palette,
+	stderr_palette: Palette,
+) -> anyhow::Result<InstalledModel> {
+	resolve_with_scope(
+		emelex,
+		explicit,
+		required,
+		interactive,
+		stdout_palette,
+		stderr_palette,
+		CandidateScope::Installed,
+	)
+	.await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateScope {
+	Compatible,
+	Installed,
+}
+
+impl CandidateScope {
+	const fn empty_message(self) -> &'static str {
+		match self {
+			Self::Compatible => "no compatible installed model",
+			Self::Installed => "no installed model",
+		}
+	}
+
+	const fn multiple_message(self) -> &'static str {
+		match self {
+			Self::Compatible => "multiple compatible models are installed",
+			Self::Installed => "multiple models are installed",
+		}
+	}
+}
+
+async fn resolve_with_scope(
+	emelex: &Emelex,
+	explicit: Option<&ModelRef>,
+	required: &[TraitFilter],
+	interactive: bool,
+	stdout_palette: Palette,
+	stderr_palette: Palette,
+	scope: CandidateScope,
+) -> anyhow::Result<InstalledModel> {
 	let models = model_manager(emelex)?;
 	if let Some(reference) = explicit {
 		let installed = models
 			.resolve(reference)
 			.with_context(|| format!("resolve installed model {reference}"))?;
-		validate_traits(&installed, required)?;
+		validate_installed_traits(models, &installed, required)?;
 		return Ok(installed);
 	}
 	if let Some(reference) = &emelex.config().default_model {
 		match models.resolve(reference) {
-			Ok(installed) => {
-				if let Some(warning) = configured_default_trait_warning(
-					reference,
-					installed.manifest().traits(),
-					required,
-					interactive,
-				)? {
+			Ok(installed) => match validate_installed_traits(models, &installed, required) {
+				Ok(()) => return Ok(installed),
+				Err(error) if interactive => {
+					let warning = configured_default_warning(reference, &error);
 					output::stderr_line(
 						&stderr_palette.yellow(&output::terminal_safe_inline(&warning)),
 					)?;
-				} else {
-					return Ok(installed);
 				}
-			}
+				Err(error) => {
+					return Err(error)
+						.with_context(|| format!("validate configured default model {reference}"));
+				}
+			},
 			Err(error) if interactive => {
 				let message = format!("configured default {reference} is unavailable: {error}");
 				let message = output::terminal_safe_inline(&message);
@@ -62,78 +125,139 @@ pub(crate) async fn resolve(
 		}
 	}
 
-	let compatible = newest_compatible(emelex, required)?;
-	match compatible.as_slice() {
-		[only] => Ok(only.clone()),
-		[] if interactive => onboard(emelex, required, stdout_palette, stderr_palette).await,
-		[] => bail!(
-			"no compatible installed model; run `emelex hub search --require \
-			 acceleration:mlx`, then `emelex hub download [NAMESPACE/]REPO`, or pass \
-			 `--model`"
+	let candidates = match scope {
+		CandidateScope::Compatible => newest_compatible(models, required)?,
+		CandidateScope::Installed => newest_installed(models)?,
+	};
+	match selection_action(candidates.len(), interactive) {
+		SelectionAction::SelectOnly => {
+			let only = candidates
+				.first()
+				.context("single-model selection lost its candidate")?
+				.clone();
+			validate_installed_traits(models, &only, required)?;
+			Ok(only)
+		}
+		SelectionAction::Onboard => {
+			onboard(
+				emelex,
+				required,
+				stdout_palette,
+				stderr_palette,
+				scope.empty_message(),
+			)
+			.await
+		}
+		SelectionAction::Missing => bail!(
+			"{}; run `emelex hub search`, then `emelex hub download [NAMESPACE/]REPO`, or pass \
+			 `--model`",
+			scope.empty_message()
 		),
-		_many if !interactive => bail!(
-			"multiple compatible models are installed; pass `--model [NAMESPACE/]REPO` \
-			 or set one with `emelex models default [NAMESPACE/]REPO`"
+		SelectionAction::RequireExplicit => bail!(
+			"{}; pass `--model [NAMESPACE/]REPO` or set one with `emelex models default \
+			 [NAMESPACE/]REPO`",
+			scope.multiple_message()
 		),
-		many => {
-			let labels = many
-				.iter()
-				.map(|model| {
-					let weights = model
-						.manifest()
-						.traits()
-						.sizing
-						.as_ref()
-						.and_then(|sizing| sizing.weights_bytes)
-						.map_or_else(|| "unknown".to_string(), bytes);
-					format!(
-						"{} ({}, {})",
-						model.reference(),
-						weights,
-						trait_summary(model.manifest().traits())
-					)
-				})
-				.collect::<Vec<_>>();
-			let selected = dialoguer::Select::new()
-				.with_prompt("Choose an installed model")
-				.items(&labels)
-				.default(0)
-				.interact_opt()
-				.context("choose installed model")?
-				.context("model selection cancelled")?;
-			Ok(many[selected].clone())
+		SelectionAction::Prompt => {
+			let selected = prompt_for_installed_model(&candidates)?;
+			validate_installed_traits(models, &selected, required)?;
+			Ok(selected)
 		}
 	}
 }
 
+fn prompt_for_installed_model(candidates: &[InstalledModel]) -> anyhow::Result<InstalledModel> {
+	let labels = candidates
+		.iter()
+		.map(|model| {
+			let weights = model
+				.manifest()
+				.traits()
+				.sizing
+				.as_ref()
+				.and_then(|sizing| sizing.weights_bytes)
+				.map_or_else(|| "unknown".to_string(), bytes);
+			format!(
+				"{} ({}, {})",
+				model.reference(),
+				weights,
+				trait_summary(model.manifest().traits())
+			)
+		})
+		.collect::<Vec<_>>();
+	let selected = dialoguer::Select::new()
+		.with_prompt("Choose an installed model")
+		.items(&labels)
+		.default(0)
+		.interact_opt()
+		.context("choose installed model")?
+		.context("model selection cancelled")?;
+	candidates
+		.get(selected)
+		.context("model selector returned an invalid index")
+		.cloned()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionAction {
+	Onboard,
+	Missing,
+	SelectOnly,
+	Prompt,
+	RequireExplicit,
+}
+
+const fn selection_action(candidate_count: usize, interactive: bool) -> SelectionAction {
+	match (candidate_count, interactive) {
+		(0, true) => SelectionAction::Onboard,
+		(0, false) => SelectionAction::Missing,
+		(1, _) => SelectionAction::SelectOnly,
+		(_, true) => SelectionAction::Prompt,
+		(_, false) => SelectionAction::RequireExplicit,
+	}
+}
+
 fn newest_compatible(
-	emelex: &Emelex,
+	models: &ModelManager,
 	required: &[TraitFilter],
 ) -> anyhow::Result<Vec<InstalledModel>> {
 	let mut newest = BTreeMap::<ModelRef, InstalledModel>::new();
-	for installed in model_manager(emelex)?
-		.list()
-		.context("list installed models")?
-	{
+	for installed in models.list().context("list installed models")? {
 		if !required
 			.iter()
 			.all(|filter| installed.manifest().traits().satisfies(filter))
 		{
 			continue;
 		}
-		match newest.get(installed.reference()) {
-			Some(current)
-				if current.manifest().installed_at() >= installed.manifest().installed_at() => {}
-			_ => {
-				newest.insert(installed.reference().clone(), installed);
-			}
-		}
+		insert_newest(&mut newest, installed);
 	}
 	Ok(newest.into_values().collect())
 }
 
-fn validate_traits(installed: &InstalledModel, required: &[TraitFilter]) -> anyhow::Result<()> {
-	let missing = missing_traits(installed.manifest().traits(), required);
+fn newest_installed(models: &ModelManager) -> anyhow::Result<Vec<InstalledModel>> {
+	let mut newest = BTreeMap::<ModelRef, InstalledModel>::new();
+	for installed in models.list().context("list installed models")? {
+		insert_newest(&mut newest, installed);
+	}
+	Ok(newest.into_values().collect())
+}
+
+fn insert_newest(newest: &mut BTreeMap<ModelRef, InstalledModel>, installed: InstalledModel) {
+	match newest.get(installed.reference()) {
+		Some(current)
+			if current.manifest().installed_at() >= installed.manifest().installed_at() => {}
+		_ => {
+			newest.insert(installed.reference().clone(), installed);
+		}
+	}
+}
+
+pub(crate) fn validate_installed_traits(
+	models: &ModelManager,
+	installed: &InstalledModel,
+	required: &[TraitFilter],
+) -> anyhow::Result<()> {
+	let missing = missing_installed_traits(models, installed, required)?;
 	if missing.is_empty() {
 		Ok(())
 	} else {
@@ -145,33 +269,73 @@ fn validate_traits(installed: &InstalledModel, required: &[TraitFilter]) -> anyh
 	}
 }
 
-fn configured_default_trait_warning(
-	reference: &ModelRef,
-	traits: &ModelTraits,
+fn missing_installed_traits(
+	models: &ModelManager,
+	installed: &InstalledModel,
 	required: &[TraitFilter],
-	interactive: bool,
-) -> anyhow::Result<Option<String>> {
-	let missing = missing_traits(traits, required);
-	if missing.is_empty() {
-		return Ok(None);
+) -> anyhow::Result<Vec<String>> {
+	let recorded = installed.manifest().traits();
+	let current = models
+		.inspect_installed(installed)
+		.with_context(|| format!("inspect installed model {}", installed.reference()))?;
+	if !current.compatible {
+		bail!(
+			"model {} is no longer compatible: {}",
+			installed.reference(),
+			current.reasons.join("; ")
+		);
 	}
-	let message = format!(
-		"configured default {reference} lacks required trait(s): {}",
-		missing.join(", ")
-	);
-	if interactive {
-		Ok(Some(format!("{message}; choosing another model")))
+	Ok(missing_traits_with_current(
+		recorded,
+		&current.traits,
+		required,
+	))
+}
+
+fn missing_traits_with_current(
+	recorded: &ModelTraits,
+	current: &ModelTraits,
+	required: &[TraitFilter],
+) -> Vec<String> {
+	required
+		.iter()
+		.filter(|filter| !effective_traits_satisfy(recorded, current, filter))
+		.map(ToString::to_string)
+		.collect()
+}
+
+fn effective_traits_satisfy(
+	recorded: &ModelTraits,
+	current: &ModelTraits,
+	filter: &TraitFilter,
+) -> bool {
+	let requires_runtime_evidence = match filter.predicate() {
+		emelex::model::TraitPredicate::Capability(key) => {
+			matches!(
+				key.as_str(),
+				"input:image" | "input:audio" | "acceleration:mtp"
+			)
+		}
+		emelex::model::TraitPredicate::MinimumConfidence { confidence, .. } => {
+			*confidence == emelex::model::TraitConfidence::RuntimeVerified
+		}
+		emelex::model::TraitPredicate::MinimumMtp(stage) => {
+			*stage == emelex::model::MtpSupport::RuntimeVerified
+		}
+		_ => false,
+	};
+	if requires_runtime_evidence {
+		recorded.satisfies(filter)
 	} else {
-		bail!("{message}")
+		current.satisfies(filter)
 	}
 }
 
-fn missing_traits(traits: &ModelTraits, required: &[TraitFilter]) -> Vec<String> {
-	required
-		.iter()
-		.filter(|filter| !traits.satisfies(filter))
-		.map(ToString::to_string)
-		.collect()
+fn configured_default_warning(reference: &ModelRef, error: &anyhow::Error) -> String {
+	format!(
+		"configured default {reference} cannot be used: {error:#}; continuing with installed-model \
+		 selection"
+	)
 }
 
 #[allow(
@@ -183,11 +347,11 @@ async fn onboard(
 	required: &[TraitFilter],
 	stdout_palette: Palette,
 	stderr_palette: Palette,
+	empty_message: &str,
 ) -> anyhow::Result<InstalledModel> {
-	output::stderr_line(
-		&stderr_palette
-			.dim("no compatible installed model; exploring visible Hugging Face MLX checkpoints"),
-	)?;
+	output::stderr_line(&stderr_palette.dim(&format!(
+		"{empty_message}; exploring visible Hugging Face MLX checkpoints"
+	)))?;
 	let query = dialoguer::Input::<String>::new()
 		.with_prompt("Optional Hugging Face search text")
 		.allow_empty(true)
@@ -335,7 +499,7 @@ async fn onboard(
 						}
 						Err(error) => return Err(error),
 					};
-					match validate_traits(&installed, required) {
+					match validate_installed_traits(manager, &installed, required) {
 						Ok(()) => break 'pages (installed, reference),
 						Err(error) => {
 							certification_failed = true;
@@ -558,17 +722,48 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn interactive_default_trait_mismatch_continues_but_noninteractive_fails() {
+	fn interactive_default_failure_warning_continues_selection() {
 		let reference = ModelRef::parse("owner/model").expect("model reference");
-		let required = [TraitFilter::parse("input:image").expect("trait filter")];
-		let warning =
-			configured_default_trait_warning(&reference, &ModelTraits::default(), &required, true)
-				.expect("interactive policy")
-				.expect("warning");
-		assert!(warning.contains("choosing another model"));
+		let error = anyhow::anyhow!("model owner/model lacks required trait(s): input:image");
+		let warning = configured_default_warning(&reference, &error);
+
+		assert!(warning.contains("input:image"));
+		assert!(warning.contains("installed-model selection"));
+	}
+
+	#[test]
+	fn installed_cardinality_drives_automatic_and_interactive_selection() {
+		assert_eq!(selection_action(0, true), SelectionAction::Onboard);
+		assert_eq!(selection_action(0, false), SelectionAction::Missing);
+		assert_eq!(selection_action(1, true), SelectionAction::SelectOnly);
+		assert_eq!(selection_action(1, false), SelectionAction::SelectOnly);
+		assert_eq!(selection_action(2, true), SelectionAction::Prompt);
+		assert_eq!(selection_action(2, false), SelectionAction::RequireExplicit);
+	}
+
+	#[test]
+	fn current_static_traits_fill_stale_manifest_gaps() {
+		let mut recorded = ModelTraits::default();
+		let mut current = ModelTraits::default();
+		current.tasks.insert(emelex::model::Task::ToolUse);
+		let required = [TraitFilter::parse("interaction:tools").expect("tool trait")];
+
+		assert!(missing_traits_with_current(&recorded, &current, &required).is_empty());
+		recorded.tasks.insert(emelex::model::Task::ToolUse);
+		assert_eq!(
+			missing_traits_with_current(&recorded, &ModelTraits::default(), &required),
+			["interaction:tools"]
+		);
+	}
+
+	#[test]
+	fn recorded_runtime_traits_survive_current_static_reinspection() {
+		let mut recorded = ModelTraits::default();
+		recorded.input.insert(emelex::model::Modality::Image);
+		let required = [TraitFilter::parse("input:image").expect("image trait")];
+
 		assert!(
-			configured_default_trait_warning(&reference, &ModelTraits::default(), &required, false)
-				.is_err()
+			missing_traits_with_current(&recorded, &ModelTraits::default(), &required).is_empty()
 		);
 	}
 
@@ -590,6 +785,14 @@ mod tests {
 				remote_onboarding_requirement(&required).expect("remote onboarding mapping");
 			assert_eq!(mapped.as_str(), remote);
 		}
+	}
+
+	#[test]
+	fn chat_onboarding_preserves_required_tool_capability() {
+		let required = TraitFilter::parse("interaction:tools").expect("tool capability");
+		let mapped = remote_onboarding_requirement(&required).expect("remote onboarding mapping");
+
+		assert_eq!(mapped.as_str(), "interaction:tools");
 	}
 
 	#[test]

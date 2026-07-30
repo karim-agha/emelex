@@ -59,14 +59,17 @@ kill and reap for an active shell command. Human cancellation flushes buffered
 Markdown and resets terminal styling before returning the cancellation error.
 
 `hub capabilities` is the source of truth for explicit remote filters. Every
-CLI search also applies Hugging Face's MLX catalog scope and local Metal/storage
-fit. Human results use compact multi-line model cards showing exact-revision
-download state and validated quantization. Because every result is already
-MLX-scoped, cards omit a redundant runtime row and show MTP separately when
-advertised. On a human terminal, those cards become one inline, height-bounded
-viewport on stdout: arrow keys move the selection rail through the displayed
-results, Enter downloads that exact revision, and Escape or `q` settles the
-results without downloading. No second compact selector is appended.
+CLI search also requires remote tool-use evidence, applies Hugging Face's MLX
+catalog scope, and enforces local Metal/storage fit. Zero-installed chat
+onboarding keeps that tool-use requirement. These are CLI additions; library
+`HubSearch` keeps caller-selected requirements generic. Human results use
+compact multi-line model cards showing exact-revision download state and
+validated quantization. Because every result is already MLX-scoped, cards omit
+a redundant runtime row and show MTP separately when advertised. On a human
+terminal, those cards become one inline, height-bounded viewport on stdout:
+arrow keys move the selection rail through the displayed results, Enter
+downloads that exact revision, and Escape or `q` settles the results without
+downloading. No second compact selector is appended.
 The viewport reserves one physical cursor row, remeasures its prior frame
 after terminal resizes, and reads Ctrl-C as a cancellation key instead of
 raising an interrupt inside raw input cleanup.
@@ -123,7 +126,14 @@ chat additionally require `interaction:reasoning_history`, because later
 rounds must preserve prior reasoning. One-shot `--thinking` overrides are
 resolved once and passed consistently to selection, model loading, and the
 request. Chat `--thinking auto` keeps resolved configuration, matching
-one-shot generation semantics.
+one-shot generation semantics. For a new chat without `--model` or a configured
+default, selection groups healthy snapshots by stable model reference and keeps
+the newest from each group. One installed reference is automatic; multiple
+references open the existing arrow selector on a human terminal, while
+redirected and JSON invocations require an explicit model. Capability
+validation follows selection, combining current static inspection evidence
+with runtime-only facts recorded in the immutable manifest. Zero installed
+references alone enters Hub onboarding.
 
 Closing chat queues idempotent distillation and returns without loading or
 running a memory model. `/compact` likewise only queues deferred work because
