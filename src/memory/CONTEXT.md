@@ -47,6 +47,12 @@
   commits run on blocking workers. The adapter is poisoned before its first
   await and disarmed only after full reconciliation; dropping a run future
   forbids reuse and clean-close distillation until resume/recovery.
+- `DurableAgentSession` can narrow enabled tools between turns, but only within
+  its immutable snapshotted registry. This subset is process-local, resets to
+  all authorized tools on fresh resume, never changes the snapshot, and never
+  bypasses one-shot approval. Disabled declarations may remain in a request
+  only when complete historical tool protocol requires them; execution remains
+  denied.
 - Resume automatically closes a tool-free interrupted active turn. Pending
   batches retain exact completed results, mark planned calls not executed, and
   never reinvoke tools. Started calls without results require explicit

@@ -17,6 +17,7 @@
 use std::process::ExitCode;
 
 pub(crate) mod args;
+pub(crate) mod chat_activity;
 pub(crate) mod chat_cmd;
 pub(crate) mod doctor_cmd;
 pub(crate) mod generate_cmd;

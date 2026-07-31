@@ -15,6 +15,13 @@ validated tools, and keeps one complete ordered in-memory conversation.
   enablement, and effective configurable ceilings. It deliberately excludes
   the one-shot approval policy. The built session exposes the same resolved
   value through `authority_snapshot`.
+- `AgentSession::available_tools` lists that immutable tool-authority ceiling.
+  Every available name starts in the process-local `enabled_tools` subset.
+  `set_enabled_tools` atomically replaces only that subset and rejects any name
+  outside the ceiling with typed `AgentError::ToolUnavailable`; it never changes
+  the authority snapshot. A disabled definition already referenced by committed
+  or current-turn history remains in generation requests for valid replay, but
+  the execution gate still returns a synthetic error before approval or invoke.
 - `AgentSession::run_turn` streams typed `AgentEvent` values through an
   in-order callback and returns an `AgentTurn`. `run_message` is the same core
   operation for text, image, or audio user content. Encoded video fails closed
@@ -66,8 +73,10 @@ Every model-produced tool call is treated as an untrusted proposal. The
 harness validates its registered name and JSON Schema arguments, replaces its
 provider-local ID with a UUIDv7, and preserves that ID through approval,
 execution, events, assistant history, and the matching tool result. A tool-call
-batch enters history only when every call has one matching result. Once any
-tool may have run, a failure checkpoints a structurally complete
+whose registered name is currently disabled receives a synthetic unavailable
+result without reaching approval or execution. A tool-call batch enters history
+only when every call has one matching result. Once any tool may have run, a
+failure checkpoints a structurally complete
 assistant-call/result batch into history so retry cannot silently repeat host
 effects. Failures before invocation roll back the proposed batch. Resumed
 history rejects duplicate, mismatched, unresolved, or declaration-free calls.

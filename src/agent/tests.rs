@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::{
-	collections::VecDeque,
+	collections::{BTreeSet, VecDeque},
 	os::unix::fs::MetadataExt as _,
 	pin::Pin,
 	sync::{
@@ -1257,6 +1257,74 @@ fn file_tools_remain_when_shell_is_authoritatively_disabled() {
 }
 
 #[test]
+fn all_authorized_tools_begin_enabled_and_available() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let model = Arc::new(FakeModel::new(Vec::new()));
+	let session = builder(model, directory.path())
+		.tool(Arc::new(EchoTool {
+			invocations: Arc::new(AtomicUsize::new(0)),
+			approval: false,
+		}))
+		.tool(Arc::new(FatalTool))
+		.build()
+		.expect("session");
+	let available = session
+		.available_tools()
+		.map(|definition| definition.name.as_str())
+		.collect::<Vec<_>>();
+
+	assert_eq!(available, vec!["echo", "fatal"]);
+	assert_eq!(
+		session.enabled_tools(),
+		&BTreeSet::from(["echo".to_string(), "fatal".to_string()])
+	);
+}
+
+#[test]
+fn unknown_enabled_tool_rejection_is_atomic() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let model = Arc::new(FakeModel::new(Vec::new()));
+	let mut session = builder(model, directory.path())
+		.tool(Arc::new(EchoTool {
+			invocations: Arc::new(AtomicUsize::new(0)),
+			approval: false,
+		}))
+		.build()
+		.expect("session");
+	let original = session.enabled_tools().clone();
+
+	let error = session
+		.set_enabled_tools(BTreeSet::from(["echo".to_string(), "missing".to_string()]))
+		.expect_err("unknown tool");
+
+	assert!(matches!(
+		error,
+		AgentError::ToolUnavailable { tool_name } if tool_name == "missing"
+	));
+	assert_eq!(session.enabled_tools(), &original);
+}
+
+#[test]
+fn enabled_tool_changes_do_not_change_authority_snapshot() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let model = Arc::new(FakeModel::new(Vec::new()));
+	let mut session = builder(model, directory.path())
+		.tool(Arc::new(EchoTool {
+			invocations: Arc::new(AtomicUsize::new(0)),
+			approval: false,
+		}))
+		.build()
+		.expect("session");
+	let authority = session.authority_snapshot().clone();
+
+	session
+		.set_enabled_tools(BTreeSet::new())
+		.expect("disable tools");
+
+	assert_eq!(session.authority_snapshot(), &authority);
+}
+
+#[test]
 fn disabled_tools_still_validate_recorded_authority_ceilings() {
 	let directory = tempfile::tempdir().expect("tempdir");
 	for seconds in [0, MAX_SHELL_TIMEOUT_SECONDS + 1] {
@@ -1609,6 +1677,191 @@ impl AgentModel for RecordingRoundsModel {
 			events.into_iter().map(Ok),
 		)))
 	}
+}
+
+#[tokio::test]
+async fn disabled_unused_tool_is_omitted_from_generation_request() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let requests = Arc::new(Mutex::new(Vec::new()));
+	let model = Arc::new(RecordingModel {
+		requests: Arc::clone(&requests),
+	});
+	let mut session = builder(model, directory.path())
+		.tool(Arc::new(EchoTool {
+			invocations: Arc::new(AtomicUsize::new(0)),
+			approval: false,
+		}))
+		.tool(Arc::new(FatalTool))
+		.build()
+		.expect("session");
+	session
+		.set_enabled_tools(BTreeSet::from(["echo".to_string()]))
+		.expect("disable fatal");
+
+	session
+		.run_turn("answer directly", &AgentCancellation::new(), |_| {})
+		.await
+		.expect("turn");
+
+	let requests = requests.lock().expect("requests");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(requests[0].tools.len(), 1);
+	assert_eq!(requests[0].tools[0].name, "echo");
+	drop(requests);
+}
+
+#[tokio::test]
+async fn disabled_tool_call_never_reaches_approval_or_invocation() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let requests = Arc::new(Mutex::new(Vec::new()));
+	let raw_call = echo_call("disabled-call", &serde_json::json!("value"));
+	let model = Arc::new(RecordingRoundsModel {
+		requests: Arc::clone(&requests),
+		rounds: Mutex::new(
+			vec![
+				vec![
+					GenerationEvent::ToolCall(raw_call.clone()),
+					GenerationEvent::Completed(response(
+						"",
+						vec![raw_call],
+						FinishReason::ToolCalls,
+					)),
+				],
+				vec![completed("answered without tools")],
+			]
+			.into(),
+		),
+	});
+	let invocations = Arc::new(AtomicUsize::new(0));
+	let mut session = builder(model, directory.path())
+		.tool(Arc::new(EchoTool {
+			invocations: Arc::clone(&invocations),
+			approval: true,
+		}))
+		.build()
+		.expect("session");
+	session
+		.set_enabled_tools(BTreeSet::new())
+		.expect("disable tools");
+	let mut events = Vec::new();
+
+	session
+		.run_turn("do not use tools", &AgentCancellation::new(), |event| {
+			events.push(event);
+		})
+		.await
+		.expect("turn");
+
+	assert_eq!(invocations.load(Ordering::Relaxed), 0);
+	assert!(
+		events
+			.iter()
+			.all(|event| !matches!(event, AgentEvent::ApprovalRequested { .. }))
+	);
+	assert!(
+		events
+			.iter()
+			.all(|event| !matches!(event, AgentEvent::ToolStarted { .. }))
+	);
+	assert!(matches!(
+		session.history()[2].content.first(),
+		Some(Content::Text(text)) if text.contains("unavailable")
+	));
+	let requests = requests.lock().expect("requests");
+	assert_eq!(requests.len(), 2);
+	assert!(requests[0].tools.is_empty());
+	assert_eq!(requests[1].tools.len(), 1);
+	assert_eq!(requests[1].tools[0].name, "echo");
+	drop(requests);
+}
+
+#[tokio::test]
+async fn reenabled_tool_is_advertised_and_invoked() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let requests = Arc::new(Mutex::new(Vec::new()));
+	let raw_call = echo_call("reenabled-call", &serde_json::json!("value"));
+	let model = Arc::new(RecordingRoundsModel {
+		requests: Arc::clone(&requests),
+		rounds: Mutex::new(
+			vec![
+				vec![
+					GenerationEvent::ToolCall(raw_call.clone()),
+					GenerationEvent::Completed(response(
+						"",
+						vec![raw_call],
+						FinishReason::ToolCalls,
+					)),
+				],
+				vec![completed("done")],
+			]
+			.into(),
+		),
+	});
+	let invocations = Arc::new(AtomicUsize::new(0));
+	let mut session = builder(model, directory.path())
+		.tool(Arc::new(EchoTool {
+			invocations: Arc::clone(&invocations),
+			approval: false,
+		}))
+		.build()
+		.expect("session");
+	session
+		.set_enabled_tools(BTreeSet::new())
+		.expect("disable tools");
+	session
+		.set_enabled_tools(BTreeSet::from(["echo".to_string()]))
+		.expect("reenable echo");
+
+	session
+		.run_turn("use echo", &AgentCancellation::new(), |_| {})
+		.await
+		.expect("turn");
+
+	assert_eq!(invocations.load(Ordering::Relaxed), 1);
+	let requests = requests.lock().expect("requests");
+	assert_eq!(requests[0].tools.len(), 1);
+	assert_eq!(requests[0].tools[0].name, "echo");
+	drop(requests);
+}
+
+#[tokio::test]
+async fn historical_disabled_tool_remains_declared_for_replay() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let requests = Arc::new(Mutex::new(Vec::new()));
+	let model = Arc::new(RecordingModel {
+		requests: Arc::clone(&requests),
+	});
+	let call_id = Uuid::now_v7().to_string();
+	let history = vec![
+		Message {
+			role: Role::Assistant,
+			tool_calls: vec![echo_call(&call_id, &serde_json::json!("value"))],
+			..Message::default()
+		},
+		Message::tool(&call_id, "stored-result"),
+	];
+	let mut session = builder(model, directory.path())
+		.history(history)
+		.tool(Arc::new(EchoTool {
+			invocations: Arc::new(AtomicUsize::new(0)),
+			approval: false,
+		}))
+		.build()
+		.expect("session");
+	session
+		.set_enabled_tools(BTreeSet::new())
+		.expect("disable tools");
+
+	session
+		.run_turn("continue", &AgentCancellation::new(), |_| {})
+		.await
+		.expect("turn");
+
+	let requests = requests.lock().expect("requests");
+	assert_eq!(requests.len(), 1);
+	assert_eq!(requests[0].tools.len(), 1);
+	assert_eq!(requests[0].tools[0].name, "echo");
+	drop(requests);
 }
 
 #[tokio::test]

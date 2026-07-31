@@ -27,7 +27,7 @@ use crate::{
 		MAX_TOTAL_TOOL_OUTPUT_BYTES, validate_history, validate_history_message,
 		validate_user_message,
 	},
-	generation::{Content, FinishReason, Message, Role, ToolCall},
+	generation::{Content, FinishReason, Message, Role, ToolCall, ToolDefinition},
 };
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -842,6 +842,33 @@ impl DurableAgentSession {
 	/// Current in-memory agent history.
 	pub fn history(&self) -> &[Message] {
 		self.agent.history()
+	}
+
+	/// Tools installed inside this Session's immutable authority boundary.
+	pub fn available_tools(&self) -> impl ExactSizeIterator<Item = &ToolDefinition> {
+		self.agent.available_tools()
+	}
+
+	/// Tool names currently allowed to execute in future turns.
+	///
+	/// This process-local subset never expands or mutates the durable authority
+	/// snapshot. New requests ordinarily advertise only this subset; declarations
+	/// required by complete historical tool protocol can remain visible but still
+	/// cannot execute. A newly resumed adapter starts with every available tool
+	/// enabled.
+	pub const fn enabled_tools(&self) -> &BTreeSet<String> {
+		self.agent.enabled_tools()
+	}
+
+	/// Replace the process-local tool subset used by future turns.
+	///
+	/// # Errors
+	///
+	/// Returns [`AgentError::ToolUnavailable`] when any requested name is not
+	/// part of this Session's immutable authority boundary. The prior subset is
+	/// retained on failure.
+	pub fn set_enabled_tools(&mut self, enabled: BTreeSet<String>) -> Result<(), AgentError> {
+		self.agent.set_enabled_tools(enabled)
 	}
 
 	/// Take the one-time interrupted-turn report produced while resuming.
@@ -3967,6 +3994,60 @@ mod tests {
 			store.session(session.id).unwrap().title.as_deref(),
 			Some("First turn")
 		);
+	}
+
+	#[test]
+	fn enabled_tool_subset_is_transient_and_snapshot_neutral() {
+		let (_directory, home, store) = store();
+		let workspace = tempfile::tempdir().unwrap();
+		let session = store.start_session(workspace.path(), None).unwrap();
+		let builder = bound_builder(
+			&store,
+			&home,
+			session.id,
+			workspace.path(),
+			Arc::new(NeverModel),
+		);
+		let authority = builder.authority_snapshot().unwrap();
+		let model_identity = authority.model_identity.clone().unwrap();
+		let snapshot =
+			SessionSnapshot::from_agent_authority(serde_json::json!({}), &authority).unwrap();
+		let mut durable = DurableAgentSession::resume(
+			store.clone(),
+			session.id,
+			workspace.path(),
+			builder,
+			snapshot.clone(),
+		)
+		.unwrap();
+		let available = durable
+			.available_tools()
+			.map(|definition| definition.name.clone())
+			.collect::<BTreeSet<_>>();
+
+		assert!(!available.is_empty());
+		assert_eq!(durable.enabled_tools(), &available);
+		durable.set_enabled_tools(BTreeSet::new()).unwrap();
+		assert!(durable.enabled_tools().is_empty());
+		assert_eq!(
+			store.session_snapshot(session.id).unwrap(),
+			Some(snapshot.clone())
+		);
+		durable.close().unwrap();
+
+		let resumed_builder =
+			AgentSessionBuilder::from_model(Arc::new(NeverModel), workspace.path())
+				.model_identity(model_identity);
+		let resumed = DurableAgentSession::resume(
+			store,
+			session.id,
+			workspace.path(),
+			resumed_builder,
+			snapshot,
+		)
+		.unwrap();
+
+		assert_eq!(resumed.enabled_tools(), &available);
 	}
 
 	#[test]

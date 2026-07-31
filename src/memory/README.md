@@ -75,6 +75,14 @@ restart-idempotently in small transactions; the final replay-visible
 assistant-call/result batch publishes atomically and removes the recoverable
 journal.
 
+The adapter also delegates an in-memory enabled-tool subset for attended chat.
+That subset may only remove or restore tools already present in the immutable
+authority snapshot; it cannot grant new authority or bypass approval. It is
+process-local rather than durable configuration, so a fresh resume starts with
+every snapshotted tool enabled. Historical declarations required to replay a
+complete prior tool round remain available to the model protocol, while the
+execution gate still rejects calls to a currently disabled tool.
+
 Lease renewal runs during inference and tool execution. Checkpoint, renewal,
 asset, and failed-turn persistence work executes on blocking workers; SQLite
 busy waits and fsync never run in the agent async poll. Title updates use the

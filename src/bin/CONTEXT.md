@@ -27,6 +27,25 @@
 - Interactive approval owns one nonblocking `/dev/tty` descriptor inside its
   future. Cancellation drops and closes it; no background terminal reader may
   outlive the approval call.
+- Attended chat owns one stderr `LiveRegion` only after line editing returns.
+  It becomes visible immediately after submission, advances from the same task
+  that polls the turn, and is cleared before stream output or approval input.
+  Completion, cancellation, output failure, and agent failure all clear it;
+  JSON and non-terminal stderr never create it.
+- Modified Return bindings insert a newline while plain Return remains submit.
+  Because Unix terminals do not encode Shift-Return uniformly, the editor also
+  accepts Rustyline's LF, Alt-Return, and Alt-LF encodings. Message text is
+  blank-checked without trimming; only single-line input can dispatch a slash
+  command. Rustyline uses `Behavior::PreferTerm`, keeping prompt redraws off a
+  redirected assistant-output stdout stream.
+- `/tools` may replace the enabled subset only between turns and only with
+  names from immutable Session authority. Deselected tools are neither newly
+  advertised nor executable, except that a historical declaration may remain
+  visible solely to preserve complete replay protocol. Approval stays
+  independent. The inline selector preserves exact tool names, documents its
+  movement/toggle/apply/cancel keys, treats Ctrl-C as chat exit, and leaves the
+  old subset unchanged on cancellation. The subset is process-local and resets
+  on fresh resume.
 - `shell`, `web_search`, and `web_fetch` approval arguments must fit as complete
   canonical JSON within the 2,048-character preview. Oversized actions are
   automatically denied and must be split. Other tool previews preserve bounded

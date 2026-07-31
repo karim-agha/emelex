@@ -19,9 +19,15 @@ Invariants:
    response containing answer text or tool calls becomes history.
 4. Provider tool-call IDs are untrusted. The session mints UUIDv7 IDs and
    prevents reuse within its complete history.
-5. Tool definitions are immutable after build and validated against the same
-   bounded JSON Schema vocabulary used by generation. Proposed arguments are
-   rechecked before dispatch.
+5. Tool definitions and implementations are immutable after build and form the
+   durable authority ceiling. All available names begin enabled. The active
+   name subset may shrink or restore only names inside that ceiling; replacement
+   rejects unknown names atomically and never changes the authority snapshot.
+   Generation advertises active definitions plus disabled definitions needed to
+   replay committed or current-turn calls. The execution gate rejects every
+   disabled call with a synthetic result before approval or invocation.
+   Definitions use the same bounded JSON Schema vocabulary as generation, and
+   proposed arguments are rechecked before dispatch.
 6. Assistant tool calls and their results commit as one complete ordered batch.
    Before invocation, failures roll the batch back. Once an invocation may have
    produced effects, failures checkpoint a matching result for every call so

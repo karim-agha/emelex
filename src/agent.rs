@@ -672,6 +672,12 @@ pub enum AgentError {
 		/// Tool-provided diagnostic.
 		message: String,
 	},
+	/// A requested tool is unavailable to this Session's active subset.
+	#[error("tool {tool_name:?} is unavailable in this agent session")]
+	ToolUnavailable {
+		/// Unavailable tool name.
+		tool_name: String,
+	},
 	/// Turn hit its configured model-round ceiling.
 	#[error("agent turn exceeded its {limit}-round limit")]
 	MaxModelRounds {
@@ -1189,12 +1195,14 @@ impl AgentSessionBuilder {
 				))
 			},
 		)?;
+		let enabled_tools = tools.keys().cloned().collect();
 		Ok(AgentSession {
 			model: self.model,
 			native_capabilities: self.native_capabilities,
 			workspace,
 			approval_policy: self.approval_policy,
 			tools,
+			enabled_tools,
 			history: self.history,
 			issued_tool_ids,
 			authority,
@@ -1411,6 +1419,7 @@ pub struct AgentSession {
 	workspace: Arc<workspace::WorkspaceRoot>,
 	approval_policy: Arc<dyn ApprovalPolicy>,
 	tools: BTreeMap<String, RegisteredTool>,
+	enabled_tools: BTreeSet<String>,
 	history: Vec<Message>,
 	issued_tool_ids: BTreeSet<String>,
 	authority: AgentAuthoritySnapshot,
@@ -1474,6 +1483,39 @@ impl AgentSession {
 	/// workspace or tool-definition drift during construction.
 	pub const fn authority_snapshot(&self) -> &AgentAuthoritySnapshot {
 		&self.authority
+	}
+
+	/// Tool definitions inside this Session's immutable authority boundary.
+	pub fn available_tools(&self) -> impl ExactSizeIterator<Item = &ToolDefinition> {
+		self.tools.values().map(|registered| &registered.definition)
+	}
+
+	/// Tool names currently enabled for new calls.
+	pub const fn enabled_tools(&self) -> &BTreeSet<String> {
+		&self.enabled_tools
+	}
+
+	/// Replace the active tool subset without changing durable authority.
+	///
+	/// Disabled tools referenced by existing complete history remain declared to
+	/// the model for replay validity, but cannot execute. All requested names are
+	/// validated before the current subset changes.
+	///
+	/// # Errors
+	///
+	/// Returns [`AgentError::ToolUnavailable`] when any requested name is outside
+	/// this Session's immutable authority.
+	pub fn set_enabled_tools(&mut self, enabled_tools: BTreeSet<String>) -> Result<(), AgentError> {
+		if let Some(tool_name) = enabled_tools
+			.iter()
+			.find(|tool_name| !self.tools.contains_key(tool_name.as_str()))
+		{
+			return Err(AgentError::ToolUnavailable {
+				tool_name: tool_name.clone(),
+			});
+		}
+		self.enabled_tools = enabled_tools;
+		Ok(())
 	}
 
 	/// Run one text-only user turn.
@@ -1909,6 +1951,12 @@ impl AgentSession {
 		turn_messages: &[Message],
 		effective_options: GenerationOptions,
 	) -> Result<GenerationRequest, AgentError> {
+		let replay_tools = self
+			.history
+			.iter()
+			.chain(turn_messages)
+			.flat_map(|message| message.tool_calls.iter().map(|call| call.name.as_str()))
+			.collect::<BTreeSet<_>>();
 		let mut messages = Vec::with_capacity(self.history.len() + turn_messages.len());
 		messages.extend(self.history.iter().cloned());
 		messages.extend(turn_messages.iter().cloned());
@@ -1917,8 +1965,12 @@ impl AgentSession {
 			messages,
 			tools: self
 				.tools
-				.values()
-				.map(|registered| registered.definition.clone())
+				.iter()
+				.filter(|(name, _)| {
+					self.enabled_tools.contains(name.as_str())
+						|| replay_tools.contains(name.as_str())
+				})
+				.map(|(_, registered)| registered.definition.clone())
 				.collect(),
 			options: effective_options,
 		};
@@ -2367,6 +2419,26 @@ impl AgentSession {
 					checkpointed_result: failure.checkpointed_result,
 				});
 		};
+		if !self.enabled_tools.contains(&call.name) {
+			let unavailable = AgentError::ToolUnavailable {
+				tool_name: call.name.clone(),
+			};
+			return self
+				.finalize_tool_output(
+					call,
+					ToolOutput::error(unavailable.to_string()),
+					total_output_bytes,
+					emit,
+					persist,
+					turn_id,
+				)
+				.await
+				.map_err(|failure| ToolCallFailure {
+					error: failure.error,
+					effect_possible: false,
+					checkpointed_result: failure.checkpointed_result,
+				});
+		}
 		if !tool_arguments_match(&registered.definition, &call.arguments) {
 			return self
 				.finalize_tool_output(

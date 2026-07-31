@@ -52,6 +52,27 @@ provider as unavailable rather than pretending the query had no matches.
 At runtime, request output tokens are capped again by the loaded checkpoint's
 effective output ceiling. Immutable requested Session semantics stay
 auditable, but cannot re-expand a model-clamped load policy.
+
+Attended chat draws an immediate animated status on stderr after a message is
+submitted, changes it for active tool execution, and clears it before streamed
+answer/reasoning text, tool reports, approvals, or terminal results. JSON and
+non-interactive chat never emit that live region. Rustyline prefers the attended
+terminal, so redirected stdout receives assistant output rather than prompt
+redraws.
+Shift-Return inserts a newline when the terminal preserves the modifier;
+Rustyline-decodable LF and Alt-Return variants provide the same operation while
+plain Return submits. Multiline message bytes, including authored outer
+whitespace, reach the agent unchanged. Slash commands remain single-line.
+
+Interactive `/tools` opens an arrow-and-checkbox execution selector for tools
+already installed in the Session's immutable authority. Space toggles, Enter
+applies, Escape cancels, and Ctrl-C exits chat without applying. Its
+process-local selection applies to future turns until chat exits, can restore a
+previously deselected authorized tool, and can never add a tool excluded when
+the Session was built. Historical declarations may remain model-visible only
+when replay protocol requires them; their deselected execution remains denied.
+Selection does not bypass one-shot approval. Fresh resume begins with every
+snapshotted tool enabled; the durable authority snapshot itself never changes.
 Ctrl-C cooperatively cancels one-shot raw generation and waits for its
 inference job to leave the model thread. One-shot agent generation likewise
 awaits native model-thread completion and tool cleanup, including process-group
