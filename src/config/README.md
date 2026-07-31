@@ -41,6 +41,16 @@ Resolved `inference.max_tokens` must not exceed
 `thinking = "auto"` inherits an explicit client default; without one, Emelex
 sends `enable_thinking = false`.
 
+For ordinary library loads and Hub fit checks, `inference.context_tokens` is
+the resolved workload context. Chat instead uses an explicit maximum-fit load
+policy on every new or resumed process: the configured value is the safe
+fallback when exact model sizing is unavailable, while complete sizing selects
+the largest context allowed by the bound model and current Metal budget. The
+effective runtime value is visible through the loaded Client and attended chat
+header; it is capacity, not a replacement for snapshotted sampling, output, or
+tool semantics. Attended chat also supplies thinking-on as the default resolved
+by `auto`; explicit off remains off.
+
 Memory recall is byte-bounded, not estimated as tokens:
 `memory.recall_bytes` caps the serialized JSON injected into the system
 context. Host-shell timeout defaults to 120 seconds and is limited to the same

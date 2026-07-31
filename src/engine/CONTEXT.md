@@ -49,6 +49,10 @@
   and nothing else). Committed is always a prefix of emitted — they
   diverge on purpose (an EOS or cancelled token is emitted but never
   fed).
+- **Generation progress**: prompt progress follows exact rendering/tokenization
+  and precedes context rejection; prefill progress follows cache resolution;
+  decode progress advances exactly with the emitted ledger. Display callbacks
+  may repeat an emitted ordinal but cannot create usage.
 - **MtpState / MtpCaches**: `MtpCaches` is the MTP module's live working
   cache (v1: one full-attention KvCache); `MtpState` is the poolable
   snapshot — caches + `pairs_fed` + the detached frontier — aligned to

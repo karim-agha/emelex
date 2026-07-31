@@ -13,15 +13,22 @@ use crate::{
 };
 
 fn manager(config: Config) -> (tempfile::TempDir, ModelManager) {
+	manager_with_budget(config, 8_u64 << 30)
+}
+
+fn manager_with_budget(config: Config, budget: u64) -> (tempfile::TempDir, ModelManager) {
 	let directory = tempfile::tempdir().expect("temporary directory");
 	let home = EmelexHome::prepare(&directory.path().join("home")).expect("test Emelex home");
+	let manager = manager_at_home(home, config, budget);
+	(directory, manager)
+}
+
+fn manager_at_home(home: EmelexHome, config: Config, budget: u64) -> ModelManager {
 	let workload =
 		WorkloadProfile::new(1, config.inference.context_tokens).expect("valid workload");
-	let budget = 8_u64 << 30;
 	let hub = HubClient::with_fit_profile(config.hub.clone(), workload, budget)
 		.expect("profiled Hub client");
-	let manager = ModelManager::new(home, config, hub, budget).expect("model manager");
-	(directory, manager)
+	ModelManager::new(home, config, hub, budget).expect("model manager")
 }
 
 fn hub_transfer_identity() -> (HubModelId, ResolvedRevision) {
@@ -108,6 +115,13 @@ fn verified_local_traits(files: &[ModelFile]) -> ModelTraits {
 }
 
 fn manifest(files: Vec<ModelFile>) -> ModelManifest {
+	manifest_with_context(files, Some(32))
+}
+
+fn manifest_with_context(
+	files: Vec<ModelFile>,
+	max_context_tokens: Option<usize>,
+) -> ModelManifest {
 	let weight_bytes = files
 		.iter()
 		.filter(|file| file.path().ends_with(".safetensors"))
@@ -120,7 +134,7 @@ fn manifest(files: Vec<ModelFile>) -> ModelManifest {
 			weights_bytes: Some(weight_bytes),
 			estimated_residency_bytes: Some(weight_bytes + 1),
 			evaluated_context_tokens: Some(16),
-			max_context_tokens: Some(32),
+			max_context_tokens,
 		}),
 		..ModelTraits::default()
 	};
@@ -197,12 +211,230 @@ fn load_policy_resolves_set_clear_and_model_limits() {
 		.expect("valid resolved policy");
 	assert_eq!(policy.max_tokens, 4_096);
 	assert_eq!(policy.context_tokens, 4_096);
+	assert_eq!(policy.prompt_cache_tokens, 4_096);
+	assert_eq!(
+		policy.context_selection,
+		ContextSelectionProvenance::Configured
+	);
 	assert_eq!(policy.temperature, 0.0);
 	assert_eq!(policy.top_p, 0.5);
 	assert_eq!(policy.top_k, None);
 	assert_eq!(policy.seed, Some(42));
 	assert_eq!(policy.thinking, ThinkingMode::On);
 	assert_eq!(policy.reasoning_budget_tokens, Some(1_024));
+}
+
+#[test]
+fn maximum_context_builder_uses_the_last_context_selection() {
+	let fixed = ModelLoadOptions::default()
+		.maximum_context()
+		.context_tokens(512);
+	let maximum = ModelLoadOptions::default()
+		.context_tokens(512)
+		.maximum_context();
+
+	assert_eq!(
+		(
+			fixed.context_tokens,
+			fixed.maximum_context,
+			maximum.context_tokens,
+			maximum.maximum_context,
+		),
+		(Some(512), false, None, true)
+	);
+}
+
+#[test]
+fn fixed_context_preserves_full_cache_capacity_when_default_is_off() {
+	let (_directory, manager) = manager(Config::default());
+	let policy = manager
+		.resolve_load_policy(
+			&ModelTraits::default(),
+			&ModelLoadOptions::default()
+				.context_tokens(32_768)
+				.prompt_cache(false),
+		)
+		.expect("fixed context policy");
+
+	assert_eq!(
+		(
+			policy.context_tokens,
+			policy.prompt_cache,
+			policy.prompt_cache_tokens,
+			policy.context_selection,
+		),
+		(
+			32_768,
+			false,
+			32_768,
+			ContextSelectionProvenance::Configured,
+		)
+	);
+}
+
+#[test]
+fn fixed_context_cannot_use_the_adaptive_load_ceiling() {
+	let (directory, manager) = manager(Config::default());
+	let runtime = directory.path().join("runtime");
+	fs::create_dir(&runtime).expect("runtime directory");
+	let installed = InstalledModel::new(
+		runtime.clone(),
+		manifest_with_context(runtime_files(&runtime), Some(2_097_152)),
+	);
+
+	let error = manager
+		.resolve_installed_load_policy(
+			&installed,
+			&runtime,
+			&ModelLoadOptions::default().context_tokens(2_097_152),
+		)
+		.expect_err("fixed context limit");
+
+	assert!(error.to_string().contains("1..=1048576"));
+}
+
+#[test]
+fn maximum_context_load_policy_can_select_above_fixed_config_ceiling() {
+	let (directory, manager) = manager(Config::default());
+	let runtime = directory.path().join("runtime");
+	fs::create_dir(&runtime).expect("runtime directory");
+	let files = runtime_files(&runtime);
+	fs::write(
+		runtime.join("config.json"),
+		serde_json::to_vec(&serde_json::json!({
+			"model_type": "llama",
+			"hidden_size": 64,
+			"num_attention_heads": 4,
+			"num_hidden_layers": 4,
+			"num_key_value_heads": 2,
+			"head_dim": 16
+		}))
+		.expect("model config encoding"),
+	)
+	.expect("model config");
+	let manifest = manifest_with_context(files, Some(2_097_152));
+	let installed = InstalledModel::new(runtime.clone(), manifest);
+
+	let policy = manager
+		.resolve_installed_load_policy(
+			&installed,
+			&runtime,
+			&ModelLoadOptions::default().maximum_context(),
+		)
+		.expect("maximum context policy");
+
+	assert_eq!(policy.context_tokens, 2_097_152);
+	assert_eq!(
+		policy.prompt_cache_tokens,
+		crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS
+	);
+	assert_eq!(
+		policy.context_selection,
+		ContextSelectionProvenance::MaximumMachineFit
+	);
+}
+
+#[test]
+fn maximum_context_without_declared_model_limit_retains_configured_context() {
+	let (directory, manager) = manager(Config::default());
+	let runtime = directory.path().join("runtime");
+	fs::create_dir(&runtime).expect("runtime directory");
+	let files = runtime_files(&runtime);
+	let manifest = manifest_with_context(files, None);
+	let installed = InstalledModel::new(runtime.clone(), manifest);
+
+	let policy = manager
+		.resolve_installed_load_policy(
+			&installed,
+			&runtime,
+			&ModelLoadOptions::default().maximum_context(),
+		)
+		.expect("fallback context policy");
+
+	assert_eq!(
+		policy.context_tokens,
+		Config::default().inference.context_tokens
+	);
+	assert_eq!(policy.prompt_cache_tokens, policy.context_tokens);
+	assert_eq!(
+		policy.context_selection,
+		ContextSelectionProvenance::Configured
+	);
+}
+
+#[test]
+fn adaptive_cache_ceiling_covers_request_reenable_and_the_load_gate() {
+	let source = crate::engine::test_support::write_tiny_model(false).expect("tiny model");
+	let config_path = source.path().join("config.json");
+	let mut model_config: serde_json::Value =
+		serde_json::from_slice(&fs::read(&config_path).expect("tiny model config"))
+			.expect("valid tiny model config");
+	let maximum = 32_768;
+	model_config["max_position_embeddings"] = serde_json::json!(maximum);
+	fs::write(
+		&config_path,
+		serde_json::to_vec(&model_config).expect("model config encoding"),
+	)
+	.expect("model config update");
+	let plan = local_runtime_plan(source.path()).expect("runtime plan");
+	let files = snapshot_runtime_files(source.path(), &plan).expect("runtime file hashes");
+	let installed = InstalledModel::new(
+		source.path().to_path_buf(),
+		manifest_with_context(files, Some(maximum)),
+	);
+	let workload = WorkloadProfile::new(1, maximum).expect("valid workload");
+	let adaptive = inspect_directory_with_prompt_cache_tokens(
+		installed.reference().clone(),
+		source.path(),
+		workload,
+		u64::MAX,
+		crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS,
+	)
+	.expect("adaptive compatibility estimate");
+	let full_cache = inspect_directory(
+		installed.reference().clone(),
+		source.path(),
+		workload,
+		u64::MAX,
+	)
+	.expect("full-cache compatibility estimate");
+	let ordinary_at_adaptive_budget = inspect_directory(
+		installed.reference().clone(),
+		source.path(),
+		workload,
+		adaptive.fit.required_bytes,
+	)
+	.expect("ordinary compatibility estimate");
+	let mut config = Config::default();
+	config.inference.prompt_cache = false;
+	let (_home, manager) = manager_with_budget(config, adaptive.fit.required_bytes);
+	let policy = manager
+		.resolve_installed_load_policy(
+			&installed,
+			source.path(),
+			&ModelLoadOptions::default().maximum_context(),
+		)
+		.expect("maximum-context policy");
+
+	manager
+		.validate_load_compatibility(&installed, source.path(), &policy)
+		.expect("load compatibility gate");
+	assert!(full_cache.fit.required_bytes > adaptive.fit.required_bytes);
+	assert!(!ordinary_at_adaptive_budget.compatible);
+	assert_eq!(
+		(
+			policy.context_tokens,
+			policy.prompt_cache,
+			policy.prompt_cache_tokens,
+			policy.context_selection,
+		),
+		(
+			maximum,
+			false,
+			crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS,
+			ContextSelectionProvenance::MaximumMachineFit,
+		)
+	);
 }
 
 #[test]

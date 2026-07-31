@@ -28,6 +28,15 @@ output-only. This keeps future report fields semver-compatible.
 
 Static inspection fails closed on missing or unsupported architecture,
 quantization, tokenizer, weight layout, attention geometry, or machine fit.
+The same architecture-specific fit estimator can select the largest positive
+context under an explicit ceiling and Metal working-set budget. Selection uses
+a monotonic binary search over total prompt-plus-generation context; it reads
+bounded `config.json` once and does not repeatedly parse tokenizer or weight
+artifacts. Prompt-cache sizing consumes an exact aggregate token ceiling.
+Public static inspection and fixed loads reserve the full context because a
+request can enable caching even when the client default is off. Adaptive
+maximum-context selection caps the cache pool at 16,384 aggregate tokens and
+uses that same capacity for selection, load inspection, and client construction.
 An owned immutable checkpoint snapshot first pins the model directory
 descriptor, then owns `config.json` bytes and every selected shard descriptor
 opened relative to it through MLX materialization and MTP certification. It

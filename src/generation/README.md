@@ -35,3 +35,8 @@ receiver immediately, wakes any producer blocked by backpressure, and stops the
 engine cooperatively. `cancel_and_wait` additionally waits until the submitted
 job has left the model's dedicated inference thread. Dropping that wait does
 not consume its completion observation; a caller may await it again.
+
+`GenerationEvent::Progress` carries exact phase-tagged prompt, cache, and
+completion-token state. Cache usage is `None` until lookup completes. A prompt
+snapshot can therefore precede a terminal context-window error without
+pretending a cache decision was made.

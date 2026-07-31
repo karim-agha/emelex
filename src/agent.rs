@@ -28,8 +28,9 @@ pub use workspace::{
 use crate::{
 	Client, Error,
 	generation::{
-		Content, FinishReason, GenerationEvent, GenerationOptions, GenerationRequest,
-		GenerationResponse, GenerationStream, Message, Role, ToolCall, ToolDefinition, Usage,
+		Content, FinishReason, GenerationEvent, GenerationOptions, GenerationProgress,
+		GenerationRequest, GenerationResponse, GenerationStream, Message, Role, ToolCall,
+		ToolDefinition, Usage,
 	},
 	model::ModelSnapshotId,
 };
@@ -485,6 +486,15 @@ pub enum AgentEvent {
 		turn_id: Uuid,
 		/// One-based round within this turn.
 		round: usize,
+	},
+	/// Exact cumulative progress for one native model round.
+	ModelProgress {
+		/// Durable turn identifier.
+		turn_id: Uuid,
+		/// One-based round within this turn.
+		round: usize,
+		/// Native prompt, cache, and completion-token progress.
+		progress: GenerationProgress,
 	},
 	/// Lossless answer-text delta.
 	TextDelta {
@@ -2026,6 +2036,13 @@ impl AgentSession {
 					));
 				}
 				match item? {
+					GenerationEvent::Progress(progress) => {
+						emit.emit(AgentEvent::ModelProgress {
+							turn_id,
+							round,
+							progress,
+						})?;
+					}
 					GenerationEvent::Text(text) => {
 						append_model_delta(
 							&mut streamed_text,

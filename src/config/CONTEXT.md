@@ -1,17 +1,23 @@
 # Configuration context
 
-`Config` is a fully resolved immutable invocation snapshot. The agent records
-the selected model reference and exact content-addressed installed model in its
+`Config` is a fully resolved immutable invocation snapshot for requested
+generation behavior, authority, and resource fallbacks. The agent records the
+selected model reference and exact content-addressed installed model in its
 Session before its first model/tool action, so resume behavior remains
-auditable.
+auditable. Chat's maximum-fit context policy is process-local capacity
+resolution: `inference.context_tokens` remains its safe fallback when model
+sizing is incomplete, while the loaded Client and attended header expose the
+effective model- and machine-bounded context.
 
 Optional nested fields use validated patch values. Missing means inherit;
 `{ clear = true }` means explicit clear for model, `top_k`, seed, system
 prompt, and memory model.
 
-Resolved generation tokens never exceed the context ceiling. Thinking `auto`
-inherits an explicit client default; without one, Emelex safely supplies
-`enable_thinking = false`.
+Resolved generation tokens never exceed the configured fallback context, then
+remain capped by the effective loaded context. Thinking `auto` inherits an
+explicit client default; without one, Emelex safely supplies
+`enable_thinking = false`. Attended chat deliberately supplies thinking-on as
+that client default unless the Session explicitly selected off.
 
 `Config::validate` is the single public validator for file-resolved and
 caller-mutated snapshots. Any new field or cross-field invariant belongs

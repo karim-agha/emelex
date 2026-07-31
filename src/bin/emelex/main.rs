@@ -48,7 +48,9 @@ async fn main() -> ExitCode {
 		Ok(()) => ExitCode::SUCCESS,
 		Err(error) if output::is_broken_pipe(&error) => ExitCode::SUCCESS,
 		Err(error) => {
-			let reported = if json {
+			let reported = if !should_report_command_error(&error, json) {
+				Ok(())
+			} else if json {
 				output::json_error(&error)
 			} else {
 				output::stderr_line(&format_human_error(&error, stderr_palette))
@@ -61,6 +63,10 @@ async fn main() -> ExitCode {
 			ExitCode::FAILURE
 		}
 	}
+}
+
+fn should_report_command_error(error: &anyhow::Error, json: bool) -> bool {
+	json || !chat_cmd::is_rendered_turn_failure(error)
 }
 
 fn format_human_error(error: &anyhow::Error, palette: style::Palette) -> String {
@@ -170,6 +176,15 @@ mod tests {
 		assert!(!rendered.contains('\u{1b}'));
 		assert!(!rendered.contains('\u{202e}'));
 		assert!(rendered.contains('\u{241b}'));
+	}
+
+	#[test]
+	fn one_shot_human_turn_failure_is_not_reported_twice() {
+		let error = chat_cmd::mark_rendered_turn_failure(
+			emelex::memory::DurableSessionError::Agent(emelex::agent::AgentError::Cancelled),
+		);
+		assert!(!should_report_command_error(&error, false));
+		assert!(should_report_command_error(&error, true));
 	}
 
 	#[test]

@@ -30,8 +30,23 @@
 - Attended chat owns one stderr `LiveRegion` only after line editing returns.
   It becomes visible immediately after submission, advances from the same task
   that polls the turn, and is cleared before stream output or approval input.
-  Completion, cancellation, output failure, and agent failure all clear it;
-  JSON and non-terminal stderr never create it.
+  Exact native progress drives prompt, cache, output, context-reservation, and
+  average decode-speed status. Attended non-JSON terminal Markdown buffers only
+  an unfinished raw line suffix, including with color disabled. Complete-line
+  flushes occur between live-region erase and immediate redraw; partial deltas
+  update a bounded terminal-neutral suffix preview and state for the 120 ms
+  animation tick without per-token erase/redraw churn. The final suffix flushes
+  when the stream changes or ends. Later styled batches reapply current
+  Markdown/base SGR state after the live frame's reset. Answer buffering is used
+  only when stdout is itself a terminal; redirected stdout, non-interactive, and
+  one-shot renderers remain immediate. Tool checkpoints and final persistence
+  retain named states instead of leaving a silent gap.
+  Completion, cancellation, output failure, and agent failure all clear the
+  region; JSON and non-terminal stderr never create it. A human `TurnFailed`
+  event is the sole diagnostic for its error: the interactive loop and the
+  top-level one-shot reporter recognize its typed marker and suppress only that
+  duplicate while retaining a failing one-shot exit, separate post-checkpoint
+  warnings, JSON error behavior, and fatal durable errors.
 - Modified Return bindings insert a newline while plain Return remains submit.
   Because Unix terminals do not encode Shift-Return uniformly, the editor also
   accepts Rustyline's LF, Alt-Return, and Alt-LF encodings. Message text is
@@ -62,10 +77,19 @@
   without claiming to change process cwd or unrelated relative-path
   resolution.
 - New-chat sampling/thinking overrides are validated through public
-  `Config::validate` and become immutable Session semantics. Explicit
-  `--thinking auto` inherits resolved configuration. Resume rejects semantic
-  overrides. Per-request max tokens use the loaded `Client` ceiling, so stored
-  semantics cannot re-expand a checkpoint-clamped load policy.
+  `Config::validate` and become immutable Session semantics. A new chat
+  materializes unresolved auto as on before snapshotting; explicit off remains
+  off. Resume rejects semantic overrides and uses its exact stored mode, so a
+  historical v2 auto is not migrated or reinterpreted and retains prior
+  auto/off behavior. New on semantics require both
+  `interaction:thinking_toggle` and `interaction:reasoning_history`; stored auto
+  does not. Each new or resumed chat load requests the largest model-declared
+  context that fits the active Metal budget. Missing exact weights, sizing, or
+  a declared maximum retains configured context. The attended header uses load
+  policy provenance to label the effective result `machine-fit` or `configured
+  fallback`, never inferring provenance from the token count. Per-request max
+  tokens use the loaded `Client` ceiling, so stored semantics cannot re-expand
+  checkpoint- or machine-clamped load policy.
 - CLI web search is explicit, approval-gated, bounded, credential/proxy-free,
   and identified solely by its provider implementation. A policy-disabled
   explicit request fails rather than silently omitting the tool. Known
@@ -143,8 +167,9 @@
   evidence; a real capability mismatch remains an error.
 - Raw thinking-on selection requires `interaction:thinking_toggle`. Agent and
   chat thinking-on selection require both that trait and
-  `interaction:reasoning_history`. A generate-command override reaches model
-  selection, load policy, and request policy as one resolved value.
+  `interaction:reasoning_history`; historical stored chat auto does not. A
+  generate-command override reaches model selection, load policy, and request
+  policy as one resolved value.
 - `doctor` records every independent facet result before returning aggregate
   failure; corrupt model entries do not hide healthy snapshots.
 - Memory-model generation renews its durable worker lease every 60 seconds from

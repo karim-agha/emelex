@@ -26,7 +26,7 @@ use emelex::{
 		SessionSnapshot,
 	},
 	model::{InstalledModel, ModelSnapshotId, TraitFilter},
-	models::{LoadOverride, ModelLoadOptions},
+	models::{ContextSelectionProvenance, LoadOverride, ModelLoadOptions},
 };
 use rustyline::{
 	At, Cmd, Completer, Config as ReadlineConfig, Editor, Helper, Hinter, KeyCode, KeyEvent,
@@ -48,7 +48,7 @@ use super::{
 	markdown::MarkdownStream,
 	media::{self, Attachment},
 	model_select, output,
-	style::Palette,
+	style::{self, Palette},
 	terminal_ui::{LiveRegion, fit_line},
 	web_search::DuckDuckGoSearch,
 };
@@ -110,9 +110,22 @@ struct PreparedChat {
 	store: MemoryStore,
 	semantics: ChatSemantics,
 	client: emelex::Client,
+	context_selection: ContextSelectionProvenance,
 	installed: InstalledModel,
 	durable: DurableAgentSession,
 	resumed: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct RenderedTurnFailure(DurableSessionError);
+
+pub(crate) fn mark_rendered_turn_failure(error: DurableSessionError) -> anyhow::Error {
+	RenderedTurnFailure(error).into()
+}
+
+pub(crate) fn is_rendered_turn_failure(error: &anyhow::Error) -> bool {
+	error.downcast_ref::<RenderedTurnFailure>().is_some()
 }
 
 #[derive(serde::Serialize)]
@@ -266,6 +279,7 @@ pub(crate) async fn run(
 		&mut prepared.durable,
 		&prepared.semantics.config,
 		&prepared.client,
+		prepared.context_selection,
 		prepared.installed.snapshot_id(),
 		args,
 		json,
@@ -343,7 +357,10 @@ async fn prepare_chat(
 			.await?
 		}
 	};
-	let client = load_client(emelex, &installed, &semantics.config)?;
+	if interactive {
+		report_model_loading(&installed, stderr_palette)?;
+	}
+	let (client, context_selection) = load_client(emelex, &installed, &semantics.config)?;
 	let builder = agent_builder(
 		emelex,
 		client.clone(),
@@ -383,22 +400,31 @@ async fn prepare_chat(
 		store,
 		semantics,
 		client,
+		context_selection,
 		installed,
 		durable,
 		resumed: !created_session,
 	})
 }
 
+fn report_model_loading(installed: &InstalledModel, palette: Palette) -> anyhow::Result<()> {
+	let reference = installed.reference().to_string();
+	let reference = output::terminal_safe_inline(&reference);
+	let message = format!("Loading {reference} · selecting context…");
+	output::stderr_line(&format!("{} {}", palette.cyan("◌"), palette.dim(&message)))
+}
+
 fn chat_model_filters(config: &Config) -> anyhow::Result<Vec<TraitFilter>> {
 	let inference = &config.inference;
+	let thinking_enabled = inference.thinking == ThinkingMode::On;
 	model_select::filters(model_select::InvocationRequirements {
 		chat: true,
 		system_prompt: true,
 		agent: true,
 		image: false,
 		audio: false,
-		reasoning_history: inference.thinking == emelex::config::ThinkingMode::On,
-		thinking_toggle: inference.thinking == emelex::config::ThinkingMode::On,
+		reasoning_history: thinking_enabled,
+		thinking_toggle: thinking_enabled,
 		mtp: inference.mtp && inference.speculative_tokens > 0,
 	})
 }
@@ -434,6 +460,11 @@ fn chat_semantics(
 	}
 	let mut config = emelex.config().clone();
 	apply_chat_generation_overrides(&mut config, args)?;
+	if config.inference.thinking == ThinkingMode::Auto {
+		// Materialize the new-chat default before it becomes immutable. Resumed
+		// Sessions return above and retain the historical meaning of stored Auto.
+		config.inference.thinking = ThinkingMode::On;
+	}
 	let file_tools_enabled = config.agent.files && !args.no_tools;
 	let shell_tool_enabled = config.agent.shell && !args.no_tools;
 	let (web_fetch_enabled, web_search_enabled) = chat_web_semantics(&config, args)?;
@@ -702,11 +733,11 @@ fn load_client(
 	emelex: &Emelex,
 	installed: &InstalledModel,
 	config: &Config,
-) -> anyhow::Result<emelex::Client> {
+) -> anyhow::Result<(emelex::Client, ContextSelectionProvenance)> {
 	let inference = &config.inference;
 	let load_options = ModelLoadOptions::default()
 		.max_tokens(inference.max_tokens)
-		.context_tokens(inference.context_tokens)
+		.maximum_context()
 		.temperature(LoadOverride::Set(inference.temperature))
 		.top_p(LoadOverride::Set(inference.top_p))
 		.top_k(
@@ -726,11 +757,14 @@ fn load_client(
 		} else {
 			0
 		});
-	emelex
-		.models()
-		.context("initialize model manager")?
+	let models = emelex.models().context("initialize model manager")?;
+	let policy = models
+		.load_policy(installed, &load_options)
+		.with_context(|| format!("resolve load policy for {}", installed.reference()))?;
+	let client = models
 		.load(installed, &load_options)
-		.with_context(|| format!("load {}", installed.reference()))
+		.with_context(|| format!("load {}", installed.reference()))?;
+	Ok((client, policy.context_selection))
 }
 
 #[expect(
@@ -743,6 +777,7 @@ async fn run_claimed(
 	durable: &mut DurableAgentSession,
 	config: &Config,
 	client: &emelex::Client,
+	context_selection: ContextSelectionProvenance,
 	model_snapshot: &ModelSnapshotId,
 	args: ChatArgs,
 	json: bool,
@@ -759,7 +794,15 @@ async fn run_claimed(
 			.model_reference
 			.as_ref()
 			.map_or_else(|| "unbound model".to_string(), ToString::to_string);
-		let header = chat_header(durable.session().id, &workspace_display, &model_reference);
+		let effective_context = u64::try_from(client.effective_context_tokens())
+			.context("effective context token limit does not fit u64")?;
+		let header = chat_header(
+			durable.session().id,
+			&workspace_display,
+			&model_reference,
+			effective_context,
+			context_selection,
+		);
 		output::stderr_line(&stderr_palette.bold(&header[0]))?;
 		for line in &header[1..] {
 			output::stderr_line(&stderr_palette.dim(line))?;
@@ -803,16 +846,35 @@ async fn run_claimed(
 	.await
 }
 
-fn chat_header(session_id: uuid::Uuid, workspace: &str, model_reference: &str) -> [String; 5] {
+fn chat_header(
+	session_id: uuid::Uuid,
+	workspace: &str,
+	model_reference: &str,
+	effective_context: u64,
+	context_selection: ContextSelectionProvenance,
+) -> [String; 6] {
 	let workspace = output::terminal_safe_inline(workspace);
 	let model = output::terminal_safe_inline(model_reference);
 	[
 		"Emelex chat".to_string(),
 		format!("  Model      {model}"),
+		format!(
+			"  Context    {} tokens ({})",
+			style::tokens(effective_context),
+			context_selection_label(context_selection)
+		),
 		format!("  Workspace  {workspace}"),
 		format!("  Session    {session_id}"),
 		"  Shift+Return newline · /help · /quit or Ctrl-C to exit".to_string(),
 	]
+}
+
+const fn context_selection_label(selection: ContextSelectionProvenance) -> &'static str {
+	if matches!(selection, ContextSelectionProvenance::MaximumMachineFit) {
+		"machine-fit"
+	} else {
+		"configured fallback"
+	}
 }
 
 #[expect(
@@ -1025,6 +1087,9 @@ fn report_history_warning(
 }
 
 fn report_recoverable_input_error(error: anyhow::Error, palette: Palette) -> anyhow::Result<()> {
+	if is_rendered_turn_failure(&error) {
+		return Ok(());
+	}
 	let durable_fatal = error
 		.downcast_ref::<DurableSessionError>()
 		.is_some_and(|error| {
@@ -1070,6 +1135,44 @@ fn generation_options(config: &Config, effective_max_tokens: usize) -> Generatio
 	options
 }
 
+const fn event_requires_stream_flush(event: &emelex::agent::AgentEvent) -> bool {
+	matches!(
+		event,
+		emelex::agent::AgentEvent::ModelStarted { .. }
+			| emelex::agent::AgentEvent::ToolCall { .. }
+			| emelex::agent::AgentEvent::ApprovalRequested { .. }
+			| emelex::agent::AgentEvent::ModelCompleted { .. }
+			| emelex::agent::AgentEvent::Cancelled { .. }
+			| emelex::agent::AgentEvent::TurnFailed { .. }
+	)
+}
+
+fn finish_chat_streams_before_boundary(
+	markdown: &mut MarkdownStream,
+	reasoning: &mut MarkdownStream,
+	reasoning_active: &mut bool,
+	answer_active: &mut bool,
+	answer_terminal: bool,
+	answer_needs_newline: &mut bool,
+) -> anyhow::Result<()> {
+	if *reasoning_active {
+		output::stderr_line(&reasoning.finish())?;
+		*reasoning_active = false;
+	}
+	if *answer_active {
+		output::stdout(&markdown.finish())?;
+		if answer_terminal && take_answer_newline(answer_needs_newline) {
+			output::stdout_line("")?;
+		}
+		*answer_active = false;
+	}
+	Ok(())
+}
+
+fn take_answer_newline(answer_needs_newline: &mut bool) -> bool {
+	std::mem::take(answer_needs_newline)
+}
+
 #[expect(
 	clippy::too_many_arguments,
 	clippy::too_many_lines,
@@ -1091,29 +1194,64 @@ async fn run_one(
 	let message = queued_message(text.clone(), attachments, recalled_context.as_deref());
 	let cancellation = AgentCancellation::new();
 	let history_cursor = durable.history().len();
+	let answer_terminal = std::io::stdout().is_terminal();
 	let mut markdown = MarkdownStream::new(stdout_palette.is_enabled());
 	let mut reasoning = MarkdownStream::with_base(stderr_palette.is_enabled(), "\u{1b}[2;3m");
+	if attended && !json {
+		reasoning = reasoning.buffer_complete_lines();
+		if answer_terminal {
+			markdown = markdown.buffer_complete_lines();
+		}
+	}
 	let mut reasoning_active = false;
+	let mut answer_active = false;
+	let mut answer_needs_newline = false;
 	let mut output_error = None;
+	let mut rendered_turn_failure = false;
 	let result = {
-		let activity = ChatActivity::new(attended && !json, stderr_palette);
+		let activity = ChatActivity::new(attended && !json, answer_terminal, stderr_palette);
 		let event_activity = activity.clone();
 		let future = durable.try_run_message(message, &cancellation, |event| {
-			let rendered = event_activity.before_event(&event).and_then(|()| {
-				render_agent_event(
-					&event,
-					json,
-					stderr_palette,
-					&mut markdown,
-					&mut reasoning,
-					&mut reasoning_active,
-				)
-			});
+			let is_human_turn_failure =
+				!json && matches!(&event, emelex::agent::AgentEvent::TurnFailed { .. });
+			let rendered = event_activity
+				.before_event(&event)
+				.and_then(|()| {
+					if !json && event_requires_stream_flush(&event) {
+						finish_chat_streams_before_boundary(
+							&mut markdown,
+							&mut reasoning,
+							&mut reasoning_active,
+							&mut answer_active,
+							answer_terminal,
+							&mut answer_needs_newline,
+						)?;
+					}
+					Ok(())
+				})
+				.and_then(|()| {
+					render_agent_event(
+						&event,
+						json,
+						stderr_palette,
+						&mut markdown,
+						&mut reasoning,
+						&mut reasoning_active,
+					)
+				})
+				.and_then(|()| event_activity.after_event(&event));
 			if let Err(error) = rendered {
 				if output_error.is_none() {
 					output_error = Some(error);
 				}
 				return Err("event output failed");
+			}
+			if is_human_turn_failure {
+				rendered_turn_failure = true;
+			}
+			if let emelex::agent::AgentEvent::TextDelta { text, .. } = &event {
+				answer_active = true;
+				answer_needs_newline = !text.ends_with('\n');
 			}
 			Ok(())
 		});
@@ -1173,7 +1311,7 @@ async fn run_one(
 			attachments.clear();
 			*recalled_context = None;
 			if !json {
-				if !turn.response.text.ends_with('\n') {
+				if take_answer_newline(&mut answer_needs_newline) {
 					output::stdout_line("")?;
 				}
 				output::stderr_line(&stderr_palette.dim(&usage_footer(
@@ -1190,6 +1328,9 @@ async fn run_one(
 				output::stderr_line(&stderr_palette.dim("Turn cancelled."))?;
 			}
 			Ok(())
+		}
+		Err(error) if rendered_turn_failure && matches!(&error, DurableSessionError::Agent(_)) => {
+			Err(mark_rendered_turn_failure(error))
 		}
 		Err(error) => Err(error.into()),
 	}
@@ -1989,19 +2130,33 @@ mod tests {
 			uuid::Uuid::nil(),
 			"/tmp/work\u{1b}]0;workspace\u{7}\nforged",
 			"org/model\u{202e}",
+			65_536,
+			ContextSelectionProvenance::MaximumMachineFit,
 		);
 		let rendered = header.join("\n");
 
 		assert_eq!(header[0], "Emelex chat");
 		assert!(header[1].starts_with("  Model      "));
-		assert!(header[2].starts_with("  Workspace  "));
-		assert!(header[3].contains("00000000-0000-0000-0000-000000000000"));
+		assert_eq!(header[2], "  Context    65.5k tokens (machine-fit)");
+		assert!(header[3].starts_with("  Workspace  "));
+		assert!(header[4].contains("00000000-0000-0000-0000-000000000000"));
 		assert_eq!(
-			header[4],
+			header[5],
 			"  Shift+Return newline · /help · /quit or Ctrl-C to exit"
 		);
 		assert_terminal_neutral(&rendered);
 		assert_eq!(rendered.lines().count(), header.len());
+		let fallback = chat_header(
+			uuid::Uuid::nil(),
+			"/tmp/work",
+			"org/model",
+			16_384,
+			ContextSelectionProvenance::Configured,
+		);
+		assert_eq!(
+			fallback[2],
+			"  Context    16.4k tokens (configured fallback)"
+		);
 	}
 
 	#[test]
@@ -2015,7 +2170,7 @@ mod tests {
 	#[test]
 	fn resumed_model_filters_follow_stored_semantics_not_current_config() {
 		let mut stored = Config::default();
-		stored.inference.thinking = emelex::config::ThinkingMode::Off;
+		stored.inference.thinking = emelex::config::ThinkingMode::Auto;
 		stored.inference.mtp = false;
 		let mut current = stored.clone();
 		current.inference.thinking = emelex::config::ThinkingMode::On;
@@ -2054,6 +2209,122 @@ mod tests {
 				.any(|filter| filter == "interaction:thinking_toggle")
 		);
 		assert!(current.iter().any(|filter| filter == "acceleration:mtp"));
+	}
+
+	#[test]
+	fn stored_auto_thinking_keeps_historical_capability_requirements() {
+		let config = Config::default();
+		assert_eq!(config.inference.thinking, ThinkingMode::Auto);
+		let filters = chat_model_filters(&config)
+			.expect("stored auto-thinking filters")
+			.into_iter()
+			.map(|filter| filter.to_string())
+			.collect::<Vec<_>>();
+		assert!(
+			!filters
+				.iter()
+				.any(|filter| filter == "interaction:reasoning_history")
+		);
+		assert!(
+			!filters
+				.iter()
+				.any(|filter| filter == "interaction:thinking_toggle")
+		);
+	}
+
+	#[test]
+	fn rendered_turn_failures_are_marked_for_single_human_diagnostic() {
+		let error: anyhow::Error = RenderedTurnFailure(DurableSessionError::Agent(
+			emelex::agent::AgentError::Cancelled,
+		))
+		.into();
+		assert!(error.downcast_ref::<RenderedTurnFailure>().is_some());
+		assert!(
+			error
+				.downcast_ref::<RenderedTurnFailure>()
+				.is_some_and(|reported| matches!(reported.0, DurableSessionError::Agent(_)))
+		);
+	}
+
+	#[test]
+	fn pending_reasoning_precedes_tool_approval_and_failure_boundaries() {
+		let turn_id = uuid::Uuid::nil();
+		let approval: emelex::agent::AgentEvent = serde_json::from_value(serde_json::json!({
+			"type": "approval_requested",
+			"context": {
+				"call_id": "call-1",
+				"tool_name": "shell",
+				"arguments": {"command": "pwd"},
+				"workspace_root": "/tmp/workspace",
+				"workspace_device": 1,
+				"workspace_inode": 2,
+				"reason": "shell execution"
+			}
+		}))
+		.expect("approval boundary fixture");
+		let boundaries = [
+			(
+				emelex::agent::AgentEvent::ToolCall {
+					turn_id,
+					round: 1,
+					call: emelex::generation::ToolCall::new(
+						"call-1",
+						"shell",
+						serde_json::json!({"command": "pwd"}),
+					),
+				},
+				"→ Shell",
+			),
+			(approval, "Allow this invocation"),
+			(
+				emelex::agent::AgentEvent::TurnFailed {
+					turn_id,
+					message: "generation failed".to_string(),
+				},
+				"× Turn failed",
+			),
+		];
+		for (boundary, boundary_copy) in boundaries {
+			assert!(event_requires_stream_flush(&boundary));
+			let mut reasoning = MarkdownStream::new(false).buffer_complete_lines();
+			assert!(reasoning.push("pending thought").is_empty());
+			let transcript = format!("{}\n{boundary_copy}", reasoning.finish());
+			let thought = transcript
+				.find("pending thought")
+				.expect("pending reasoning");
+			let boundary = transcript.find(boundary_copy).expect("boundary copy");
+			assert!(thought < boundary);
+		}
+	}
+
+	#[test]
+	fn model_completed_boundary_terminates_final_answer_once() {
+		let mut transcript = "answer without newline".to_string();
+		let mut answer_needs_newline = true;
+		if take_answer_newline(&mut answer_needs_newline) {
+			transcript.push('\n');
+		}
+		if take_answer_newline(&mut answer_needs_newline) {
+			transcript.push('\n');
+		}
+
+		assert_eq!(transcript, "answer without newline\n");
+	}
+
+	#[test]
+	fn cancellation_boundary_separates_partial_answer_from_diagnostic() {
+		let boundary = emelex::agent::AgentEvent::Cancelled {
+			turn_id: uuid::Uuid::nil(),
+		};
+		assert!(event_requires_stream_flush(&boundary));
+		let mut transcript = "partial answer".to_string();
+		let mut answer_needs_newline = true;
+		if take_answer_newline(&mut answer_needs_newline) {
+			transcript.push('\n');
+		}
+		transcript.push_str("Turn cancelled.\n");
+
+		assert_eq!(transcript, "partial answer\nTurn cancelled.\n");
 	}
 
 	#[test]
@@ -2307,6 +2578,18 @@ mod tests {
 			.expect("Emelex");
 		let store =
 			MemoryStore::open_path(directory.path().join("memory.sqlite3")).expect("memory store");
+		let default_semantics = chat_semantics(&emelex, &store, &chat_args(None), None)
+			.expect("default chat semantics");
+		assert_eq!(
+			default_semantics.config.inference.thinking,
+			ThinkingMode::On
+		);
+		let mut off_args = chat_args(None);
+		off_args.thinking = Some(ThinkingArg::Off);
+		let off_semantics =
+			chat_semantics(&emelex, &store, &off_args, None).expect("thinking-off semantics");
+		assert_eq!(off_semantics.config.inference.thinking, ThinkingMode::Off);
+
 		let mut args = chat_args(None);
 		args.max_tokens = Some(512);
 		args.temperature = Some(0.7);

@@ -18,7 +18,10 @@ pub use compatibility::{
 	CompatibilityReport, FitReport, InspectionError, WorkloadError, WorkloadProfile,
 	inspect_directory,
 };
-pub(crate) use compatibility::{estimate_fit_from_config, supported_model_type};
+pub(crate) use compatibility::{
+	estimate_fit_from_config, inspect_directory_with_prompt_cache_tokens, maximum_fitting_context,
+	supported_model_type,
+};
 pub use identity::{
 	HubModelId, LocalModelName, ModelRef, ModelRefError, ModelSnapshotId, ResolvedRevision,
 	SnapshotDigest,
@@ -141,6 +144,7 @@ impl rig_core::completion::CompletionModel for CompletionModel {
 					engine_request.tools.as_deref(),
 					engine_request.options,
 					&request_cancelled,
+					|_| true,
 					|_| !job_cancelled.load(std::sync::atomic::Ordering::Acquire),
 				);
 				let _ = done_tx.send(result);

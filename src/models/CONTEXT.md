@@ -59,6 +59,15 @@
   cannot erase the latter.
 - Interactive Hub status uses cancellation-safe Hub-only snapshot and transfer
   scans. It does not inspect or hash caller-owned linked imports.
+- Maximum-context loads reserve and enforce
+  `min(context, DEFAULT_MAX_TOTAL_TOKENS)` prompt-cache capacity independently
+  of the default cache toggle, because a request may re-enable caching. Fixed
+  loads preserve full-context capacity.
+- `ModelLoadPolicy::prompt_cache_tokens` carries that exact capacity through
+  selection, the load compatibility gate, and client construction.
+- A resolved load policy marks context provenance as machine-fit only after
+  adaptive sizing succeeds. Configured, fixed, clamped, and incomplete-sizing
+  fallbacks remain configured provenance.
 - Owned snapshot paths and all link records stay under the selected Emelex
   Home. A link record may name one canonical caller-owned external target.
 - Hub snapshot paths carry an explicit `unnamespaced` or `namespaced`
@@ -99,6 +108,12 @@
   overrides distinguish inheritance, explicit values, and clearing. Each
   option has one canonical field; no parallel `Option<T>` representation
   exists.
+- Maximum-context load mode is explicit and process-local. It chooses the
+  largest architecture-declared total context whose estimated residency fits
+  the active Metal budget, up to 16,777,216 tokens. Models without complete
+  sizing or a declared maximum retain resolved configuration. Fixed context
+  configuration remains bounded at 1,048,576 tokens. Public `load_policy` and
+  actual `load` resolve the same adaptive context.
 - Destructive removal resolves an exact `ModelSnapshotId`, never a mutable
   stable reference.
 - Removing an external link deletes only its managed record. It never deletes,

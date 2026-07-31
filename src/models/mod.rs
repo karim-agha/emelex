@@ -33,6 +33,7 @@ use crate::{
 		CompatibilityReport, HubModelId, InspectionError, InstalledModel, LocalModelName,
 		ManifestError, ModelFile, ModelManifest, ModelRef, ModelSnapshotId, ModelSource,
 		ResolvedRevision, VerificationStatus, WorkloadProfile, inspect_directory,
+		inspect_directory_with_prompt_cache_tokens, maximum_fitting_context,
 	},
 };
 
@@ -46,6 +47,8 @@ const HUB_TRANSFER_PAYLOAD_NAME: &str = "payload";
 const MAX_MANIFEST_BYTES: u64 = 4 << 20;
 const MAX_VERIFICATION_STAMP_BYTES: u64 = 8 << 20;
 const MAX_HUB_TRANSFER_RECORD_BYTES: u64 = 64 << 10;
+const MAX_FIXED_CONTEXT_TOKENS: usize = 1 << 20;
+const MAX_LOAD_CONTEXT_TOKENS: usize = 1 << 24;
 
 /// Tri-state per-load setting.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -70,6 +73,8 @@ pub struct ModelLoadOptions {
 	pub max_tokens: Option<usize>,
 	/// Total prompt plus generation context.
 	pub context_tokens: Option<usize>,
+	/// Select the largest model- and machine-compatible context.
+	pub maximum_context: bool,
 	/// Sampling temperature.
 	pub temperature: LoadOverride<f32>,
 	/// Nucleus sampling.
@@ -107,6 +112,20 @@ impl ModelLoadOptions {
 	#[must_use]
 	pub const fn context_tokens(mut self, tokens: usize) -> Self {
 		self.context_tokens = Some(tokens);
+		self.maximum_context = false;
+		self
+	}
+
+	/// Select the largest architecture-declared context that fits the active
+	/// Metal working-set budget.
+	///
+	/// This clears an earlier fixed [`Self::context_tokens`] override. Models
+	/// without an architecture-declared maximum retain resolved Emelex
+	/// configuration instead of guessing an unsafe ceiling.
+	#[must_use]
+	pub const fn maximum_context(mut self) -> Self {
+		self.context_tokens = None;
+		self.maximum_context = true;
 		self
 	}
 
@@ -167,6 +186,18 @@ impl ModelLoadOptions {
 	}
 }
 
+/// Provenance of the effective context selected for one load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ContextSelectionProvenance {
+	/// Resolved configuration or an explicit fixed override, possibly clamped
+	/// by the model's declared limit.
+	Configured,
+	/// Largest architecture-declared context proven to fit the active Metal
+	/// working-set budget.
+	MaximumMachineFit,
+}
+
 /// Fully resolved policy applied to one managed model load.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -177,6 +208,8 @@ pub struct ModelLoadPolicy {
 	pub max_tokens: usize,
 	/// Prompt plus generated context.
 	pub context_tokens: usize,
+	/// How the effective context was selected.
+	pub context_selection: ContextSelectionProvenance,
 	/// Effective sampling temperature.
 	pub temperature: f32,
 	/// Effective nucleus threshold.
@@ -191,6 +224,8 @@ pub struct ModelLoadPolicy {
 	pub reasoning_budget_tokens: Option<usize>,
 	/// Prompt-cache behavior.
 	pub prompt_cache: bool,
+	/// Aggregate prompt-cache token capacity reserved by compatibility sizing.
+	pub prompt_cache_tokens: usize,
 	/// MTP draft depth.
 	pub speculative_tokens: usize,
 }
@@ -1387,17 +1422,8 @@ impl ModelManager {
 	) -> Result<Client, ModelsError> {
 		self.validate_owned_install(installed)?;
 		let runtime = runtime_directory(installed.path(), installed.manifest())?;
-		let policy = self.resolve_load_policy(installed.manifest().traits(), options)?;
-		let compatibility = inspect_directory(
-			installed.reference().clone(),
-			&runtime,
-			WorkloadProfile::new(1, policy.context_tokens)
-				.map_err(|error| ModelsError::Configuration(error.to_string()))?,
-			self.metal_budget_bytes,
-		)?;
-		if !compatibility.compatible {
-			return Err(ModelsError::Incompatible(compatibility.reasons));
-		}
+		let policy = self.resolve_installed_load_policy(installed, &runtime, options)?;
+		self.validate_load_compatibility(installed, &runtime, &policy)?;
 		let client = self.build_client(
 			&runtime,
 			&policy,
@@ -1423,7 +1449,8 @@ impl ModelManager {
 		options: &ModelLoadOptions,
 	) -> Result<ModelLoadPolicy, ModelsError> {
 		self.validate_owned_install(installed)?;
-		self.resolve_load_policy(installed.manifest().traits(), options)
+		let runtime = runtime_directory(installed.path(), installed.manifest())?;
+		self.resolve_installed_load_policy(installed, &runtime, options)
 	}
 
 	/// Move one snapshot into Emelex quarantine.
@@ -1719,6 +1746,7 @@ impl ModelManager {
 			queue_capacity: options.queue_capacity.unwrap_or(8),
 			max_tokens,
 			context_tokens,
+			context_selection: ContextSelectionProvenance::Configured,
 			temperature,
 			top_p,
 			top_k,
@@ -1726,10 +1754,86 @@ impl ModelManager {
 			thinking,
 			reasoning_budget_tokens,
 			prompt_cache: options.prompt_cache.unwrap_or(inference.prompt_cache),
+			prompt_cache_tokens: context_tokens,
 			speculative_tokens,
 		};
 		validate_load_policy(&policy, traits)?;
 		Ok(policy)
+	}
+
+	fn resolve_installed_load_policy(
+		&self,
+		installed: &InstalledModel,
+		runtime: &Path,
+		options: &ModelLoadOptions,
+	) -> Result<ModelLoadPolicy, ModelsError> {
+		if !options.maximum_context {
+			let policy = self.resolve_load_policy(installed.manifest().traits(), options)?;
+			if policy.context_tokens > MAX_FIXED_CONTEXT_TOKENS {
+				return Err(ModelsError::Configuration(
+					"fixed context_tokens must be in 1..=1048576".to_string(),
+				));
+			}
+			return Ok(policy);
+		}
+		if options.context_tokens.is_some() {
+			return Err(ModelsError::Configuration(
+				"maximum_context conflicts with a fixed context_tokens override".to_string(),
+			));
+		}
+		let traits = installed.manifest().traits();
+		let Some(sizing) = traits.sizing.as_ref() else {
+			return self.resolve_load_policy(traits, options);
+		};
+		let Some(maximum_context_tokens) = sizing.max_context_tokens else {
+			return self.resolve_load_policy(traits, options);
+		};
+		let Some(weights_bytes) = sizing.weights_bytes else {
+			return self.resolve_load_policy(traits, options);
+		};
+		let maximum_context_tokens = maximum_context_tokens.min(MAX_LOAD_CONTEXT_TOKENS);
+		let context_tokens = maximum_fitting_context(
+			runtime,
+			weights_bytes,
+			maximum_context_tokens,
+			self.metal_budget_bytes,
+			crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS,
+		)?
+		.ok_or_else(|| {
+			ModelsError::Incompatible(vec![format!(
+				"no positive context fits the active Metal budget {}",
+				self.metal_budget_bytes
+			)])
+		})?;
+		let mut resolved = options.clone();
+		resolved.maximum_context = false;
+		resolved.context_tokens = Some(context_tokens);
+		let mut policy = self.resolve_load_policy(traits, &resolved)?;
+		policy.context_selection = ContextSelectionProvenance::MaximumMachineFit;
+		policy.prompt_cache_tokens = policy
+			.context_tokens
+			.min(crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS);
+		Ok(policy)
+	}
+
+	fn validate_load_compatibility(
+		&self,
+		installed: &InstalledModel,
+		runtime: &Path,
+		policy: &ModelLoadPolicy,
+	) -> Result<(), ModelsError> {
+		let compatibility = inspect_directory_with_prompt_cache_tokens(
+			installed.reference().clone(),
+			runtime,
+			WorkloadProfile::new(1, policy.context_tokens)
+				.map_err(|error| ModelsError::Configuration(error.to_string()))?,
+			self.metal_budget_bytes,
+			policy.prompt_cache_tokens,
+		)?;
+		if !compatibility.compatible {
+			return Err(ModelsError::Incompatible(compatibility.reasons));
+		}
+		Ok(())
 	}
 
 	fn build_client(
@@ -1750,6 +1854,7 @@ impl ModelManager {
 			.top_p(policy.top_p)
 			.top_k(policy.top_k.unwrap_or(0))
 			.prompt_cache(policy.prompt_cache)
+			.cache_max_tokens(policy.prompt_cache_tokens)
 			.speculative_tokens(policy.speculative_tokens);
 		if let Some(seed) = policy.seed {
 			builder = builder.seed(seed);
@@ -2252,9 +2357,14 @@ fn validate_load_policy(
 			"effective max_tokens must be in 1..=1048576".to_string(),
 		));
 	}
-	if policy.context_tokens == 0 || policy.context_tokens > 1 << 20 {
+	if policy.context_tokens == 0 || policy.context_tokens > MAX_LOAD_CONTEXT_TOKENS {
 		return Err(ModelsError::Configuration(
-			"effective context_tokens must be in 1..=1048576".to_string(),
+			"effective context_tokens must be in 1..=16777216".to_string(),
+		));
+	}
+	if policy.prompt_cache_tokens == 0 || policy.prompt_cache_tokens > policy.context_tokens {
+		return Err(ModelsError::Configuration(
+			"effective prompt_cache_tokens must be in 1..=context_tokens".to_string(),
 		));
 	}
 	if policy.max_tokens > policy.context_tokens {

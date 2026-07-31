@@ -12,6 +12,11 @@ MTP counters belong to the call that produced them:
 responses carry the equivalent field. There is no client-global "latest"
 snapshot, so overlapping callers cannot observe one another's counters.
 
+Native streams also emit exact `GenerationEvent::Progress` snapshots: prompt
+tokens before context validation fails, resolved cache use before prefill, and
+one cumulative completion-token advance per generated token. Progress shares
+the bounded stream and its backpressure; it is never inferred from text bytes.
+
 The inference queue is bounded and non-blocking at admission. Saturation
 returns `Error::InferenceBusy`; a disconnected worker returns
 `Error::InferenceChannel`. Dropped futures and streams cancel cooperatively.

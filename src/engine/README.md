@@ -31,6 +31,11 @@ Every site is marked `emelex patch` in the source. Grouped by file:
   forward pass never ran (eos/abort), so entry ids always match the KV
   they carry; an entry covering the entire prompt is treated as a miss
   (an empty prefill suffix cannot produce logits).
+- **Exact live progress**: cached generation reports the rendered prompt count
+  before context rejection, the actual cache hit before prefill, then one
+  cumulative completion count per token admitted to `DecodeOutcome.emitted`.
+  Split classified segments and terminal decoder flushes repeat, rather than
+  advance, that token ordinal.
 - **Forced-close KV integrity**: when a reasoning budget fires, the
   budget-exceeding token is fed through the model together with the
   injected close marker (it was previously skipped, desyncing KV from

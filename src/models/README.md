@@ -106,7 +106,22 @@ use that persistent immutable-snapshot fast path; they fully validate the
 external target. `load_policy` exposes the fully resolved configuration,
 including the single canonical `LoadOverride<T>` tri-state for each optional
 sampling value and model context limits. Public load options are non-exhaustive
-and have fluent setters. Nonzero speculation requires runtime-verified MTP.
+and have fluent setters. `ModelLoadOptions::maximum_context` selects the largest
+architecture-declared context that fits the manager's Metal budget, capped by
+the Client-supported 16,777,216-token load ceiling. A later fixed-context
+setter replaces that mode, and a later maximum-context setter clears the fixed
+override. Adaptive selection reserves and enforces a 16,384-token aggregate
+prompt-cache ceiling even when caching is off by default, because per-request
+options may re-enable it. Fixed contexts preserve full-context cache capacity.
+Missing sizing, exact weight bytes, or a declared model maximum falls back to
+resolved configuration instead of guessing. `load` and `load_policy` run the
+same selection path. Nonzero speculation requires runtime-verified MTP.
+The final compatibility gate repeats sizing with
+`ModelLoadPolicy::prompt_cache_tokens`, the exact capacity also applied during
+client construction.
+`ModelLoadPolicy::context_selection` distinguishes a successful Metal-budget
+maximum from configured, explicitly fixed, or incomplete-metadata fallback
+contexts, so callers can describe the result without overstating its source.
 Install, import, and verification probes are invocation-policy-neutral: they
 force MTP off, thinking off, and clear the reasoning budget. Ordinary loads
 still inherit resolved configuration unless a per-load override replaces it.

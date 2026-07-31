@@ -22,6 +22,9 @@
   jobs, not the currently running job.
 - Native streaming has bounded token backpressure. Cancellation closes the
   receiver before waiting for the next cooperative engine boundary.
+- Native progress uses that same bounded channel. Prompt and cache snapshots
+  come from engine accounting; decode snapshots advance from exact emitted
+  token ordinals, not display-callback or string counts.
 - Native and Rig answer streams are exact prefixes of their terminal text.
   A raw tool boundary withholds later answer deltas until terminal validation;
   the validated suffix is emitted before structured calls and completion.

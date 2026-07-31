@@ -54,6 +54,16 @@ it never substitutes current project or global configuration. Changing model,
 system instructions, generation semantics, or tool authority starts a new
 Session rather than rewriting the meaning of prior turns.
 
+The chat model's effective context capacity is a runtime resource decision,
+not a mutable generation or authority setting. New and resumed chat processes
+resolve the largest context supported by the Session's bound model snapshot
+and the current Metal working-set budget. The model declaration and Emelex's
+load ceiling remain hard upper bounds; the snapshotted configured context is a
+safe fallback when exact sizing evidence is unavailable. This resolution does
+not change sampling, output-token limits, thinking policy, prompts, tools, or
+history. Because available machine capacity can change, attended chat reports
+the effective context selected for that process.
+
 The standalone CLI preserves portable chat controls without carrying host
 product integrations:
 
@@ -88,7 +98,10 @@ library protocol.
   execution, and rendering hand-off.
 - Security-sensitive actions are explicit even though the harness is local.
 - Session replay cannot silently move a conversation to another workspace.
-- Configuration edits affect new Sessions only; resume remains reproducible.
+- Configuration edits to generation and authority semantics affect new
+  Sessions only. Resume preserves those semantics; effective context capacity
+  may change with the current machine budget under the immutable maximum-fit
+  chat policy.
 - Portable chat UX remains available without importing product-specific
   project semantics.
 - Restart recovery never silently repeats a host-side tool effect.

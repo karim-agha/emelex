@@ -153,6 +153,15 @@ fn is_cancelled(cancelled: &AtomicBool) -> bool {
 	cancelled.load(Ordering::Acquire)
 }
 
+fn send_generation_progress(
+	sender: &tokio::sync::mpsc::Sender<Result<GenerationEvent, Error>>,
+	progress: crate::engine::generate::GenerationProgress,
+) -> bool {
+	sender
+		.blocking_send(Ok(GenerationEvent::Progress(progress.into())))
+		.is_ok()
+}
+
 /// Keeps answer deltas an exact prefix of the terminal answer.
 ///
 /// Tool-call syntax cannot be accepted until the complete reply has been
@@ -377,6 +386,7 @@ impl Client {
 						(!request.tools.is_empty()).then_some(request.tools.as_slice()),
 						request.options,
 						&request_cancelled,
+						|_| true,
 						|_| !is_cancelled(&cancelled),
 					)
 				}));
@@ -430,6 +440,7 @@ impl Client {
 						(!request.tools.is_empty()).then_some(request.tools.as_slice()),
 						request.options,
 						&request_cancelled,
+						|progress| send_generation_progress(&sender, progress),
 						|token| {
 							if is_cancelled(&job_cancelled) {
 								return false;
@@ -1378,6 +1389,31 @@ mod native_tests {
 			validate_builder(&builder),
 			Err(Error::InvalidConfiguration(_))
 		));
+	}
+
+	#[test]
+	fn request_can_reenable_cache_under_an_explicit_adaptive_capacity() {
+		let builder = ClientBuilder::new("missing-model")
+			.context_tokens(32_768)
+			.prompt_cache(false)
+			.cache_max_tokens(crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS);
+		let request = GenerationRequest::text("hello")
+			.options(crate::generation::GenerationOptions::default().prompt_cache(true))
+			.into_engine(&builder.defaults, false, false)
+			.expect("valid request override");
+
+		assert_eq!(
+			(
+				builder.cache.max_total_tokens,
+				builder.defaults.prompt_cache,
+				request.options.prompt_cache,
+			),
+			(
+				crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS,
+				Some(false),
+				Some(true),
+			)
+		);
 	}
 
 	#[test]

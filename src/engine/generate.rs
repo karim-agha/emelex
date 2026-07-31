@@ -78,11 +78,49 @@ pub struct GeneratedToken {
 	pub id: u32,
 	pub text: String,
 	pub finished: bool,
+	/// Exact cumulative number of token IDs admitted to this generation's
+	/// emitted ledger, including this token. Multiple classified callbacks for
+	/// one token and terminal decoder flushes repeat the same value.
+	pub completion_tokens: usize,
 	/// Which span this token belongs to (plain text, reasoning, or a
 	/// raw, not-yet-parsed tool-call span) - see [`crate::engine::streaming`].
 	/// Best-effort: a marker straddling two tokens is still detected,
 	/// but only once its second half arrives.
 	pub kind: TokenKind,
+}
+
+/// Exact native progress emitted around prompt preparation and decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GenerationProgress {
+	pub(crate) phase: GenerationProgressPhase,
+	pub(crate) prompt_tokens: usize,
+	pub(crate) cached_tokens: Option<usize>,
+	pub(crate) completion_tokens: usize,
+	pub(crate) max_output_tokens: usize,
+	pub(crate) context_limit: usize,
+}
+
+/// Native generation phase attached to [`GenerationProgress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenerationProgressPhase {
+	Prompt,
+	Prefill,
+	Decode,
+}
+
+#[derive(Default)]
+struct CompletionProgress {
+	reported_tokens: usize,
+}
+
+impl CompletionProgress {
+	fn observe(&mut self, token: &GeneratedToken) -> Option<usize> {
+		if token.completion_tokens <= self.reported_tokens {
+			return None;
+		}
+		self.reported_tokens = token.completion_tokens;
+		Some(token.completion_tokens)
+	}
 }
 
 /// Token accounting for one [`Session::generate_cached`] call, mirroring
@@ -413,6 +451,7 @@ impl<F: FnMut(GeneratedToken) -> bool> TokenEmitter<'_, F> {
 				id,
 				text: segment.text,
 				finished: finished && index == last,
+				completion_tokens: self.emitted.len(),
 				kind: segment.kind,
 			}) {
 				self.callback_open = false;
@@ -427,6 +466,7 @@ impl<F: FnMut(GeneratedToken) -> bool> TokenEmitter<'_, F> {
 			id,
 			text: String::new(),
 			finished,
+			completion_tokens: self.emitted.len(),
 			kind: self.classifier.current_kind(),
 		});
 		if !keep_going {
@@ -1922,7 +1962,14 @@ impl Session {
 		options: GenerateOptions,
 		on_token: impl FnMut(GeneratedToken) -> bool,
 	) -> Result<GenerateReply> {
-		self.generate_cached_inner(messages, tools, options, Cancellation::disabled(), on_token)
+		self.generate_cached_inner(
+			messages,
+			tools,
+			options,
+			Cancellation::disabled(),
+			|_| true,
+			on_token,
+		)
 	}
 
 	pub(crate) fn generate_cached_cancellable(
@@ -1931,6 +1978,7 @@ impl Session {
 		tools: Option<&[Tool]>,
 		options: GenerateOptions,
 		is_cancelled: &dyn Fn() -> bool,
+		on_progress: impl FnMut(GenerationProgress) -> bool,
 		on_token: impl FnMut(GeneratedToken) -> bool,
 	) -> Result<GenerateReply> {
 		self.generate_cached_inner(
@@ -1938,6 +1986,7 @@ impl Session {
 			tools,
 			options,
 			Cancellation::cooperative(is_cancelled),
+			on_progress,
 			on_token,
 		)
 	}
@@ -1948,6 +1997,7 @@ impl Session {
 		tools: Option<&[Tool]>,
 		options: GenerateOptions,
 		cancellation: Cancellation<'_>,
+		mut on_progress: impl FnMut(GenerationProgress) -> bool,
 		mut on_token: impl FnMut(GeneratedToken) -> bool,
 	) -> Result<GenerateReply> {
 		cancellation.checkpoint()?;
@@ -1975,6 +2025,16 @@ impl Session {
 			}),
 			cancellation,
 		)?;
+		if !on_progress(GenerationProgress {
+			phase: GenerationProgressPhase::Prompt,
+			prompt_tokens: full_ids.len(),
+			cached_tokens: None,
+			completion_tokens: 0,
+			max_output_tokens: options.max_tokens,
+			context_limit,
+		}) {
+			return Err(Error::Cancelled);
+		}
 		let requested_context =
 			full_ids
 				.len()
@@ -2050,6 +2110,16 @@ impl Session {
 		// the boundary prefill below advances fed_len with freshly
 		// computed tokens that must not be reported as cache hits.
 		let pool_hit_tokens = fed_len;
+		if !on_progress(GenerationProgress {
+			phase: GenerationProgressPhase::Prefill,
+			prompt_tokens: full_ids.len(),
+			cached_tokens: Some(pool_hit_tokens),
+			completion_tokens: 0,
+			max_output_tokens: options.max_tokens,
+			context_limit,
+		}) {
+			return Err(Error::Cancelled);
+		}
 
 		// emelex patch (not upstream): boundary snapshot. Full-prompt
 		// entries can never serve the next turn on templates that insert
@@ -2129,6 +2199,7 @@ impl Session {
 		};
 
 		let mut aborted = false;
+		let mut completion_progress = CompletionProgress::default();
 		let outcome = self.generate_with_media_inner(
 			new_suffix,
 			&new_media,
@@ -2141,6 +2212,18 @@ impl Session {
 			mtp,
 			cancellation,
 			|tok| {
+				if let Some(completion_tokens) = completion_progress.observe(&tok)
+					&& !on_progress(GenerationProgress {
+						phase: GenerationProgressPhase::Decode,
+						prompt_tokens: full_ids.len(),
+						cached_tokens: Some(pool_hit_tokens),
+						completion_tokens,
+						max_output_tokens: options.max_tokens,
+						context_limit,
+					}) {
+					aborted = true;
+					return false;
+				}
 				let keep_going = on_token(tok);
 				if !keep_going {
 					aborted = true;
@@ -2517,6 +2600,108 @@ mod tests {
 			.expect("pending terminal decode must flush");
 		assert_eq!(piece.display, "\u{FFFD}");
 		assert!(decoder.finish().is_none());
+	}
+
+	#[test]
+	fn completion_progress_reports_each_exact_ledger_advance_once() {
+		let token = |completion_tokens| GeneratedToken {
+			id: 7,
+			text: String::new(),
+			finished: false,
+			completion_tokens,
+			kind: TokenKind::Text,
+		};
+		let mut progress = CompletionProgress::default();
+		let observed = [1, 1, 2, 2, 3]
+			.into_iter()
+			.filter_map(|completion_tokens| progress.observe(&token(completion_tokens)))
+			.collect::<Vec<_>>();
+
+		assert_eq!(observed, vec![1, 2, 3]);
+	}
+
+	#[test]
+	fn context_rejection_reports_exact_prompt_progress_first() {
+		let dir = write_tiny_model(false).expect("tiny model");
+		let session = Session::load(dir.path()).expect("fixture session");
+		let mut progress = Vec::new();
+		let options = GenerateOptions {
+			max_tokens: 4,
+			context_tokens: 1,
+			..GenerateOptions::default()
+		};
+
+		let error = session
+			.generate_cached_cancellable(
+				&[ChatMessage::user("hello")],
+				None,
+				options,
+				&|| false,
+				|event| {
+					progress.push(event);
+					true
+				},
+				|_| true,
+			)
+			.expect_err("request must exceed one-token context");
+		let Error::ContextExceeded {
+			prompt_tokens,
+			max_output_tokens,
+			limit,
+		} = error
+		else {
+			panic!("unexpected context error: {error}");
+		};
+
+		assert_eq!(
+			progress,
+			vec![GenerationProgress {
+				phase: GenerationProgressPhase::Prompt,
+				prompt_tokens,
+				cached_tokens: None,
+				completion_tokens: 0,
+				max_output_tokens,
+				context_limit: limit,
+			}]
+		);
+	}
+
+	#[test]
+	fn successful_generation_reports_prefill_then_each_exact_decode_advance() {
+		let dir = write_tiny_model(false).expect("tiny model");
+		let session = Session::load(dir.path()).expect("fixture session");
+		let mut progress = Vec::new();
+		let options = GenerateOptions {
+			max_tokens: 3,
+			context_tokens: 128,
+			..GenerateOptions::default()
+		};
+
+		let reply = session
+			.generate_cached_cancellable(
+				&[ChatMessage::user("hello")],
+				None,
+				options,
+				&|| false,
+				|event| {
+					progress.push(event);
+					true
+				},
+				|_| true,
+			)
+			.expect("generation");
+
+		assert_eq!(progress[0].phase, GenerationProgressPhase::Prompt);
+		assert_eq!(progress[1].phase, GenerationProgressPhase::Prefill);
+		assert_eq!(progress[1].cached_tokens, Some(0));
+		let decode = &progress[2..];
+		assert_eq!(decode.len(), reply.usage.completion_tokens);
+		for (index, event) in decode.iter().enumerate() {
+			assert_eq!(event.phase, GenerationProgressPhase::Decode);
+			assert_eq!(event.prompt_tokens, reply.usage.prompt_tokens);
+			assert_eq!(event.cached_tokens, Some(reply.usage.cached_tokens));
+			assert_eq!(event.completion_tokens, index + 1);
+		}
 	}
 
 	#[test]

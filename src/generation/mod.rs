@@ -19,6 +19,8 @@ use crate::{
 	engine::{
 		generate::{
 			FinishReason as EngineFinishReason, GenerateOptions as EngineOptions, GenerateReply,
+			GenerationProgress as EngineGenerationProgress,
+			GenerationProgressPhase as EngineGenerationProgressPhase,
 			SpeculationStats as EngineSpeculationStats,
 		},
 		sampling::SamplingConfig,
@@ -1091,6 +1093,61 @@ pub struct Usage {
 	pub completion_tokens: u64,
 }
 
+/// Exact cumulative progress for one native model round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct GenerationProgress {
+	/// Current native generation phase.
+	pub phase: GenerationProgressPhase,
+	/// Fully rendered prompt tokens.
+	pub prompt_tokens: u64,
+	/// Prompt tokens served from the KV cache, once cache lookup completes.
+	pub cached_tokens: Option<u64>,
+	/// Token IDs admitted to the exact generated-token ledger so far.
+	pub completion_tokens: u64,
+	/// Output tokens reserved for this request.
+	pub max_output_tokens: u64,
+	/// Effective model/config context limit for this request.
+	pub context_limit: u64,
+}
+
+impl From<EngineGenerationProgress> for GenerationProgress {
+	fn from(progress: EngineGenerationProgress) -> Self {
+		Self {
+			phase: progress.phase.into(),
+			prompt_tokens: progress.prompt_tokens as u64,
+			cached_tokens: progress.cached_tokens.map(|tokens| tokens as u64),
+			completion_tokens: progress.completion_tokens as u64,
+			max_output_tokens: progress.max_output_tokens as u64,
+			context_limit: progress.context_limit as u64,
+		}
+	}
+}
+
+/// Native phase represented by [`GenerationProgress`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum GenerationProgressPhase {
+	/// Prompt rendering and tokenization completed; cache usage is not known yet.
+	Prompt,
+	/// Prompt-cache lookup completed and uncached prompt evaluation is beginning.
+	Prefill,
+	/// At least one generated token entered the exact completion ledger.
+	Decode,
+}
+
+impl From<EngineGenerationProgressPhase> for GenerationProgressPhase {
+	fn from(phase: EngineGenerationProgressPhase) -> Self {
+		match phase {
+			EngineGenerationProgressPhase::Prompt => Self::Prompt,
+			EngineGenerationProgressPhase::Prefill => Self::Prefill,
+			EngineGenerationProgressPhase::Decode => Self::Decode,
+		}
+	}
+}
+
 /// Why generation stopped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1145,6 +1202,8 @@ impl SpeculationStats {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum GenerationEvent {
+	/// Exact cumulative native generation progress.
+	Progress(GenerationProgress),
 	/// Answer text delta.
 	Text(String),
 	/// Reasoning delta.
@@ -1245,6 +1304,47 @@ mod tests {
 			prompt_cache: None,
 			speculative_tokens: None,
 		}
+	}
+
+	#[test]
+	fn progress_event_round_trips_exact_usage_state() {
+		let event = GenerationEvent::Progress(GenerationProgress {
+			phase: GenerationProgressPhase::Prefill,
+			prompt_tokens: 44_167,
+			cached_tokens: Some(16_000),
+			completion_tokens: 0,
+			max_output_tokens: 4_096,
+			context_limit: 65_536,
+		});
+		let encoded = serde_json::to_value(&event).expect("encode progress event");
+		let decoded: GenerationEvent =
+			serde_json::from_value(encoded.clone()).expect("decode progress event");
+
+		assert_eq!(
+			encoded,
+			serde_json::json!({
+				"type": "progress",
+				"data": {
+					"phase": "prefill",
+					"prompt_tokens": 44_167,
+					"cached_tokens": 16_000,
+					"completion_tokens": 0,
+					"max_output_tokens": 4_096,
+					"context_limit": 65_536
+				}
+			})
+		);
+		assert!(matches!(
+			decoded,
+			GenerationEvent::Progress(GenerationProgress {
+				phase: GenerationProgressPhase::Prefill,
+				prompt_tokens: 44_167,
+				cached_tokens: Some(16_000),
+				completion_tokens: 0,
+				max_output_tokens: 4_096,
+				context_limit: 65_536,
+			})
+		));
 	}
 
 	#[test]

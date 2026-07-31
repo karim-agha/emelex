@@ -83,6 +83,8 @@ Invariants:
     receiver backpressure and awaits inference-job completion before returning.
     Custom `AgentGeneration::new` streams have no completion hook and are
     drop-only; their implementations must not detach work that survives Drop.
+    Native model progress is forwarded losslessly with turn/round identity and
+    never enters committed history.
 19. `authority_snapshot` and `build` share one borrowed resolution path. The
     versioned snapshot contains canonical workspace path plus descriptor
     device/inode identity, exact name-sorted tool definitions, built-in

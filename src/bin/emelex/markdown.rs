@@ -43,6 +43,8 @@ enum LineState {
 pub(crate) struct MarkdownStream {
 	enabled: bool,
 	base: &'static str,
+	line_buffered: bool,
+	pending: String,
 	started: bool,
 	state: LineState,
 	asterisks: usize,
@@ -62,6 +64,8 @@ impl MarkdownStream {
 		Self {
 			enabled,
 			base,
+			line_buffered: false,
+			pending: String::new(),
 			started: false,
 			state: LineState::Start(String::new()),
 			asterisks: 0,
@@ -73,8 +77,32 @@ impl MarkdownStream {
 		}
 	}
 
+	/// Hold an unfinished raw line until a newline or [`Self::finish`].
+	///
+	/// Complete lines remain incremental. This mode keeps the terminal cursor at
+	/// a line boundary so an attended live region can be safely redrawn between
+	/// model deltas, including when Markdown styling is disabled.
+	#[must_use]
+	pub(crate) const fn buffer_complete_lines(mut self) -> Self {
+		self.line_buffered = true;
+		self
+	}
+
 	/// Render one exact stream chunk.
 	pub(crate) fn push(&mut self, chunk: &str) -> String {
+		if !self.line_buffered {
+			return self.render_chunk(chunk);
+		}
+		self.pending.push_str(chunk);
+		let Some(boundary) = self.pending.rfind('\n').map(|index| index + 1) else {
+			return String::new();
+		};
+		let suffix = self.pending.split_off(boundary);
+		let complete = std::mem::replace(&mut self.pending, suffix);
+		self.render_chunk(&complete)
+	}
+
+	fn render_chunk(&mut self, chunk: &str) -> String {
 		if !self.enabled {
 			return chunk.to_string();
 		}
@@ -82,6 +110,10 @@ impl MarkdownStream {
 		if !self.started {
 			output.push_str(self.base);
 			self.started = true;
+		} else if self.line_buffered {
+			// A live status frame ends with a reset. Reapply the parser's current
+			// base and inline state before every later complete-line batch.
+			output.push_str(&self.sgr());
 		}
 		for character in chunk.chars() {
 			self.step(character, &mut output);
@@ -91,10 +123,15 @@ impl MarkdownStream {
 
 	/// Flush buffered prefixes or code and reset terminal styling.
 	pub(crate) fn finish(&mut self) -> String {
+		let pending = std::mem::take(&mut self.pending);
+		let mut output = if pending.is_empty() {
+			String::new()
+		} else {
+			self.render_chunk(&pending)
+		};
 		if !self.enabled {
-			return String::new();
+			return output;
 		}
-		let mut output = String::new();
 		match std::mem::replace(&mut self.state, LineState::Start(String::new())) {
 			LineState::Start(prefix) => {
 				for character in prefix.chars() {
@@ -341,6 +378,29 @@ mod tests {
 		let mut stream = MarkdownStream::new(false);
 		assert_eq!(stream.push(text), text);
 		assert!(stream.finish().is_empty());
+	}
+
+	#[test]
+	fn line_buffering_holds_only_the_unfinished_suffix_without_color() {
+		let mut stream = MarkdownStream::new(false).buffer_complete_lines();
+		assert!(stream.push("hel").is_empty());
+		assert_eq!(stream.push("lo\nnext"), "hello\n");
+		assert!(stream.push(" suffix").is_empty());
+		assert_eq!(stream.finish(), "next suffix");
+	}
+
+	#[test]
+	fn line_buffering_reapplies_reasoning_style_after_live_status_reset() {
+		let base = "\u{1b}[2;3m";
+		let mut stream = MarkdownStream::with_base(true, base).buffer_complete_lines();
+		let first = stream.push("first thought\npartial");
+		assert!(first.starts_with(base));
+		assert!(first.contains("first thought"));
+		assert!(!first.contains("partial"));
+
+		let second = stream.push(" thought\n");
+		assert!(second.starts_with("\u{1b}[0m\u{1b}[2;3m"));
+		assert!(second.contains("partial thought"));
 	}
 
 	#[test]

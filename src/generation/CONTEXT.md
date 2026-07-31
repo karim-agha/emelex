@@ -22,6 +22,9 @@
 - One loaded model owns one bounded FIFO inference queue and one GPU thread.
 - Stream backpressure is bounded; cancellation closes the receiver before
   waiting for the engine's cooperative token-boundary stop.
+- Progress is cumulative and exact. `Prompt` has no cache result, `Prefill`
+  carries the resolved cache hit, and each `Decode` event advances with one
+  emitted token ID even when that token produces zero or multiple text spans.
 - `GenerationStream::cancel_and_wait` observes worker completion after
   unblocking the bounded receiver. Its wait is cancellation-safe: dropping a
   pending wait leaves the completion receiver available for another call.

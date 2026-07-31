@@ -26,6 +26,9 @@ validated tools, and keeps one complete ordered in-memory conversation.
   in-order callback and returns an `AgentTurn`. `run_message` is the same core
   operation for text, image, or audio user content. Encoded video fails closed
   until Emelex contains a bundled decoder.
+- Native `GenerationEvent::Progress` is forwarded in order as
+  `AgentEvent::ModelProgress` with its turn and round identity. It remains
+  presentation telemetry; terminal response usage remains commit authority.
 - Answer deltas always concatenate to the terminal answer. If a model bridge
   supplies only an exact prefix, the harness emits the missing terminal suffix
   before model/turn completion; a non-prefix response fails the turn.

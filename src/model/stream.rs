@@ -62,6 +62,7 @@ fn run_job(session: &Session, tx: &tokio::sync::mpsc::Sender<Item>, engine_reque
 			tools.as_deref(),
 			options,
 			&request_cancelled,
+			|_| true,
 			|token| {
 				let choice = match token.kind {
 					TokenKind::Text => {

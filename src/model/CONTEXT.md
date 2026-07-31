@@ -30,8 +30,19 @@
   `Verified`.
 - Fit defaults to batch 1 and 16,384 total context tokens.
 - Required residency is exact selected weights plus live KV/recurrent state,
-  bounded prompt-cache state, the MLX freed-buffer cache, persistent
-  activations, and `max(512 MiB, 10% of weights)`.
+  the configured aggregate prompt-cache capacity, the MLX freed-buffer cache,
+  persistent activations, and `max(512 MiB, 10% of weights)`. Prompt-cache KV
+  follows the exact token capacity while recurrent snapshots retain the maximum
+  entry count.
+- General inspection and fixed loads reserve full-context prompt-cache
+  capacity. Maximum-context loads reserve `min(context, 16,384)` because their
+  client cache is explicitly capped there. The reservation is independent of
+  the default cache toggle because a request may re-enable caching.
+- A managed load repeats compatibility inspection with the same exact cache
+  capacity used by selection and client construction.
+- Maximum-context selection uses this same non-decreasing residency model and
+  returns the largest positive context whose required bytes do not exceed the
+  Metal budget. It never extrapolates one manifest residency sample.
 - MTP is either metadata-advertised or runtime-verified; layout checks are part
   of runtime verification, not a separately addressable support level.
 - Manifests describe Emelex-owned immutable snapshots. Managed external-link

@@ -52,13 +52,34 @@ provider as unavailable rather than pretending the query had no matches.
 At runtime, request output tokens are capped again by the loaded checkpoint's
 effective output ceiling. Immutable requested Session semantics stay
 auditable, but cannot re-expand a model-clamped load policy.
+Chat requests the largest model-declared context that fits the active machine
+budget. When exact weights and a declared maximum are available, this adaptive
+load replaces the fixed configured context for new and resumed chat processes
+without rewriting immutable Session semantics. Incomplete sizing metadata keeps
+the resolved configured context instead of guessing. The attended header labels
+the effective context as `machine-fit` or `configured fallback` accordingly.
 
 Attended chat draws an immediate animated status on stderr after a message is
-submitted, changes it for active tool execution, and clears it before streamed
-answer/reasoning text, tool reports, approvals, or terminal results. JSON and
-non-interactive chat never emit that live region. Rustyline prefers the attended
-terminal, so redirected stdout receives assistant output rather than prompt
-redraws.
+submitted. It remains active across prompt checking, prefill, reasoning, answer
+streaming, tool execution, durable tool-result recording, and final response
+persistence. The live line reports exact cumulative prompt, cache, and output
+tokens from native progress events, the current context reservation while it is
+checked, and average decode tokens per second once two output tokens exist. It
+is cleared only when persistent answer/reasoning lines or event reports will be
+written. Attended terminal Markdown holds the unfinished raw line suffix,
+flushes each complete line before an immediate redraw, and flushes the final
+suffix when the stream changes or ends. Between line flushes, a bounded,
+terminal-neutral live preview shows the suffix above coalesced 120 ms telemetry
+updates. The terminal cursor therefore stays at a safe line boundary while
+token counts and speed continue animating during ordinary no-newline decode.
+Redirected answer stdout and all non-interactive rendering remain immediate;
+reasoning remains line-buffered only when its stderr live region is active. The
+terminal usage footer remains authoritative. JSON and non-interactive chat
+never emit the live region. Rustyline prefers the attended terminal, so
+redirected stdout receives assistant output rather than prompt redraws. A
+human-rendered turn failure is not printed a second time by either the
+interactive input loop or the top-level one-shot error reporter;
+checkpoint-side-effect warnings remain separate.
 Shift-Return inserts a newline when the terminal preserves the modifier;
 Rustyline-decodable LF and Alt-Return variants provide the same operation while
 plain Return submits. Multiline message bytes, including authored outer
@@ -151,8 +172,13 @@ thinking enabled requires `interaction:thinking_toggle`; agent generation and
 chat additionally require `interaction:reasoning_history`, because later
 rounds must preserve prior reasoning. One-shot `--thinking` overrides are
 resolved once and passed consistently to selection, model loading, and the
-request. Chat `--thinking auto` keeps resolved configuration, matching
-one-shot generation semantics. For a new chat without `--model` or a configured
+request. A new chat materializes an unresolved `auto` default as `on` before
+writing immutable Session semantics, so reasoning is shown by default;
+explicit `off` remains off. A resumed Session keeps its exact stored mode:
+historical `auto` is neither migrated nor reinterpreted and retains its prior
+auto/off behavior. New default/on chat selection requires both
+`interaction:thinking_toggle` and `interaction:reasoning_history`, while stored
+historical auto does not. For a new chat without `--model` or a configured
 default, selection groups healthy snapshots by stable model reference and keeps
 the newest from each group. One installed reference is automatic; multiple
 references open the existing arrow selector on a human terminal, while

@@ -203,7 +203,16 @@ async fn turn_forwards_text_and_reasoning_deltas_losslessly() {
 	let directory = tempfile::tempdir().expect("tempdir");
 	let mut terminal = response("hello", Vec::new(), FinishReason::Stop);
 	terminal.reasoning = Some("think again".to_string());
+	let progress = crate::generation::GenerationProgress {
+		phase: crate::generation::GenerationProgressPhase::Decode,
+		prompt_tokens: 10,
+		cached_tokens: Some(2),
+		completion_tokens: 1,
+		max_output_tokens: 32,
+		context_limit: 64,
+	};
 	let model = Arc::new(FakeModel::new(vec![vec![
+		GenerationEvent::Progress(progress),
 		GenerationEvent::Text("hel".to_string()),
 		GenerationEvent::Reasoning("think ".to_string()),
 		GenerationEvent::Text("lo".to_string()),
@@ -234,6 +243,14 @@ async fn turn_forwards_text_and_reasoning_deltas_losslessly() {
 		.collect::<String>();
 	assert_eq!(text, "hello");
 	assert_eq!(reasoning, "think again");
+	assert!(events.iter().any(|event| matches!(
+		event,
+		AgentEvent::ModelProgress {
+			round: 1,
+			progress: observed,
+			..
+		} if *observed == progress
+	)));
 	assert_eq!(turn.response.text, "hello");
 	assert_eq!(session.history().len(), 2);
 	assert!(matches!(

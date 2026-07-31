@@ -241,28 +241,36 @@ pub enum InspectionError {
 ///
 /// Returns an error when required metadata or safetensors headers cannot be
 /// read, parsed, or safely matched to the shard index.
-#[allow(
-	clippy::too_many_lines,
-	reason = "inspection is one fail-closed pipeline whose ordered diagnostics form the report"
-)]
 pub fn inspect_directory(
 	reference: ModelRef,
 	path: &Path,
 	workload: WorkloadProfile,
 	budget_bytes: u64,
 ) -> Result<CompatibilityReport, InspectionError> {
+	inspect_directory_with_prompt_cache_tokens(
+		reference,
+		path,
+		workload,
+		budget_bytes,
+		workload.context_tokens(),
+	)
+}
+
+/// Inspect a checkpoint using the effective aggregate prompt-cache token
+/// ceiling for a load. Zero omits prompt-cache residency from the estimate.
+#[allow(
+	clippy::too_many_lines,
+	reason = "inspection is one fail-closed pipeline whose ordered diagnostics form the report"
+)]
+pub fn inspect_directory_with_prompt_cache_tokens(
+	reference: ModelRef,
+	path: &Path,
+	workload: WorkloadProfile,
+	budget_bytes: u64,
+	prompt_cache_tokens: usize,
+) -> Result<CompatibilityReport, InspectionError> {
 	let config_path = path.join("config.json");
-	let config_bytes =
-		crate::artifact::read_bytes(&config_path, crate::artifact::MAX_MODEL_CONFIG_BYTES)
-			.map_err(|source| InspectionError::Read {
-				path: config_path.clone(),
-				source,
-			})?;
-	let config: Value =
-		serde_json::from_slice(&config_bytes).map_err(|error| InspectionError::Json {
-			path: config_path.clone(),
-			message: error.to_string(),
-		})?;
+	let config = read_model_config(&config_path)?;
 	let model_type = config
 		.get("model_type")
 		.and_then(Value::as_str)
@@ -324,12 +332,13 @@ pub fn inspect_directory(
 		}
 	};
 	let text = config.get("text_config").unwrap_or(&config);
-	let fit = match estimate_fit_from_config(
+	let fit = match estimate_fit_from_config_with_prompt_cache_tokens(
 		text,
 		model_type.as_deref(),
 		inventory.weights_bytes(),
 		workload,
 		budget_bytes,
+		prompt_cache_tokens,
 	) {
 		Ok(fit) => fit,
 		Err(reason) => {
@@ -400,12 +409,116 @@ pub fn inspect_directory(
 	})
 }
 
+/// Select the largest positive context under one model and Metal ceiling.
+///
+/// # Errors
+///
+/// Returns an inspection error when bounded model configuration cannot be read
+/// or its architecture cannot be sized.
+pub fn maximum_fitting_context(
+	path: &Path,
+	weights_bytes: u64,
+	maximum_context_tokens: usize,
+	budget_bytes: u64,
+	prompt_cache_token_ceiling: usize,
+) -> Result<Option<usize>, InspectionError> {
+	let config_path = path.join("config.json");
+	let config = read_model_config(&config_path)?;
+	let model_type = config.get("model_type").and_then(Value::as_str);
+	let text = config.get("text_config").unwrap_or(&config);
+	maximum_fitting_context_from_config(
+		text,
+		model_type,
+		weights_bytes,
+		maximum_context_tokens,
+		budget_bytes,
+		prompt_cache_token_ceiling,
+	)
+	.map_err(|message| InspectionError::Config {
+		path: config_path,
+		message,
+	})
+}
+
+fn maximum_fitting_context_from_config(
+	config: &Value,
+	model_type: Option<&str>,
+	weights_bytes: u64,
+	maximum_context_tokens: usize,
+	budget_bytes: u64,
+	prompt_cache_token_ceiling: usize,
+) -> Result<Option<usize>, String> {
+	if maximum_context_tokens == 0 {
+		return Ok(None);
+	}
+	let fits = |context_tokens| {
+		let workload =
+			WorkloadProfile::new(1, context_tokens).map_err(|error| error.to_string())?;
+		estimate_fit_from_config_with_prompt_cache_tokens(
+			config,
+			model_type,
+			weights_bytes,
+			workload,
+			budget_bytes,
+			context_tokens.min(prompt_cache_token_ceiling),
+		)
+		.map(|fit| fit.fits)
+	};
+	if !fits(1)? {
+		return Ok(None);
+	}
+	if fits(maximum_context_tokens)? {
+		return Ok(Some(maximum_context_tokens));
+	}
+	let mut fitting = 1_usize;
+	let mut not_fitting = maximum_context_tokens;
+	while fitting.saturating_add(1) < not_fitting {
+		let candidate = fitting + (not_fitting - fitting) / 2;
+		if fits(candidate)? {
+			fitting = candidate;
+		} else {
+			not_fitting = candidate;
+		}
+	}
+	Ok(Some(fitting))
+}
+
+fn read_model_config(path: &Path) -> Result<Value, InspectionError> {
+	let bytes = crate::artifact::read_bytes(path, crate::artifact::MAX_MODEL_CONFIG_BYTES)
+		.map_err(|source| InspectionError::Read {
+			path: path.to_path_buf(),
+			source,
+		})?;
+	serde_json::from_slice(&bytes).map_err(|error| InspectionError::Json {
+		path: path.to_path_buf(),
+		message: error.to_string(),
+	})
+}
+
 pub fn estimate_fit_from_config(
 	config: &Value,
 	model_type: Option<&str>,
 	weights_bytes: u64,
 	workload: WorkloadProfile,
 	budget_bytes: u64,
+) -> Result<FitReport, String> {
+	estimate_fit_from_config_with_prompt_cache_tokens(
+		config,
+		model_type,
+		weights_bytes,
+		workload,
+		budget_bytes,
+		workload.context_tokens(),
+	)
+}
+
+fn estimate_fit_from_config_with_prompt_cache_tokens(
+	config: &Value,
+	model_type: Option<&str>,
+	weights_bytes: u64,
+	workload: WorkloadProfile,
+	budget_bytes: u64,
+	prompt_cache_tokens: usize,
 ) -> Result<FitReport, String> {
 	let state = estimate_runtime_state(model_type, config, workload)?;
 	let context = u64::try_from(workload.context_tokens())
@@ -427,14 +540,21 @@ pub fn estimate_fit_from_config(
 		.ok_or_else(|| "persistent-memory estimate overflow".to_string())?,
 	)
 	.ok_or_else(|| "persistent-memory estimate overflow".to_string())?;
-	let cached_recurrent = checked_product(&[
-		state.recurrent_bytes,
-		u64::try_from(crate::engine::prompt_cache::DEFAULT_MAX_ENTRIES)
-			.map_err(|_| "prompt-cache entry count overflow".to_string())?,
-	])
-	.ok_or_else(|| "prompt-cache state estimate overflow".to_string())?;
-	let prompt_cache_bytes = checked_add(state.kv_cache_bytes, cached_recurrent)
-		.ok_or_else(|| "prompt-cache estimate overflow".to_string())?;
+	let prompt_cache_bytes = if prompt_cache_tokens > 0 {
+		let cached_workload = WorkloadProfile::new(workload.batch_size(), prompt_cache_tokens)
+			.map_err(|error| error.to_string())?;
+		let cached_state = estimate_runtime_state(model_type, config, cached_workload)?;
+		let cached_recurrent = checked_product(&[
+			cached_state.recurrent_bytes,
+			u64::try_from(crate::engine::prompt_cache::DEFAULT_MAX_ENTRIES)
+				.map_err(|_| "prompt-cache entry count overflow".to_string())?,
+		])
+		.ok_or_else(|| "prompt-cache state estimate overflow".to_string())?;
+		checked_add(cached_state.kv_cache_bytes, cached_recurrent)
+			.ok_or_else(|| "prompt-cache estimate overflow".to_string())?
+	} else {
+		0
+	};
 	let runtime_cache_bytes = crate::engine::generate::MLX_FREED_BUFFER_CACHE_BYTES;
 	let margin_bytes = (512_u64 << 20).max(weights_bytes / 10);
 	let required_bytes = checked_add(
@@ -1157,6 +1277,111 @@ fn checkpoint_error(error: &CheckpointLayoutError) -> InspectionError {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn attention_config() -> Value {
+		serde_json::json!({
+			"hidden_size": 64,
+			"num_attention_heads": 4,
+			"num_hidden_layers": 4,
+			"num_key_value_heads": 2,
+			"head_dim": 16
+		})
+	}
+
+	fn fit(config: &Value, context_tokens: usize, prompt_cache_tokens: usize) -> FitReport {
+		estimate_fit_from_config_with_prompt_cache_tokens(
+			config,
+			Some("llama"),
+			1 << 20,
+			WorkloadProfile::new(1, context_tokens).unwrap(),
+			u64::MAX,
+			prompt_cache_tokens,
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn maximum_fitting_context_selects_declared_ceiling_when_it_fits() {
+		let config = attention_config();
+		let selected = maximum_fitting_context_from_config(
+			&config,
+			Some("llama"),
+			1 << 20,
+			2_097_152,
+			u64::MAX,
+			crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS,
+		)
+		.unwrap();
+
+		assert_eq!(selected, Some(2_097_152));
+	}
+
+	#[test]
+	fn maximum_fitting_context_selects_exact_machine_boundary() {
+		let config = attention_config();
+		let budget = fit(&config, 63, 63).required_bytes;
+		let selected = maximum_fitting_context_from_config(
+			&config,
+			Some("llama"),
+			1 << 20,
+			128,
+			budget,
+			crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS,
+		)
+		.unwrap();
+
+		assert_eq!(selected, Some(63));
+	}
+
+	#[test]
+	fn maximum_fitting_context_reports_no_safe_positive_context() {
+		let config = attention_config();
+		let budget = fit(&config, 1, 1).required_bytes.saturating_sub(1);
+		let selected = maximum_fitting_context_from_config(
+			&config,
+			Some("llama"),
+			1 << 20,
+			128,
+			budget,
+			crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS,
+		)
+		.unwrap();
+
+		assert_eq!(selected, None);
+	}
+
+	#[test]
+	fn explicit_prompt_cache_ceiling_bounds_residency_above_16k() {
+		let config = attention_config();
+		let cache_limit = crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS;
+		let at_limit = fit(&config, cache_limit, cache_limit);
+		let bounded_above_limit = fit(&config, cache_limit * 2, cache_limit);
+		let full_context_cache = fit(&config, cache_limit * 2, cache_limit * 2);
+
+		assert_eq!(
+			at_limit.prompt_cache_bytes,
+			bounded_above_limit.prompt_cache_bytes
+		);
+		assert!(full_context_cache.prompt_cache_bytes > bounded_above_limit.prompt_cache_bytes);
+	}
+
+	#[test]
+	fn maximum_fitting_context_reserves_cache_for_request_reenable() {
+		let config = attention_config();
+		let maximum = 32_768;
+		let no_cache_budget = fit(&config, maximum, 0).required_bytes;
+		let selected = maximum_fitting_context_from_config(
+			&config,
+			Some("llama"),
+			1 << 20,
+			maximum,
+			no_cache_budget,
+			crate::engine::prompt_cache::DEFAULT_MAX_TOTAL_TOKENS,
+		)
+		.unwrap();
+
+		assert!(selected.is_some_and(|context_tokens| context_tokens < maximum));
+	}
 
 	fn derived_tasks(template: &str) -> BTreeSet<Task> {
 		let directory = tempfile::tempdir().unwrap();
