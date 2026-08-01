@@ -71,6 +71,7 @@ pub(crate) async fn run(
 	let inference = &emelex.config().inference;
 	let required = model_select::filters(model_select::InvocationRequirements {
 		chat: true,
+		translation: false,
 		system_prompt: args.agent,
 		agent: args.agent,
 		image: has_image,

@@ -3164,6 +3164,13 @@ pub(crate) fn validate_user_message(message: &Message) -> Result<(), AgentError>
 		let length = match content {
 			Content::Text(text) => text.len(),
 			Content::Image(data) | Content::Audio(data) | Content::Video(data) => data.len(),
+			Content::Translation { .. } => {
+				return Err(AgentError::Configuration(
+					"translation content is not supported in agent chat sessions; use \
+					 `emelex translate` or the Client generation API"
+						.to_string(),
+				));
+			}
 		};
 		if matches!(content, Content::Video(_)) {
 			return Err(AgentError::Configuration(
@@ -3282,7 +3289,10 @@ pub(crate) fn validate_history_message(
 				.iter()
 				.filter_map(|content| match content {
 					Content::Text(text) => Some(text.len()),
-					Content::Image(_) | Content::Audio(_) | Content::Video(_) => None,
+					Content::Image(_)
+					| Content::Audio(_)
+					| Content::Video(_)
+					| Content::Translation { .. } => None,
 				})
 				.try_fold(0_usize, usize::checked_add)
 				.ok_or_else(|| invalid_history(index, "system content size overflow"))?;
@@ -3324,7 +3334,10 @@ pub(crate) fn validate_history_message(
 				.iter()
 				.filter_map(|content| match content {
 					Content::Text(text) => Some(text.len()),
-					Content::Image(_) | Content::Audio(_) | Content::Video(_) => None,
+					Content::Image(_)
+					| Content::Audio(_)
+					| Content::Video(_)
+					| Content::Translation { .. } => None,
 				})
 				.try_fold(0_usize, usize::checked_add)
 				.ok_or_else(|| invalid_history(index, "tool content size overflow"))?;
@@ -3373,7 +3386,10 @@ fn validate_assistant_history_message(index: usize, message: &Message) -> Result
 		.iter()
 		.filter_map(|content| match content {
 			Content::Text(text) => Some(text.len()),
-			Content::Image(_) | Content::Audio(_) | Content::Video(_) => None,
+			Content::Image(_)
+			| Content::Audio(_)
+			| Content::Video(_)
+			| Content::Translation { .. } => None,
 		})
 		.try_fold(0_usize, usize::checked_add)
 		.ok_or_else(|| invalid_history(index, "assistant text size overflow"))?;

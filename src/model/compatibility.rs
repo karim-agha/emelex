@@ -15,8 +15,10 @@ use super::{
 	layout::{CheckpointLayoutError, checkpoint_plan},
 };
 
-const SUPPORTED_MODEL_TYPES: &[&str] = &[
+pub const SUPPORTED_MODEL_TYPES: &[&str] = &[
 	"dhara_ar",
+	"gemma3",
+	"gemma3_text",
 	"gemma4",
 	"gemma4_text",
 	"gemma4_unified",
@@ -391,7 +393,7 @@ pub fn inspect_directory_with_prompt_cache_tokens(
 			.collect(),
 		},
 	)?;
-	if !traits.tasks.contains(&Task::Chat) {
+	if !traits.tasks.contains(&Task::Chat) && !traits.tasks.contains(&Task::Translation) {
 		reasons.push(
 			"no supported chat template in chat_template.jinja, chat_templates/default.jinja, \
 			 tokenizer_config.json, or processor_config.json"
@@ -704,6 +706,59 @@ fn estimate_runtime_state(
 				.ok_or_else(|| "Nemotron state estimate overflow".to_string())?,
 			})
 		}
+		Some("gemma3" | "gemma3_text") => {
+			// 5:1 sliding/full interleave: sliding layers only ever hold
+			// their window, so charging full context for every layer (the
+			// default arm) would overestimate KV roughly 5x and wrongly
+			// fail machine fit for large checkpoints.
+			let sliding_window = integer(config, "sliding_window").unwrap_or(1024);
+			// HF spells the fallback pattern `_sliding_window_pattern`.
+			let pattern = integer(config, "_sliding_window_pattern")
+				.or_else(|| integer(config, "sliding_window_pattern"))
+				.unwrap_or(6);
+			if pattern == 0 {
+				return Err("gemma3 sliding_window_pattern must be positive".to_string());
+			}
+			let mut token_layers = 0_u64;
+			if let Some(layer_types) = config.get("layer_types").and_then(Value::as_array) {
+				if u64::try_from(layer_types.len())
+					.map_err(|_| "gemma3 layer count overflow".to_string())?
+					!= layers
+				{
+					return Err("gemma3 layer_types length mismatch".to_string());
+				}
+				for kind in layer_types {
+					match kind.as_str() {
+						Some("full_attention") => {
+							token_layers = checked_add(token_layers, context)
+								.ok_or_else(|| "gemma3 fit estimate overflow".to_string())?;
+						}
+						Some("sliding_attention") => {
+							token_layers =
+								checked_add(token_layers, context.min(sliding_window))
+									.ok_or_else(|| "gemma3 fit estimate overflow".to_string())?;
+						}
+						_ => return Err("unsupported gemma3 layer type".to_string()),
+					}
+				}
+			} else {
+				for index in 0..layers {
+					let tokens = if (index + 1) % pattern == 0 {
+						context
+					} else {
+						context.min(sliding_window)
+					};
+					token_layers = checked_add(token_layers, tokens)
+						.ok_or_else(|| "gemma3 fit estimate overflow".to_string())?;
+				}
+			}
+			let kv_cache_bytes = checked_product(&[2, token_layers, kv_heads, head_dim, batch, 2])
+				.ok_or_else(|| "gemma3 KV estimate overflow".to_string())?;
+			Ok(RuntimeState {
+				kv_cache_bytes,
+				recurrent_bytes: 0,
+			})
+		}
 		Some("laguna") => {
 			let sliding_window = integer(config, "sliding_window").unwrap_or(512);
 			let layer_types = config.get("layer_types").and_then(Value::as_array);
@@ -858,15 +913,30 @@ fn derive_traits(
 					&format!("chat template cannot be compiled safely: {error}"),
 				)
 			})?;
-		traits.tasks.insert(Task::Chat);
-		traits
-			.confidence
-			.insert("task:chat".to_string(), TraitConfidence::Inferred);
-		traits.evidence.push(TraitEvidence {
-			trait_key: "task:chat".to_string(),
-			source: EvidenceSource::Tokenizer,
-			detail: "chat template completed a bounded baseline render".to_string(),
-		});
+		if capabilities.translation {
+			traits.tasks.insert(Task::Translation);
+			traits
+				.confidence
+				.insert("task:translation".to_string(), TraitConfidence::Inferred);
+			traits.evidence.push(TraitEvidence {
+				trait_key: "task:translation".to_string(),
+				source: EvidenceSource::Tokenizer,
+				detail: "chat template rendered a structured translation message with a \
+				 per-message language pair"
+					.to_string(),
+			});
+		}
+		if capabilities.chat {
+			traits.tasks.insert(Task::Chat);
+			traits
+				.confidence
+				.insert("task:chat".to_string(), TraitConfidence::Inferred);
+			traits.evidence.push(TraitEvidence {
+				trait_key: "task:chat".to_string(),
+				source: EvidenceSource::Tokenizer,
+				detail: "chat template completed a bounded baseline render".to_string(),
+			});
+		}
 		if capabilities.system_prompt {
 			traits.extras.insert(
 				"interaction:system_prompt".to_string(),
@@ -1301,6 +1371,42 @@ mod tests {
 	}
 
 	#[test]
+	fn gemma3_runtime_state_charges_sliding_layers_by_window() {
+		let config = serde_json::json!({
+			"hidden_size": 64,
+			"num_attention_heads": 4,
+			"num_hidden_layers": 6,
+			"num_key_value_heads": 2,
+			"head_dim": 16,
+			"sliding_window": 1024,
+			"layer_types": [
+				"sliding_attention", "sliding_attention", "sliding_attention",
+				"sliding_attention", "sliding_attention", "full_attention"
+			]
+		});
+		let workload = WorkloadProfile::new(1, 4096).unwrap();
+		let state = estimate_runtime_state(Some("gemma3"), &config, workload).unwrap();
+		// token_layers = 5 sliding * 1024 + 1 full * 4096 = 9216;
+		// kv bytes = 2 (K+V) * 9216 * 2 kv-heads * 16 head-dim * 1 batch * 2 (bf16).
+		assert_eq!(state.kv_cache_bytes, 1_179_648);
+		assert_eq!(state.recurrent_bytes, 0);
+
+		// Without layer_types the underscored pattern key derives the same mix.
+		let mut fallback = config.clone();
+		if let Some(object) = fallback.as_object_mut() {
+			object.remove("layer_types");
+		}
+		fallback["_sliding_window_pattern"] = serde_json::json!(6);
+		let derived = estimate_runtime_state(Some("gemma3_text"), &fallback, workload).unwrap();
+		assert_eq!(derived.kv_cache_bytes, state.kv_cache_bytes);
+
+		// A layer_types length mismatch is an error, not a silent estimate.
+		let mut mismatched = config;
+		mismatched["layer_types"] = serde_json::json!(["sliding_attention"]);
+		assert!(estimate_runtime_state(Some("gemma3"), &mismatched, workload).is_err());
+	}
+
+	#[test]
 	fn maximum_fitting_context_selects_declared_ceiling_when_it_fits() {
 		let config = attention_config();
 		let selected = maximum_fitting_context_from_config(
@@ -1398,6 +1504,23 @@ mod tests {
 		)
 		.unwrap()
 		.tasks
+	}
+
+	#[test]
+	fn local_inspection_derives_translation_task_from_translation_only_template() {
+		let tasks = derived_tasks(
+			r"
+{%- for message in messages -%}
+{%- if message['content'] is string -%}
+{{ raise_exception('translation mapping required') }}
+{%- else -%}
+{{ message['content'][0]['text'] }}
+{%- endif -%}
+{%- endfor -%}
+",
+		);
+		assert!(tasks.contains(&Task::Translation));
+		assert!(!tasks.contains(&Task::Chat));
 	}
 
 	#[test]

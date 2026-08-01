@@ -28,6 +28,10 @@
   duplicate, non-text, or mismatched results are rejected.
 - Static metadata yields `Estimated`; only successful runtime load/probe yields
   `Verified`.
+- Whitelisting a `model_type` and giving it an engine preflight arm are one
+  atomic change: local inspection treats preflight failure as a hard error for
+  whitelisted types, so a missing arm makes checkpoints uninspectable rather
+  than incompatible. A table test pins every whitelisted type to an arm.
 - Fit defaults to batch 1 and 16,384 total context tokens.
 - Required residency is exact selected weights plus live KV/recurrent state,
   the configured aggregate prompt-cache capacity, the MLX freed-buffer cache,
@@ -77,3 +81,8 @@ client-global snapshot is involved. Generation jobs serialize on the
 client-owned inference thread and use bounded streaming backpressure. Dropped
 completion futures and streams are checked before queued inference starts and
 cooperatively during decoding.
+- `Task::Translation` is granted from the same template probe as
+  `Task::Chat` but independently: translation-only templates yield
+  `{Translation}` without `Chat`, and static compatibility accepts either
+  task as the conversational-surface requirement. `task:translation` is
+  part of the closed filter vocabulary and the remote catalog.

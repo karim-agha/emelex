@@ -46,6 +46,8 @@ pub(crate) enum Command {
 	Resume(ResumeArgs),
 	/// Run one non-interactive inference request.
 	Generate(GenerateArgs),
+	/// Translate text with a translation model (one-shot or interactive).
+	Translate(TranslateArgs),
 	/// Explore or download visible Hugging Face models.
 	Hub {
 		#[command(subcommand)]
@@ -198,6 +200,31 @@ pub(crate) struct GenerateArgs {
 	/// Permit every protected agent tool invocation.
 	#[arg(long, requires = "agent")]
 	pub(crate) approve_all: bool,
+}
+
+/// Structured translation options.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct TranslateArgs {
+	/// Text to translate; when absent, read UTF-8 stdin, or start the
+	/// interactive translator on a terminal.
+	pub(crate) text: Option<String>,
+	/// Source language code (BCP-47-style, e.g. en); falls back to the
+	/// `[translate] source` configuration key.
+	#[arg(long = "from", short = 'f', value_name = "CODE")]
+	pub(crate) from: Option<String>,
+	/// Target language code (BCP-47-style, e.g. de); falls back to the
+	/// `[translate] target` configuration key.
+	#[arg(long = "to", short = 't', value_name = "CODE")]
+	pub(crate) to: Option<String>,
+	/// Stable installed model reference.
+	#[arg(long)]
+	pub(crate) model: Option<ModelRef>,
+	/// Maximum generated tokens.
+	#[arg(long)]
+	pub(crate) max_tokens: Option<usize>,
+	/// Sampling temperature.
+	#[arg(long)]
+	pub(crate) temperature: Option<f32>,
 }
 
 /// Thinking-mode CLI value.
@@ -736,5 +763,33 @@ mod tests {
 		let job = Uuid::now_v7();
 		assert!(Cli::try_parse_from(["emelex", "memory", "failures", "--limit", "10"]).is_ok());
 		assert!(Cli::try_parse_from(["emelex", "memory", "retry", &job.to_string()]).is_ok());
+	}
+
+	#[test]
+	fn translate_parses_pair_flags_and_optional_text() {
+		let cli = Cli::try_parse_from([
+			"emelex",
+			"translate",
+			"--from",
+			"en",
+			"--to",
+			"de",
+			"Good morning",
+		])
+		.expect("translate command");
+		assert!(matches!(
+			cli.command,
+			Command::Translate(TranslateArgs {
+				from: Some(ref from),
+				to: Some(ref to),
+				text: Some(ref text),
+				model: None,
+				..
+			}) if from == "en" && to == "de" && text == "Good morning"
+		));
+
+		// Short flags and a bare invocation (interactive mode) both parse.
+		assert!(Cli::try_parse_from(["emelex", "translate", "-f", "en", "-t", "de"]).is_ok());
+		assert!(Cli::try_parse_from(["emelex", "translate"]).is_ok());
 	}
 }

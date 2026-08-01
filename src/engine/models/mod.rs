@@ -6,6 +6,7 @@ pub mod cache;
 pub mod config;
 pub mod dhara;
 pub mod gated_delta;
+pub mod gemma3;
 pub mod gemma4;
 pub mod laguna;
 pub mod mamba2;
@@ -43,6 +44,7 @@ pub enum Model {
 	Qwen2(qwen2::Qwen2Model),
 	Qwen3(qwen3::Qwen3Model),
 	Qwen35(qwen3_5::Qwen35Model),
+	Gemma3(gemma3::Gemma3Model),
 	Gemma4(gemma4::Gemma4Model),
 	NemotronH(nemotron::NemotronModel),
 	Dhara(dhara::DharaModel),
@@ -103,8 +105,16 @@ impl Model {
 
 		config::validate_checkpoint_config(&config_json)?;
 		let quant = Quantization::from_config(&config_json)?;
+		// The text-only gemma3 port never loads multimodal towers — skip
+		// their tensors before materialization (excluded lazy handles are
+		// freed) rather than paying peak memory for weights `sanitize`
+		// would immediately drop.
+		let skip_multimodal = matches!(model_type, "gemma3" | "gemma3_text");
 		let tensors = weights::load_snapshot(snapshot, model_dir, |name| {
-			allow_mtp || !weights::is_mtp_tensor_name(name)
+			(allow_mtp || !weights::is_mtp_tensor_name(name))
+				&& !(skip_multimodal
+					&& (name.starts_with("vision_tower.")
+						|| name.starts_with("multi_modal_projector.")))
 		})?;
 		let mut weight_map = WeightMap::new(tensors, quant);
 
@@ -126,6 +136,11 @@ impl Model {
 				qwen3::sanitize(&mut weight_map, tie);
 				let model = qwen3::Qwen3Model::load(weight_map, &config_json)?;
 				Ok(Model::Qwen3(model))
+			}
+			"gemma3" | "gemma3_text" => {
+				gemma3::sanitize(&mut weight_map);
+				let model = gemma3::Gemma3Model::load(weight_map, &config_json)?;
+				Ok(Model::Gemma3(model))
 			}
 			"gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
 				gemma4::sanitize(&mut weight_map);
@@ -186,8 +201,8 @@ impl Model {
 			}
 			other => Err(Error::Model(format!(
 				"unsupported model_type '{other}' (supported: qwen2, qwen3, qwen3_5, \
-				 qwen3_5_moe, gemma4, gemma4_unified, nemotron_h, llama, dhara_ar, \
-				 laguna)"
+				 qwen3_5_moe, gemma3, gemma4, gemma4_unified, nemotron_h, llama, \
+				 dhara_ar, laguna)"
 			))),
 		}
 	}
@@ -197,6 +212,7 @@ impl Model {
 			Model::Qwen2(m) => m.new_caches(),
 			Model::Qwen3(m) => m.new_caches(),
 			Model::Qwen35(m) => m.new_caches(),
+			Model::Gemma3(m) => m.new_caches(),
 			Model::Gemma4(m) => m.new_caches(),
 			Model::NemotronH(m) => m.new_caches(),
 			Model::Dhara(m) => m.new_caches(),
@@ -211,6 +227,7 @@ impl Model {
 			Model::Qwen2(m) => m.forward(input_ids, caches),
 			Model::Qwen3(m) => m.forward(input_ids, caches),
 			Model::Qwen35(m) => m.forward(input_ids, caches),
+			Model::Gemma3(m) => m.forward(input_ids, caches),
 			Model::Gemma4(m) => m.forward(input_ids, caches),
 			Model::NemotronH(m) => m.forward(input_ids, caches),
 			Model::Dhara(m) => m.forward(input_ids, caches),

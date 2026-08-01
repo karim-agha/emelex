@@ -113,3 +113,8 @@
 - Both public Hub download futures own a linked private cancellation child.
   Dropping either future cancels detached pre-commit work without mutating a
   caller token shared by sibling operations.
+- A chat template that renders neither plain chat nor structured
+  translation is a soft incompatibility (diagnostic), never a hard
+  enrichment error; `Task::Chat` and `Task::Translation` are granted
+  independently from the probe's `chat`/`translation` capability bits, and
+  the no-supported-template diagnostic fires only when both are absent.

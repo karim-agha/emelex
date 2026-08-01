@@ -36,6 +36,9 @@ pub enum Task {
 	StructuredOutput,
 	/// Explicit reasoning/thinking spans.
 	Reasoning,
+	/// Structured translation through a translation-shaped chat template
+	/// (TranslateGemma-style per-message language pairs).
+	Translation,
 }
 
 /// Confidence state for a capability or compatibility fact.
@@ -244,6 +247,7 @@ impl ModelTraits {
 			"output:audio" => self.output.contains(&Modality::Audio),
 			"task:text_generation" => self.tasks.contains(&Task::TextGeneration),
 			"task:chat" => self.tasks.contains(&Task::Chat),
+			"task:translation" => self.tasks.contains(&Task::Translation),
 			"interaction:tools" => self.tasks.contains(&Task::ToolUse),
 			"interaction:system_prompt" => self
 				.extras
@@ -432,6 +436,7 @@ const fn known_capability(value: &str) -> bool {
 			| b"output:audio"
 			| b"task:text_generation"
 			| b"task:chat"
+			| b"task:translation"
 			| b"interaction:tools"
 			| b"interaction:system_prompt"
 			| b"interaction:reasoning"

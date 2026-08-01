@@ -296,10 +296,18 @@ async fn select_search_result(
 
 fn cli_search_requirements(require: Vec<TraitFilter>) -> anyhow::Result<Vec<TraitFilter>> {
 	let mut requirements = require.into_iter().collect::<BTreeSet<_>>();
-	requirements.insert(
-		TraitFilter::parse(CLI_REQUIRED_SEARCH_TRAIT)
-			.context("build implicit CLI Hub search requirement")?,
-	);
+	// Translation models are tool-less by design; injecting the implicit
+	// tools requirement would hide every one of them from an explicit
+	// `--require task:translation` search.
+	let translation_search = requirements
+		.iter()
+		.any(|filter| filter.to_string() == "task:translation");
+	if !translation_search {
+		requirements.insert(
+			TraitFilter::parse(CLI_REQUIRED_SEARCH_TRAIT)
+				.context("build implicit CLI Hub search requirement")?,
+		);
+	}
 	Ok(requirements.into_iter().collect())
 }
 
@@ -903,6 +911,7 @@ fn search_task_labels(traits: &ModelTraits) -> Vec<&'static str> {
 			Task::ToolUse => "tools",
 			Task::StructuredOutput => "structured output",
 			Task::Reasoning => "reasoning",
+			Task::Translation => "translation",
 			_ => "other task",
 		};
 		if !tasks.contains(&label) {
@@ -2002,6 +2011,21 @@ mod tests {
 				.map(TraitFilter::as_str)
 				.collect::<Vec<_>>(),
 			["interaction:reasoning", CLI_REQUIRED_SEARCH_TRAIT]
+		);
+	}
+
+	#[test]
+	fn cli_search_skips_tools_injection_for_translation_requirement() {
+		let translation = TraitFilter::parse("task:translation").expect("translation capability");
+		let requirements =
+			cli_search_requirements(vec![translation]).expect("CLI search requirements");
+
+		assert_eq!(
+			requirements
+				.iter()
+				.map(TraitFilter::as_str)
+				.collect::<Vec<_>>(),
+			["task:translation"]
 		);
 	}
 

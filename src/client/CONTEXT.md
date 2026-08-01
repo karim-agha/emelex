@@ -54,3 +54,9 @@
 - `Session` and native `Array` are structurally `!Send + !Sync`. The dedicated
   inference worker constructs, uses, and drops its session on that same OS
   thread; only Emelex job closures and result values cross the queue.
+- Translation gating is two-way and runs before queueing: translation
+  content requires `ChatCapabilities.translation`, and plain user text
+  against a translation-only template (`translation && !chat`) fails with
+  a `task:chat` capability error that names `emelex translate`. The
+  template's embedded language table (when present) is extracted once at
+  load and exposed through `Client::translation_languages`.

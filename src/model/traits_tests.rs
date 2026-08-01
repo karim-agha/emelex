@@ -82,3 +82,12 @@ fn unsupported_video_filters_are_rejected() {
 		assert!(TraitFilter::parse(value).is_err(), "{value}");
 	}
 }
+
+#[test]
+fn task_translation_filter_matches_translation_task() {
+	let filter = TraitFilter::parse("task:translation").expect("known capability");
+	let mut traits = ModelTraits::default();
+	assert!(!traits.satisfies(&filter));
+	traits.tasks.insert(Task::Translation);
+	assert!(traits.satisfies(&filter));
+}

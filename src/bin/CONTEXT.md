@@ -192,3 +192,9 @@
 - `/compact` only queues while the chat lease is live. Exit chat, run
   `emelex memory work`, then resume so compaction can complete and replay can
   install the verified Summary.
+- `translate` is stateless per line: every input builds one
+  `Message::translation` request; slash-state (the language pair) lives in
+  the process only and is never persisted into Session semantics.
+- The implicit `interaction:tools` Hub-search requirement is skipped only
+  when the explicit `--require` set contains `task:translation`; every
+  other search keeps today's behavior.

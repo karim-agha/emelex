@@ -235,6 +235,14 @@ pub(crate) fn validate_request_shape(
 					})?;
 					data.len()
 				}
+				Content::Translation {
+					source_lang,
+					target_lang,
+					text,
+				} => source_lang
+					.len()
+					.saturating_add(target_lang.len())
+					.saturating_add(text.len()),
 			};
 			content_bytes = content_bytes.checked_add(bytes).ok_or_else(|| {
 				Error::InvalidRequest("conversation content size overflow".to_string())
@@ -459,6 +467,26 @@ impl Message {
 		Self::text(Role::Assistant, text)
 	}
 
+	/// Structured translation request (user role): translate `text` from
+	/// `source_lang` to `target_lang` (BCP-47-style codes). Only accepted
+	/// by models whose chat template supports translation content — check
+	/// [`crate::Client::supports_translation`].
+	pub fn translation(
+		source_lang: impl Into<String>,
+		target_lang: impl Into<String>,
+		text: impl Into<String>,
+	) -> Self {
+		Self {
+			role: Role::User,
+			content: vec![Content::Translation {
+				source_lang: source_lang.into(),
+				target_lang: target_lang.into(),
+				text: text.into(),
+			}],
+			..Self::default()
+		}
+	}
+
 	/// Tool-result message.
 	pub fn tool(call_id: impl Into<String>, text: impl Into<String>) -> Self {
 		Self {
@@ -548,11 +576,35 @@ impl Message {
 				)));
 			}
 		}
+		let has_translation = self
+			.content
+			.iter()
+			.any(|part| matches!(part, Content::Translation { .. }));
+		if has_translation {
+			if self.role != Role::User {
+				return Err(Error::InvalidRequest(
+					"translation content is valid only on user messages".to_string(),
+				));
+			}
+			if self.content.len() != 1 {
+				return Err(Error::InvalidRequest(
+					"translation content must be the only part of its message".to_string(),
+				));
+			}
+		}
 		let mut bytes = 0_usize;
 		for part in &self.content {
 			let length = match part {
 				Content::Text(text) => text.len(),
 				Content::Image(data) | Content::Audio(data) | Content::Video(data) => data.len(),
+				Content::Translation {
+					source_lang,
+					target_lang,
+					text,
+				} => source_lang
+					.len()
+					.saturating_add(target_lang.len())
+					.saturating_add(text.len()),
 			};
 			bytes = bytes.checked_add(length).ok_or_else(|| {
 				Error::InvalidRequest("message content size overflow".to_string())
@@ -577,6 +629,24 @@ impl Message {
 					return Err(Error::UnsupportedContent(
 						"loaded model does not support audio input".to_string(),
 					));
+				}
+				Content::Translation {
+					source_lang,
+					target_lang,
+					text,
+				} => {
+					if source_lang.trim().is_empty() || target_lang.trim().is_empty() {
+						return Err(Error::InvalidRequest(
+							"translation content requires non-empty source and target \
+							 language codes"
+								.to_string(),
+						));
+					}
+					if text.trim().is_empty() {
+						return Err(Error::InvalidRequest(
+							"translation content requires non-empty text".to_string(),
+						));
+					}
 				}
 				_ => {}
 			}
@@ -646,6 +716,18 @@ pub enum Content {
 	Audio(Vec<u8>),
 	/// Encoded video bytes.
 	Video(Vec<u8>),
+	/// Structured translation request for translation models
+	/// (TranslateGemma-style templates): translate `text` from
+	/// `source_lang` to `target_lang` (BCP-47-style codes, e.g. "en",
+	/// "pt-BR"). Must be the only content part of a user message.
+	Translation {
+		/// Source language code.
+		source_lang: String,
+		/// Target language code.
+		target_lang: String,
+		/// Text to translate.
+		text: String,
+	},
 }
 
 impl Content {
@@ -655,6 +737,15 @@ impl Content {
 			Self::Image(bytes) => ContentPart::Image(ImageContent { bytes }),
 			Self::Audio(bytes) => ContentPart::Audio(AudioContent { bytes }),
 			Self::Video(bytes) => ContentPart::Video(VideoContent { bytes }),
+			Self::Translation {
+				source_lang,
+				target_lang,
+				text,
+			} => ContentPart::Translation(crate::engine::tokenizer::TranslationContent {
+				source_lang,
+				target_lang,
+				text,
+			}),
 		}
 	}
 }
@@ -1365,6 +1456,89 @@ mod tests {
 		assert!(matches!(
 			request.into_engine(&defaults(), false, false),
 			Err(Error::InvalidRequest(_))
+		));
+	}
+
+	#[test]
+	fn message_translation_constructor_builds_sole_user_part() {
+		let message = Message::translation("en", "de", "hello");
+		assert_eq!(message.role, Role::User);
+		assert!(matches!(
+			message.content.as_slice(),
+			[Content::Translation { source_lang, target_lang, text }]
+				if source_lang == "en" && target_lang == "de" && text == "hello"
+		));
+		let request = GenerationRequest::default().message(message);
+		assert!(request.into_engine(&defaults(), false, false).is_ok());
+	}
+
+	#[test]
+	fn translation_part_must_be_sole_user_content() {
+		let mixed = Message {
+			role: Role::User,
+			content: vec![
+				Content::Text("extra".to_string()),
+				Content::Translation {
+					source_lang: "en".to_string(),
+					target_lang: "de".to_string(),
+					text: "hello".to_string(),
+				},
+			],
+			..Message::default()
+		};
+		assert!(matches!(
+			GenerationRequest::default()
+				.message(mixed)
+				.into_engine(&defaults(), false, false),
+			Err(Error::InvalidRequest(message)) if message.contains("only part")
+		));
+
+		let mut assistant = Message::translation("en", "de", "hello");
+		assistant.role = Role::Assistant;
+		assert!(matches!(
+			GenerationRequest::default()
+				.message(assistant)
+				.into_engine(&defaults(), false, false),
+			Err(Error::InvalidRequest(message)) if message.contains("user messages")
+		));
+
+		let empty_codes = Message::translation(" ", "de", "hello");
+		assert!(matches!(
+			GenerationRequest::default()
+				.message(empty_codes)
+				.into_engine(&defaults(), false, false),
+			Err(Error::InvalidRequest(message)) if message.contains("language codes")
+		));
+
+		let empty_text = Message::translation("en", "de", "  ");
+		assert!(matches!(
+			GenerationRequest::default()
+				.message(empty_text)
+				.into_engine(&defaults(), false, false),
+			Err(Error::InvalidRequest(message)) if message.contains("non-empty text")
+		));
+	}
+
+	#[test]
+	fn content_translation_serde_round_trip_is_stable() {
+		let content = Content::Translation {
+			source_lang: "en".to_string(),
+			target_lang: "de".to_string(),
+			text: "hello".to_string(),
+		};
+		let encoded = serde_json::to_value(&content).expect("serialize");
+		assert_eq!(
+			encoded,
+			serde_json::json!({
+				"type": "translation",
+				"data": {"source_lang": "en", "target_lang": "de", "text": "hello"}
+			})
+		);
+		let decoded: Content = serde_json::from_value(encoded).expect("deserialize");
+		assert!(matches!(
+			decoded,
+			Content::Translation { source_lang, target_lang, text }
+				if source_lang == "en" && target_lang == "de" && text == "hello"
 		));
 	}
 

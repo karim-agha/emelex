@@ -208,6 +208,25 @@ Subprocess regressions cover all four paths and prove stream reuse.
 kernels: affine groups 32/64/128 with 2/3/4/5/6/8 bits, mxfp4 32x4,
 mxfp8 32x8, and nvfp4 16x4.
 
+`tokenizer.rs (translation)` — `ContentPart::Translation` serializes as a
+single `{type:"text", source_lang_code, target_lang_code, text}` mapping
+(the TranslateGemma contract); the capability probe grants `translation`
+only when that render preserves the sentinel without leaking the mapping's
+key names, and tolerates a raising plain-string baseline only in that
+case. The embedded `set languages = {...}` table is extracted with a
+brace-matching scanner (≥50 entries required, fail-open to `None`).
+
+`models/gemma3` — text-only Gemma 3 (TranslateGemma et al.): 5:1
+sliding/full-attention interleave (explicit `layer_types`, or the
+underscore-spelled `_sliding_window_pattern` fallback), per-layer-type RoPE
+with linear position scaling on full layers only, `query_pre_attn_scalar`-
+derived attention scale, and a bf16-rounded `sqrt(hidden_size)` embedding
+normalizer matching the reference implementation. Weight keys are
+canonicalized to the `language_model.model.*` prefix; bare-prefix
+`Gemma3ForCausalLM` checkpoints are renamed with the identical mapping
+applied to quantization-override keys, and multimodal tower tensors are
+skipped before materialization and dropped by sanitize.
+
 `models/gemma4` — configuration-controlled optional projections are rechecked
 at use and return typed model errors if construction invariants drift; model
 input cannot turn a missing component into a Rust panic.

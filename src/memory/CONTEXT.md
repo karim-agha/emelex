@@ -105,3 +105,6 @@
   v5-to-v6 renames snapshot tool JSON to authority JSON and adds constrained
   active-turn, pending-invocation, result-origin, and asset-reference journals;
   existing Sessions and transcript events remain unchanged.
+- Translation content never reaches durable storage: the agent rejects it
+  at input/history validation, and `encode_durable_message` fails closed
+  if it ever sees one (`DurableContent` has no representation for it).

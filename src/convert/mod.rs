@@ -446,6 +446,13 @@ fn validate_engine_request(messages: &[ChatMessage], tools: &[Tool]) -> Result<(
 					media_parts = checked_increment(media_parts, "media part count")?;
 					video.bytes.len()
 				}
+				ContentPart::Translation(_) => {
+					return Err(Error::InvalidRequest(
+						"translation content is not supported through the rig bridge; use \
+						 the native generation API or `emelex translate`"
+							.to_string(),
+					));
+				}
 			};
 			message_bytes = message_bytes.checked_add(part_bytes).ok_or_else(|| {
 				Error::InvalidRequest("message content size overflow".to_string())

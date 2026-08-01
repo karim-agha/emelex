@@ -759,7 +759,7 @@ fn content_part_media_kind(part: &ContentPart) -> Option<MediaBindingKind> {
 		ContentPart::Image(_) => Some(MediaBindingKind::Image),
 		ContentPart::Audio(_) => Some(MediaBindingKind::Audio),
 		ContentPart::Video(_) => Some(MediaBindingKind::Video),
-		ContentPart::Text(_) => None,
+		ContentPart::Text(_) | ContentPart::Translation(_) => None,
 	}
 }
 
@@ -1262,7 +1262,7 @@ impl Session {
 				ContentPart::Image(image) => resource_budget.reserve_encoded(image.bytes.len())?,
 				ContentPart::Audio(audio) => resource_budget.reserve_encoded(audio.bytes.len())?,
 				ContentPart::Video(video) => resource_budget.reserve_encoded(video.bytes.len())?,
-				ContentPart::Text(_) => {}
+				ContentPart::Text(_) | ContentPart::Translation(_) => {}
 			}
 		}
 
@@ -1350,7 +1350,7 @@ impl Session {
 					)?;
 					audio_queue.push(processed);
 				}
-				ContentPart::Text(_) => {}
+				ContentPart::Text(_) | ContentPart::Translation(_) => {}
 			}
 		}
 

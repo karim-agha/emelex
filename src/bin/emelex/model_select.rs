@@ -7,7 +7,7 @@ use emelex::{
 	Emelex,
 	config::Config,
 	hub::HubSearch,
-	model::{InstalledModel, ModelRef, ModelTraits, TraitFilter},
+	model::{InstalledModel, ModelRef, ModelTraits, Task, TraitFilter},
 	models::{ModelManager, ModelsError},
 };
 
@@ -261,6 +261,23 @@ pub(crate) fn validate_installed_traits(
 	if missing.is_empty() {
 		Ok(())
 	} else {
+		// A translation-only model failing the chat requirement deserves a
+		// pointer at the command that can actually drive it.
+		let translation_hint = missing.iter().any(|name| name == "task:chat")
+			&& installed
+				.manifest()
+				.traits()
+				.tasks
+				.contains(&Task::Translation);
+		if translation_hint {
+			bail!(
+				"model {} lacks required trait(s): {}\nnote: this model is translation-only; \
+				 try `emelex translate --model {}`",
+				installed.reference(),
+				missing.join(", "),
+				installed.reference()
+			)
+		}
 		bail!(
 			"model {} lacks required trait(s): {}",
 			installed.reference(),
@@ -674,6 +691,7 @@ fn model_manager(emelex: &Emelex) -> anyhow::Result<&ModelManager> {
 )]
 pub(crate) struct InvocationRequirements {
 	pub chat: bool,
+	pub translation: bool,
 	pub system_prompt: bool,
 	pub agent: bool,
 	pub image: bool,
@@ -685,7 +703,9 @@ pub(crate) struct InvocationRequirements {
 
 /// Build evidence-backed filters for one concrete invocation.
 pub(crate) fn filters(requirements: InvocationRequirements) -> anyhow::Result<Vec<TraitFilter>> {
-	let mut names = vec![if requirements.chat {
+	let mut names = vec![if requirements.translation {
+		"task:translation"
+	} else if requirements.chat {
 		"task:chat"
 	} else {
 		"task:text_generation"

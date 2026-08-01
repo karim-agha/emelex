@@ -48,6 +48,20 @@ pub struct Config {
 	pub hub: HubConfig,
 	/// Durable memory behavior.
 	pub memory: MemoryConfig,
+	/// Translation command defaults.
+	pub translate: TranslateConfig,
+}
+
+/// Default language pair for `emelex translate`. Not authority-bearing:
+/// a project `.emelex.toml` may set or clear it freely.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
+pub struct TranslateConfig {
+	/// Default source language code (BCP-47-style, e.g. "en").
+	pub source: Option<String>,
+	/// Default target language code (BCP-47-style, e.g. "de").
+	pub target: Option<String>,
 }
 
 /// Generation defaults.
@@ -567,6 +581,7 @@ struct ConfigPatch {
 	agent: Option<AgentPatch>,
 	hub: Option<HubPatch>,
 	memory: Option<MemoryPatch>,
+	translate: Option<TranslatePatch>,
 }
 
 impl ConfigPatch {
@@ -661,6 +676,29 @@ impl ConfigPatch {
 		}
 		if let Some(patch) = self.memory {
 			patch.apply(&mut config.memory, authority);
+		}
+		if let Some(patch) = self.translate {
+			patch.apply(&mut config.translate);
+		}
+	}
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TranslatePatch {
+	source: Option<PatchValue<String>>,
+	target: Option<PatchValue<String>>,
+}
+
+impl TranslatePatch {
+	/// Language-pair defaults are not authority-bearing; project and
+	/// global scope apply identically.
+	fn apply(self, target: &mut TranslateConfig) {
+		if let Some(value) = self.source {
+			target.source = value.into_option();
+		}
+		if let Some(value) = self.target {
+			target.target = value.into_option();
 		}
 	}
 }

@@ -251,6 +251,7 @@ pub(crate) async fn run(
 	}
 	let required = model_select::filters(model_select::InvocationRequirements {
 		chat: true,
+		translation: false,
 		system_prompt: true,
 		agent: false,
 		image: false,

@@ -28,6 +28,9 @@ output-only. This keeps future report fields semver-compatible.
 
 Static inspection fails closed on missing or unsupported architecture,
 quantization, tokenizer, weight layout, attention geometry, or machine fit.
+Sliding-window architectures (Laguna, Gemma 3) charge sliding layers only
+`min(context, window)` KV tokens, so large checkpoints are not rejected on a
+full-context overestimate.
 The same architecture-specific fit estimator can select the largest positive
 context under an explicit ceiling and Metal working-set budget. Selection uses
 a monotonic binary search over total prompt-plus-generation context; it reads

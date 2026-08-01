@@ -33,3 +33,8 @@
   accounting separate.
 - Explicit thinking-off clears an inherited reasoning budget. An explicit
   request budget remains authoritative and invalid while thinking is off.
+- `Content::Translation` is user-role-only and must be the sole content
+  part of its message (the TranslateGemma template contract is exactly one
+  mapping per turn); language codes and text must be non-empty after
+  trimming. The serde shape is `{"type":"translation","data":{...}}` and
+  is pinned by a round-trip test.

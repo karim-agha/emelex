@@ -1011,6 +1011,16 @@ impl DurableAgentSession {
 				Content::Image(bytes) | Content::Audio(bytes) | Content::Video(bytes) => {
 					bytes.len()
 				}
+				// Unreachable in practice: validate_user_message rejects
+				// translation content before durable admission.
+				Content::Translation {
+					source_lang,
+					target_lang,
+					text,
+				} => source_lang
+					.len()
+					.saturating_add(target_lang.len())
+					.saturating_add(text.len()),
 			};
 			total.checked_add(bytes).ok_or_else(|| {
 				DurableSessionError::Memory(MemoryError::Invalid(
@@ -3242,6 +3252,14 @@ fn encode_durable_message(
 				let reference = store.store_asset_bytes(AssetKind::Video, bytes)?;
 				content.push(DurableContent::Asset(reference.clone()));
 				assets.push(reference);
+			}
+			// Defensive: the agent rejects translation content before any
+			// durable admission, and DurableContent has no representation
+			// for it — never persist it silently.
+			Content::Translation { .. } => {
+				return Err(MemoryError::Invalid(
+					"translation content cannot be persisted in durable sessions".to_string(),
+				));
 			}
 		}
 	}

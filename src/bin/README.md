@@ -208,3 +208,20 @@ and terminal failures remain visible through `memory status` and
 `memory failures`. A chat Session that becomes live after worker claim
 preempts maintenance; the job returns to pending without consuming retry
 budget. `memory retry JOB` is the explicit operator reset.
+
+`translate` drives translation-capable models (TranslateGemma-style
+templates that require per-message language pairs). One-shot mode reads a
+positional TEXT or bounded UTF-8 stdin and needs a resolved language pair
+from `--from`/`--to` or the `[translate]` configuration section; on a
+terminal with no TEXT it opens a stateless interactive translator whose
+prompt shows the live pair (`en→de❯`) with `/from`, `/to`, `/swap`,
+`/langs`, `/model`, `/help`, and `/quit` commands. Each line is one
+independent request; no conversation history is sent. Language codes are
+validated against the code→name table extracted from the loaded template
+when one is present; without a table, codes pass through and the template
+render is the authority. Model selection requires `task:translation`, and
+`hub search --require task:translation` skips the implicit
+`interaction:tools` search requirement because translation models are
+tool-less by design. `chat` against a translation-only model fails its
+trait check with a pointer to `translate`. Translation output streams as
+plain text, never through the markdown renderer.

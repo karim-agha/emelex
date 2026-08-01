@@ -201,6 +201,14 @@
 - Gemma4 optional per-layer/KV projections are construction invariants but
   remain fallible at use. Missing components return `Error::Model`, never
   panic.
+- Gemma3 is the only Gemma path that renames weight keys: bare-prefix
+  checkpoints are canonicalized under `language_model.` and the identical
+  mapping MUST stay paired with `normalize_quant_keys` so checkpoint-verbatim
+  per-layer quantization overrides keep resolving. HF Gemma 3 configs spell
+  the layer-mix fallback `_sliding_window_pattern` (leading underscore) and
+  ship literal `null` for retired Gemma 2 fields; parser and preflight both
+  treat `null` as absent. Multimodal `Gemma3ForConditionalGeneration` repos
+  degrade to text-only (tower tensors never materialize).
 - Media preprocessing treats encoded bytes and checkpoint-provided
   geometry as hostile. Encoded size is checked before parsing; decoder
   dimensions/allocation, source aspect ratio/pixels, processed tensor
@@ -236,3 +244,25 @@ Preferably nothing beyond the mechanical re-vendoring steps and the
 documented `emelex patch` sites in `README.md`. New behavioral changes
 need the same treatment: a marked comment at the site, an entry in
 `README.md`, and ideally an upstream offer.
+- The chat-capability probe distinguishes `chat` (plain-string baseline
+  render preserves the user sentinel) from `translation` (a single
+  translation-mapping render preserves the sentinel WITHOUT leaking the
+  mapping's `source_lang_code` key — the leak check keeps
+  content-stringifying chat templates from claiming the translation
+  task). A baseline raise is tolerated iff the translation probe
+  succeeds; templates failing both shapes still resolve to a hard
+  template error. `ContentPart::Translation` is structured text, never
+  media: it must not enter the media byte-budget, binding, or
+  preprocessing paths.
+- Gemma RMSNorm scales are zero-centered deltas: the effective scale is
+  `1 + weight` (HF `Gemma3RMSNorm`). gemma3 folds the offset once at load
+  (`gemma_rms_norm`) so the fused kernel applies the correct scale — an
+  unfolded weight still generates, but garbage.
+- A chat template that terminates turns with `<end_of_turn>` registers
+  that token as an EOS id at tokenizer construction: some conversions
+  (TranslateGemma 4b) ship neither a tokenizer_config `eos_token` nor any
+  numeric `eos_token_id`, and would otherwise never stop generating.
+- `Client::runtime_probe` (install certification / verify) probes
+  translation-only templates with a translation-shaped request; a
+  plain-string probe would raise inside the template and fail
+  certification of a healthy model.

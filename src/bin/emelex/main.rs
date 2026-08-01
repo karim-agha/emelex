@@ -32,6 +32,7 @@ pub(crate) mod models_cmd;
 pub(crate) mod output;
 pub(crate) mod style;
 pub(crate) mod terminal_ui;
+pub(crate) mod translate_cmd;
 pub(crate) mod web_search;
 
 use anyhow::Context as _;
@@ -110,6 +111,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 		}
 		Command::Generate(args) => {
 			generate_cmd::run(&emelex, args, cli.json, stdout_palette, stderr_palette).await
+		}
+		Command::Translate(args) => {
+			translate_cmd::run(&emelex, args, cli.json, stdout_palette, stderr_palette).await
 		}
 		Command::Hub { command } => {
 			match hub_cmd::run(&emelex, command, cli.json, stdout_palette, stderr_palette).await? {

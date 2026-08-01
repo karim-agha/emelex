@@ -125,6 +125,10 @@ pub fn validate_checkpoint_config(root: &Value) -> Result<()> {
 			validate_qwen35_rope(text, geometry.head_dim)?;
 			super::qwen3_5::Qwen35Config::from_json(root)?;
 		}
+		"gemma3" | "gemma3_text" => {
+			validate_gemma3(text, geometry)?;
+			super::gemma3::Gemma3Config::from_json(root)?;
+		}
 		"gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
 			validate_gemma4(text, geometry)?;
 			super::gemma4::Gemma4Config::from_json(root)?;
@@ -270,6 +274,102 @@ fn validate_qwen35(config: &Value, geometry: TextGeometry) -> Result<()> {
 		.checked_add(value_width)
 		.ok_or_else(|| Error::Config("Qwen convolution width exceeds i32".to_string()))?;
 	Ok(())
+}
+
+/// Gemma 3 preflight. HF Gemma 3 configs ship literal `null` for retired
+/// Gemma 2 fields (`rope_scaling`, `attn_logit_softcapping`,
+/// `final_logit_softcapping`) — every read here treats `null` as absent,
+/// mirroring `Gemma3Config::from_json`.
+fn validate_gemma3(config: &Value, geometry: TextGeometry) -> Result<()> {
+	// The fallback pattern key is spelled `_sliding_window_pattern`
+	// (leading underscore) in current HF configs; accept both.
+	let pattern = match optional_bounded(config, "_sliding_window_pattern", 1, MAX_LAYERS)? {
+		Some(value) => value,
+		None => optional_bounded(config, "sliding_window_pattern", 1, MAX_LAYERS)?.unwrap_or(6),
+	};
+	optional_bounded(config, "sliding_window", 1, i32::MAX)?;
+	if let Some(value) = non_null(config, "query_pre_attn_scalar")
+		&& finite_f32(value, "query_pre_attn_scalar")? <= 0.0
+	{
+		return Err(Error::Config(
+			"query_pre_attn_scalar must be positive".to_string(),
+		));
+	}
+	if let Some(value) = non_null(config, "rope_local_base_freq")
+		&& finite_f32(value, "rope_local_base_freq")? <= 0.0
+	{
+		return Err(Error::Config(
+			"rope_local_base_freq must be positive".to_string(),
+		));
+	}
+	// Gemma 3 replaced attention softcapping with q/k RMSNorm; a
+	// checkpoint declaring a live value would silently diverge at runtime.
+	if non_null(config, "attn_logit_softcapping").is_some() {
+		return Err(Error::Config(
+			"attn_logit_softcapping is not supported for gemma3".to_string(),
+		));
+	}
+	if let Some(value) = non_null(config, "final_logit_softcapping")
+		&& finite_f32(value, "final_logit_softcapping")? <= 0.0
+	{
+		return Err(Error::Config(
+			"final_logit_softcapping must be positive".to_string(),
+		));
+	}
+	validate_string_array(
+		config,
+		"layer_types",
+		Some(geometry.layers),
+		&["full_attention", "sliding_attention"],
+	)?;
+	gemma_layer_types(config, geometry.layers, pattern)?;
+
+	let rope = match non_null(config, "rope_parameters") {
+		None => None,
+		Some(value) => {
+			value
+				.as_object()
+				.ok_or_else(|| Error::Config("rope_parameters must be an object".to_string()))?;
+			Some(value)
+		}
+	};
+	let nested = |key: &str, path: &str| -> Result<Option<&Value>> {
+		match rope.and_then(|value| non_null(value, key)) {
+			None => Ok(None),
+			Some(value) => {
+				value
+					.as_object()
+					.ok_or_else(|| Error::Config(format!("{path} must be an object")))?;
+				Ok(Some(value))
+			}
+		}
+	};
+	let full = nested("full_attention", "rope_parameters.full_attention")?;
+	let sliding = nested("sliding_attention", "rope_parameters.sliding_attention")?;
+	validate_rope_values(
+		full,
+		geometry.head_dim,
+		"rope_parameters.full_attention",
+		1.0,
+	)?;
+	validate_rope_values(
+		sliding,
+		geometry.head_dim,
+		"rope_parameters.sliding_attention",
+		1.0,
+	)?;
+	if let Some(scaling) = non_null(config, "rope_scaling") {
+		scaling
+			.as_object()
+			.ok_or_else(|| Error::Config("rope_scaling must be an object".to_string()))?;
+		validate_rope_values(Some(scaling), geometry.head_dim, "rope_scaling", 1.0)?;
+	}
+	Ok(())
+}
+
+/// Read a config value, treating JSON `null` as absent.
+fn non_null<'a>(config: &'a Value, key: &str) -> Option<&'a Value> {
+	config.get(key).filter(|value| !value.is_null())
 }
 
 fn validate_gemma4(config: &Value, geometry: TextGeometry) -> Result<()> {
@@ -909,9 +1009,90 @@ mod tests {
 		})
 	}
 
+	fn tiny_gemma3() -> Value {
+		serde_json::json!({
+			"model_type": "gemma3_text",
+			"hidden_size": 32,
+			"num_hidden_layers": 2,
+			"num_attention_heads": 2,
+			"num_key_value_heads": 1,
+			"head_dim": 16,
+			"vocab_size": 16,
+			"query_pre_attn_scalar": 16,
+			"sliding_window": 4,
+			"layer_types": ["sliding_attention", "full_attention"],
+			"attn_logit_softcapping": null,
+			"final_logit_softcapping": null,
+			"rope_scaling": null
+		})
+	}
+
 	#[test]
 	fn valid_tiny_checkpoint_config_passes_preflight() {
 		validate_checkpoint_config(&tiny_qwen()).unwrap();
+	}
+
+	#[test]
+	fn preflight_accepts_gemma3_and_rejects_hazards() {
+		assert!(validate_checkpoint_config(&tiny_gemma3()).is_ok());
+
+		// The nested multimodal shape validates through text_config.
+		let nested = serde_json::json!({
+			"model_type": "gemma3",
+			"text_config": tiny_gemma3()
+		});
+		assert!(validate_checkpoint_config(&nested).is_ok());
+
+		let mut config = tiny_gemma3();
+		config["layer_types"] = serde_json::json!(["sliding_attention"]);
+		assert!(validate_checkpoint_config(&config).is_err());
+
+		let mut config = tiny_gemma3();
+		config["query_pre_attn_scalar"] = serde_json::json!(0);
+		assert!(validate_checkpoint_config(&config).is_err());
+
+		let mut config = tiny_gemma3();
+		config["attn_logit_softcapping"] = serde_json::json!(50.0);
+		assert!(validate_checkpoint_config(&config).is_err());
+
+		let mut config = tiny_gemma3();
+		config["rope_parameters"] =
+			serde_json::json!({"full_attention": {"rope_type": "linear", "factor": 0.0}});
+		assert!(validate_checkpoint_config(&config).is_err());
+
+		let mut config = tiny_gemma3();
+		if let Some(object) = config.as_object_mut() {
+			object.remove("layer_types");
+		}
+		config["_sliding_window_pattern"] = serde_json::json!(0);
+		assert!(validate_checkpoint_config(&config).is_err());
+	}
+
+	/// Every whitelisted model_type must have a `validate_checkpoint_config`
+	/// arm: local inspection treats validator failure as a hard error once a
+	/// type is whitelisted, so a missing arm would make every checkpoint of
+	/// that type uninspectable rather than merely incompatible.
+	#[test]
+	fn every_supported_model_type_has_a_validator_arm() {
+		for model_type in crate::model::SUPPORTED_MODEL_TYPES {
+			let config = serde_json::json!({
+				"model_type": model_type,
+				"hidden_size": 32,
+				"num_hidden_layers": 2,
+				"num_attention_heads": 2,
+				"num_key_value_heads": 1,
+				"head_dim": 16,
+				"intermediate_size": 64,
+				"vocab_size": 16
+			});
+			if let Err(error) = validate_checkpoint_config(&config) {
+				let message = error.to_string();
+				assert!(
+					!message.contains("unsupported model_type"),
+					"{model_type} is whitelisted but has no validator arm: {message}"
+				);
+			}
+		}
 	}
 
 	#[test]

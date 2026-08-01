@@ -25,6 +25,11 @@ const MAX_NAMED_CHAT_TEMPLATES: usize = 32;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ChatTemplateCapabilities {
+	/// The template renders ordinary plain-string chat turns.
+	pub chat: bool,
+	/// The template renders structured translation messages
+	/// (TranslateGemma-style single-mapping content with language codes).
+	pub translation: bool,
 	pub system_prompt: bool,
 	pub tools: bool,
 	pub reasoning_history: bool,
@@ -215,6 +220,18 @@ pub enum ContentPart {
 	Image(ImageContent),
 	Audio(AudioContent),
 	Video(VideoContent),
+	Translation(TranslationContent),
+}
+
+/// A structured translation request (TranslateGemma-style templates):
+/// translate `text` from `source_lang` to `target_lang` (BCP-47-style
+/// codes, e.g. "en", "pt-BR"). Must be the sole content part of a user
+/// message — the template contract is exactly one mapping per turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationContent {
+	pub source_lang: String,
+	pub target_lang: String,
+	pub text: String,
 }
 
 /// A single image attachment (raw encoded bytes - JPEG/PNG/...; decoded and
@@ -268,6 +285,24 @@ impl ChatMessage {
 		ChatMessage {
 			role: "user".into(),
 			content: vec![ContentPart::Text(content.into())],
+			..Default::default()
+		}
+	}
+
+	/// A user turn carrying one structured translation request — the sole
+	/// content shape TranslateGemma-style templates accept.
+	pub fn user_translation(
+		source_lang: impl Into<String>,
+		target_lang: impl Into<String>,
+		text: impl Into<String>,
+	) -> Self {
+		ChatMessage {
+			role: "user".into(),
+			content: vec![ContentPart::Translation(TranslationContent {
+				source_lang: source_lang.into(),
+				target_lang: target_lang.into(),
+				text: text.into(),
+			})],
 			..Default::default()
 		}
 	}
@@ -416,11 +451,16 @@ impl ChatMessage {
 		})
 	}
 
-	/// True if this message carries any non-text content part.
+	/// True if this message carries any media content part. Translation
+	/// parts are structured text, not media — they must not trigger the
+	/// media preprocessing or byte-budget machinery.
 	pub fn has_media(&self) -> bool {
-		self.content
-			.iter()
-			.any(|p| !matches!(p, ContentPart::Text(_)))
+		self.content.iter().any(|p| {
+			matches!(
+				p,
+				ContentPart::Image(_) | ContentPart::Audio(_) | ContentPart::Video(_)
+			)
+		})
 	}
 }
 
@@ -441,6 +481,14 @@ fn content_to_json(content: &[ContentPart]) -> Value {
 				ContentPart::Image(_) => serde_json::json!({"type": "image"}),
 				ContentPart::Audio(_) => serde_json::json!({"type": "audio"}),
 				ContentPart::Video(_) => serde_json::json!({"type": "video"}),
+				// TranslateGemma-style contract: one mapping whose `type`
+				// is the payload kind ("text"), carrying the language pair.
+				ContentPart::Translation(t) => serde_json::json!({
+					"type": "text",
+					"source_lang_code": t.source_lang,
+					"target_lang_code": t.target_lang,
+					"text": t.text,
+				}),
 			})
 			.collect(),
 	)
@@ -676,6 +724,21 @@ impl Tokenizer {
 		}
 		// generation_config.json / config.json commonly list eos_token_id
 		// as a scalar or list; callers can extend this via `add_eos_id`.
+		//
+		// Gemma-family templates terminate every turn with the dedicated
+		// `<end_of_turn>` token; instruction-tuned checkpoints emit it, not
+		// `<eos>`. Conversions with sparse metadata (no tokenizer_config
+		// eos_token, no numeric eos_token_id anywhere — some TranslateGemma
+		// exports) would otherwise never stop generating. The template
+		// using the marker is the evidence the checkpoint stops with it.
+		if chat_templates
+			.as_ref()
+			.is_some_and(|templates| templates.default.contains("<end_of_turn>"))
+			&& let Some(id) = inner.token_to_id("<end_of_turn>")
+			&& !eos_token_ids.contains(&id)
+		{
+			eos_token_ids.push(id);
+		}
 
 		Ok(Tokenizer {
 			inner,
@@ -724,6 +787,17 @@ impl Tokenizer {
 				self.eos_token.as_deref().unwrap_or_default(),
 			),
 		)
+	}
+
+	/// The language table embedded in the default chat template, when the
+	/// template ships one (TranslateGemma-style `set languages = {...}`).
+	/// `None` when there is no template or no recognizable table.
+	pub(crate) fn translation_language_table(
+		&self,
+	) -> Option<std::collections::BTreeMap<String, String>> {
+		self.chat_template
+			.as_deref()
+			.and_then(translation_language_table)
 	}
 
 	pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -1480,16 +1554,35 @@ fn probe_chat_templates_capabilities_at(
 		strip_generation_tags(&templates.default),
 		TemplateClock::Fixed(now),
 	)?;
+	// Fail-soft structured-translation probe. Runs unconditionally so
+	// dual-mode templates report both shapes; a template without the
+	// translation contract simply fails this render.
+	let translation = probe_translation_capability(&default_env, special_tokens);
+	let translation_only = ChatTemplateCapabilities {
+		translation: true,
+		..ChatTemplateCapabilities::default()
+	};
 	let baseline_messages = vec![ChatMessage::user(USER_SENTINEL)];
-	let baseline = render_template(
+	let baseline = match render_template(
 		&default_env,
 		chat_messages_to_jinja(&baseline_messages),
 		true,
 		None,
 		None,
 		special_tokens,
-	)?;
+	) {
+		Ok(rendered) => rendered,
+		// TranslateGemma-style templates reject plain-string chat turns
+		// by design; the successful translation render is the authority.
+		// Secondary probes are skipped — they all send plain strings and
+		// would raise the same way.
+		Err(_) if translation => return Ok(translation_only),
+		Err(error) => return Err(error),
+	};
 	if baseline.trim().is_empty() || !baseline.contains(USER_SENTINEL) {
+		if translation {
+			return Ok(translation_only);
+		}
 		return Err(Error::Template(
 			"chat template does not preserve a required user message".to_string(),
 		));
@@ -1515,6 +1608,8 @@ fn probe_chat_templates_capabilities_at(
 	let default_thinking_toggle =
 		probe_reasoning_toggle(&default_env, special_tokens, None, tool_format).unwrap_or(false);
 	Ok(ChatTemplateCapabilities {
+		chat: true,
+		translation,
 		system_prompt: system_prompt
 			&& (!tool_capability
 				|| probe_system_capability(tool_env, special_tokens, Some(&tools), tool_format)),
@@ -1528,6 +1623,107 @@ fn probe_chat_templates_capabilities_at(
 				|| probe_reasoning_toggle(tool_env, special_tokens, Some(&tools), tool_format)
 					.unwrap_or(false)),
 	})
+}
+
+/// Fail-soft probe for the structured-translation contract: render one
+/// user message whose content is a single translation mapping and require
+/// the sentinel text to survive WITHOUT the mapping's internal key names
+/// leaking into the prompt. A genuine translation template consumes
+/// `source_lang_code`/`target_lang_code`; a plain chat template that
+/// stringifies unknown list content dumps them verbatim — rejecting that
+/// leak keeps ordinary chat models from claiming the translation task.
+/// "en"/"de" are used because every known translation template's language
+/// table contains them; templates without the contract fail the render
+/// (or drop the sentinel) and report `false`.
+fn probe_translation_capability(env: &Environment<'_>, special_tokens: (&str, &str)) -> bool {
+	const TRANSLATION_SENTINEL: &str = "emelex_probe_translation_c417";
+	let messages = vec![ChatMessage::user_translation(
+		"en",
+		"de",
+		TRANSLATION_SENTINEL,
+	)];
+	render_template(
+		env,
+		chat_messages_to_jinja(&messages),
+		true,
+		None,
+		None,
+		special_tokens,
+	)
+	.ok()
+	.is_some_and(|rendered| {
+		!rendered.trim().is_empty()
+			&& rendered.contains(TRANSLATION_SENTINEL)
+			&& !rendered.contains("source_lang_code")
+	})
+}
+
+/// Extract the `set languages = { "code": "Name", ... }` table a
+/// TranslateGemma-style template embeds. Returns `None` unless a
+/// well-formed table with at least 50 entries is found (guards against
+/// matching unrelated small dicts) — fail-open: callers treat `None` as
+/// "no validation possible", never as an error.
+pub(crate) fn translation_language_table(
+	template: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+	const MIN_LANGUAGE_TABLE_ENTRIES: usize = 50;
+	let start = template.find("set languages")?;
+	let brace = start + template[start..].find('{')?;
+	let literal = balanced_brace_span(&template[brace..])?;
+	let mut entries = std::collections::BTreeMap::new();
+	let mut rest = literal.strip_prefix('{')?;
+	loop {
+		rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+		if rest.starts_with('}') {
+			break;
+		}
+		let (key, after_key) = leading_quoted_string(rest)?;
+		let after_colon = after_key.trim_start().strip_prefix(':')?;
+		let (value, after_value) = leading_quoted_string(after_colon.trim_start())?;
+		entries.insert(key, value);
+		rest = after_value;
+	}
+	(entries.len() >= MIN_LANGUAGE_TABLE_ENTRIES).then_some(entries)
+}
+
+/// The balanced `{...}` span starting at the first byte of `text`,
+/// honoring double-quoted strings with backslash escapes.
+fn balanced_brace_span(text: &str) -> Option<&str> {
+	let mut depth = 0_usize;
+	let mut in_string = false;
+	let mut escaped = false;
+	for (index, ch) in text.char_indices() {
+		if in_string {
+			if escaped {
+				escaped = false;
+			} else if ch == '\\' {
+				escaped = true;
+			} else if ch == '"' {
+				in_string = false;
+			}
+			continue;
+		}
+		match ch {
+			'"' => in_string = true,
+			'{' => depth += 1,
+			'}' => {
+				depth = depth.checked_sub(1)?;
+				if depth == 0 {
+					return Some(&text[..=index]);
+				}
+			}
+			_ => {}
+		}
+	}
+	None
+}
+
+/// Split a leading double-quoted string into its contents and the
+/// remainder after the closing quote.
+fn leading_quoted_string(text: &str) -> Option<(String, &str)> {
+	let rest = text.strip_prefix('"')?;
+	let end = rest.find('"')?;
+	Some((rest[..end].to_string(), &rest[end + 1..]))
 }
 
 fn probe_system_capability(
@@ -2296,7 +2492,13 @@ mod tests {
 ",
 		)
 		.unwrap();
-		assert_eq!(capabilities, ChatTemplateCapabilities::default());
+		assert_eq!(
+			capabilities,
+			ChatTemplateCapabilities {
+				chat: true,
+				..ChatTemplateCapabilities::default()
+			}
+		);
 	}
 
 	#[test]
@@ -2837,6 +3039,140 @@ mod tests {
 		assert!(!boundary_ids.is_empty());
 		assert!(boundary_ids.len() < full_ids.len());
 		assert_eq!(&full_ids[..boundary_ids.len()], &boundary_ids[..]);
+	}
+
+	// ------------------------------------------------------------------
+	// Structured translation (TranslateGemma-style templates)
+	// ------------------------------------------------------------------
+
+	/// A TranslateGemma-shaped fixture: raises on plain-string content,
+	/// consumes a single translation mapping, and embeds a ≥50-entry
+	/// language table.
+	fn translation_fixture_template() -> String {
+		let mut table = String::from("{%- set languages = {\n");
+		table.push_str("    \"en\": \"English\",\n    \"de\": \"German\",\n");
+		for index in 0..60 {
+			table.push_str(&format!("    \"x{index}\": \"Language {index}\",\n"));
+		}
+		table.push_str("}\n-%}\n");
+		table.push_str(
+			r#"{{ bos_token }}
+{%- for message in messages -%}
+{%- if message['role'] == 'user' -%}
+{%- if message['content'] is none or message['content'] is string or message['content'] | length != 1 -%}
+{{ raise_exception("User content must be a single translation mapping") }}
+{%- endif -%}
+{%- set content = message['content'][0] -%}
+<start_of_turn>user
+You are a professional {{ languages[content['source_lang_code']] }} to {{ languages[content['target_lang_code']] }} translator.
+{{ content['text'] | trim }}<end_of_turn>
+{%- elif message['role'] == 'assistant' -%}
+<start_of_turn>model
+{{ message['content'] | trim }}<end_of_turn>
+{%- else -%}
+{{ raise_exception("only user and assistant turns") }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<start_of_turn>model
+{% endif -%}"#,
+		);
+		table
+	}
+
+	#[test]
+	fn translation_content_renders_as_single_map_list() {
+		let json = chat_message_to_json(
+			&ChatMessage::user_translation("en", "de", "hello"),
+			&std::collections::BTreeMap::new(),
+		);
+		assert_eq!(
+			json["content"],
+			serde_json::json!([{
+				"type": "text",
+				"source_lang_code": "en",
+				"target_lang_code": "de",
+				"text": "hello",
+			}])
+		);
+	}
+
+	#[test]
+	fn probe_marks_translation_capability_on_translategemma_style_template() {
+		let capabilities = probe_chat_template_capabilities(&translation_fixture_template())
+			.expect("translation-only template resolves");
+		assert!(capabilities.translation);
+		assert!(!capabilities.chat);
+		assert!(!capabilities.system_prompt);
+		assert!(!capabilities.tools);
+	}
+
+	#[test]
+	fn probe_translation_is_fail_soft_on_plain_chat_template() {
+		// A plain template stringifies the translation mapping, leaking its
+		// key names — the probe must not claim the translation task.
+		let capabilities = probe_chat_template_capabilities(
+			"{% for message in messages %}{{ message.content }}{% endfor %}",
+		)
+		.unwrap();
+		assert!(capabilities.chat);
+		assert!(!capabilities.translation);
+	}
+
+	#[test]
+	fn dual_mode_template_reports_chat_and_translation() {
+		let capabilities = probe_chat_template_capabilities(
+			r"
+{%- for message in messages -%}
+{%- if message['content'] is string -%}
+{{ message['content'] }}
+{%- else -%}
+{{ message['content'][0]['text'] }}
+{%- endif -%}
+{%- endfor -%}
+",
+		)
+		.unwrap();
+		assert!(capabilities.chat);
+		assert!(capabilities.translation);
+	}
+
+	#[test]
+	fn has_media_ignores_translation_content() {
+		let message = ChatMessage::user_translation("en", "de", "hello");
+		assert!(!message.has_media());
+		assert!(
+			ChatMessage::user_with_image("look", Vec::new()).has_media(),
+			"image content is still media"
+		);
+	}
+
+	#[test]
+	fn translation_language_table_extracts_codes() {
+		let table =
+			translation_language_table(&translation_fixture_template()).expect("table present");
+		assert!(table.len() >= 50);
+		assert_eq!(table.get("en").map(String::as_str), Some("English"));
+		assert_eq!(table.get("de").map(String::as_str), Some("German"));
+	}
+
+	#[test]
+	fn translation_language_table_returns_none_without_table() {
+		assert!(
+			translation_language_table(
+				"{% for message in messages %}{{ message.content }}{% endfor %}"
+			)
+			.is_none()
+		);
+	}
+
+	#[test]
+	fn translation_language_table_rejects_tiny_false_matches() {
+		assert!(
+			translation_language_table(
+				r#"{%- set languages = {"en": "English", "de": "German"} -%}"#
+			)
+			.is_none()
+		);
 	}
 }
 

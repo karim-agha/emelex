@@ -70,6 +70,8 @@ pub struct Inner {
 	pub model_snapshot_id: Option<ModelSnapshotId>,
 	media_capabilities: MediaCapabilities,
 	chat_capabilities: ChatCapabilities,
+	/// Language table embedded in a translation template, when present.
+	translation_languages: Option<Arc<std::collections::BTreeMap<String, String>>>,
 	/// emelex patch (not upstream): whether the loaded checkpoint carries
 	/// a usable MTP module (speculative decoding can draft).
 	pub supports_mtp: bool,
@@ -87,17 +89,23 @@ struct MediaCapabilities {
 	reason = "independent template capabilities must remain separately addressable"
 )]
 struct ChatCapabilities {
+	/// The template renders plain-string chat turns.
+	chat: bool,
+	/// The template renders structured translation messages.
+	translation: bool,
 	system_prompt: bool,
 	tools: bool,
 	reasoning_history: bool,
 	thinking_toggle: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct LoadedCapabilities {
 	media: MediaCapabilities,
 	chat: ChatCapabilities,
 	mtp: bool,
+	/// Language table embedded in a translation template, when present.
+	translation_languages: Option<Arc<std::collections::BTreeMap<String, String>>>,
 }
 
 impl Inner {
@@ -297,6 +305,19 @@ impl Client {
 		self.supports_reasoning_history() || self.supports_thinking_toggle()
 	}
 
+	/// Whether the loaded chat template renders structured translation
+	/// messages (send them with [`crate::generation::Message::translation`]).
+	pub fn supports_translation(&self) -> bool {
+		self.inner.chat_capabilities.translation
+	}
+
+	/// The `code → language name` table embedded in a translation
+	/// template, when the template ships one. `None` means language codes
+	/// cannot be validated up front.
+	pub fn translation_languages(&self) -> Option<Arc<std::collections::BTreeMap<String, String>>> {
+		self.inner.translation_languages.clone()
+	}
+
 	/// Exact installed snapshot identity when loaded by
 	/// [`crate::models::ModelManager`].
 	pub fn model_snapshot_id(&self) -> Option<&ModelSnapshotId> {
@@ -321,7 +342,18 @@ impl Client {
 	/// Run one deterministic token through tokenizer, prefill, model forward,
 	/// and decode. Used before an installed snapshot is marked verified.
 	pub(crate) fn runtime_probe(&self) -> Result<(), Error> {
-		let mut request = GenerationRequest::text("Respond with one token.");
+		// Translation-only templates reject plain-string chat turns by
+		// design; probe them with the request shape they actually serve.
+		let mut request =
+			if self.inner.chat_capabilities.translation && !self.inner.chat_capabilities.chat {
+				GenerationRequest::default().message(crate::generation::Message::translation(
+					"en",
+					"de",
+					"Respond with one token.",
+				))
+			} else {
+				GenerationRequest::text("Respond with one token.")
+			};
 		request.options.max_tokens = Some(1);
 		request.options.temperature = Some(0.0);
 		request.options.thinking = Some(crate::config::ThinkingMode::Off);
@@ -520,6 +552,35 @@ impl Inner {
 		tools: &[Tool],
 		options: EngineOptions,
 	) -> Result<(), Error> {
+		let has_translation_part = |message: &ChatMessage| {
+			message
+				.content
+				.iter()
+				.any(|part| matches!(part, crate::engine::tokenizer::ContentPart::Translation(_)))
+		};
+		if messages.iter().any(has_translation_part) && !self.chat_capabilities.translation {
+			return Err(Error::CapabilityUnavailable {
+				capability: "task:translation",
+				reason: "loaded model does not accept structured translation requests; \
+				 install a translation model (try: emelex hub search --require \
+				 task:translation)"
+					.to_string(),
+			});
+		}
+		if self.chat_capabilities.translation
+			&& !self.chat_capabilities.chat
+			&& messages
+				.iter()
+				.any(|message| message.role == "user" && !has_translation_part(message))
+		{
+			return Err(Error::CapabilityUnavailable {
+				capability: "task:chat",
+				reason: "this model only accepts structured translation requests; use \
+				 `emelex translate --from <code> --to <code>` or send translation \
+				 content with source and target language codes"
+					.to_string(),
+			});
+		}
 		if messages.iter().any(|message| message.role == "system")
 			&& !self.chat_capabilities.system_prompt
 		{
@@ -917,6 +978,7 @@ impl ClientBuilder {
 				model_snapshot_id: self.model_snapshot_id,
 				media_capabilities: capabilities.media,
 				chat_capabilities: capabilities.chat,
+				translation_languages: capabilities.translation_languages,
 				supports_mtp: capabilities.mtp,
 			}),
 		})
@@ -962,12 +1024,23 @@ fn spawn_inference_worker(
 					audio: session.supports_audio(),
 				},
 				chat: ChatCapabilities {
+					chat: chat.chat,
+					translation: chat.translation,
 					system_prompt: chat.system_prompt,
 					tools: chat.tools,
 					reasoning_history: chat.reasoning_history,
 					thinking_toggle: chat.thinking_toggle,
 				},
 				mtp: session.supports_mtp(),
+				translation_languages: chat
+					.translation
+					.then(|| {
+						session
+							.tokenizer()
+							.translation_language_table()
+							.map(Arc::new)
+					})
+					.flatten(),
 			};
 			if ready_tx.send(Ok(capabilities)).is_err() {
 				return;
@@ -1201,11 +1274,14 @@ mod native_tests {
 					audio: false,
 				},
 				chat_capabilities: ChatCapabilities {
+					chat: true,
+					translation: false,
 					system_prompt: true,
 					tools: true,
 					reasoning_history: true,
 					thinking_toggle: true,
 				},
+				translation_languages: None,
 				supports_mtp: false,
 			}),
 		}
@@ -1299,6 +1375,59 @@ mod native_tests {
 				..
 			})
 		));
+	}
+
+	#[test]
+	fn translation_requests_gate_in_both_directions() {
+		// Translation content against a chat-only template.
+		let (jobs, _receiver) = mpsc::sync_channel::<Job>(1);
+		let client = doctored_client(jobs);
+		assert!(matches!(
+			client.stream(
+				GenerationRequest::default()
+					.message(crate::generation::Message::translation("en", "de", "hello"))
+			),
+			Err(Error::CapabilityUnavailable {
+				capability: "task:translation",
+				..
+			})
+		));
+
+		// Plain chat against a translation-only template.
+		let (jobs, _receiver) = mpsc::sync_channel::<Job>(1);
+		let mut client = doctored_client(jobs);
+		{
+			let inner = Arc::get_mut(&mut client.inner).expect("unique test client");
+			inner.chat_capabilities.chat = false;
+			inner.chat_capabilities.translation = true;
+			inner.chat_capabilities.system_prompt = false;
+			inner.chat_capabilities.tools = false;
+		}
+		assert!(matches!(
+			client.stream(GenerationRequest::text("hello")),
+			Err(Error::CapabilityUnavailable {
+				capability: "task:chat",
+				..
+			})
+		));
+
+		// Translation content on a translation-capable template reaches
+		// queueing.
+		let (jobs, receiver) = mpsc::sync_channel::<Job>(1);
+		let mut client = doctored_client(jobs);
+		Arc::get_mut(&mut client.inner)
+			.expect("unique test client")
+			.chat_capabilities
+			.translation = true;
+		assert!(
+			client
+				.stream(
+					GenerationRequest::default()
+						.message(crate::generation::Message::translation("en", "de", "hello"))
+				)
+				.is_ok()
+		);
+		assert!(receiver.try_recv().is_ok());
 	}
 
 	#[test]

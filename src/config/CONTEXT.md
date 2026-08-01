@@ -55,3 +55,6 @@ Global default-model mutation is deliberately field-specific. Do not write a
 resolved `Config` snapshot back to disk: it may contain project reductions and
 built-in defaults that were never selected globally. The same rule applies to
 the extracted Hub secret.
+- `[translate] source/target` is the only non-authority-bearing scalar
+  pair: project scope may set or clear it freely; it feeds `emelex
+  translate` defaults only and never model selection.

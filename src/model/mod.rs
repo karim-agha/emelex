@@ -14,6 +14,10 @@ mod response;
 mod stream;
 mod traits;
 
+/// The whitelist itself is consumed only by the engine-side preflight
+/// table test pinning that every whitelisted type has a validator arm.
+#[cfg(test)]
+pub(crate) use compatibility::SUPPORTED_MODEL_TYPES;
 pub use compatibility::{
 	CompatibilityReport, FitReport, InspectionError, WorkloadError, WorkloadProfile,
 	inspect_directory,

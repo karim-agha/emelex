@@ -2330,3 +2330,10 @@ async fn cancellation_abandons_pending_approval_without_waiting() {
 	assert_eq!(invocations.load(Ordering::Relaxed), 0);
 	assert!(session.history().is_empty());
 }
+
+#[test]
+fn agent_rejects_translation_content_with_actionable_error() {
+	let message = Message::translation("en", "de", "hello");
+	let error = validate_user_message(&message).expect_err("translation content rejected");
+	assert!(error.to_string().contains("emelex translate"));
+}

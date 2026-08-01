@@ -69,6 +69,11 @@ impl KvCache {
 		self.start
 	}
 
+	/// The retention window, or `None` for a cache that keeps everything.
+	pub fn window(&self) -> Option<i32> {
+		self.window
+	}
+
 	/// Current buffer capacity in positions (diagnostics).
 	pub fn buffer_capacity(&self) -> i32 {
 		self.keys.as_ref().map_or(0, |k| k.dim(-2))

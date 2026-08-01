@@ -138,7 +138,7 @@ struct ChatSessionEnvelope {
 }
 
 #[derive(Completer, Hinter, Validator)]
-struct PromptHelper {
+pub(crate) struct PromptHelper {
 	colored: bool,
 }
 
@@ -158,7 +158,7 @@ impl Highlighter for PromptHelper {
 
 impl Helper for PromptHelper {}
 
-fn build_editor(colored: bool) -> anyhow::Result<Editor<PromptHelper, DefaultHistory>> {
+pub(crate) fn build_editor(colored: bool) -> anyhow::Result<Editor<PromptHelper, DefaultHistory>> {
 	let mut editor = Editor::with_history(chat_editor_config(), DefaultHistory::new())
 		.context("initialize line editor")?;
 	editor.set_helper(Some(PromptHelper { colored }));
@@ -199,20 +199,20 @@ fn chat_editor_config() -> ReadlineConfig {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum ChatInput {
+pub(crate) enum ChatInput {
 	SlashCommand(String),
 	Message(String),
 }
 
 impl ChatInput {
-	fn as_str(&self) -> &str {
+	pub(crate) fn as_str(&self) -> &str {
 		match self {
 			Self::SlashCommand(value) | Self::Message(value) => value,
 		}
 	}
 }
 
-fn classify_chat_input(input: String) -> Option<ChatInput> {
+pub(crate) fn classify_chat_input(input: String) -> Option<ChatInput> {
 	let trimmed = input.trim();
 	if trimmed.is_empty() {
 		return None;
@@ -419,6 +419,7 @@ fn chat_model_filters(config: &Config) -> anyhow::Result<Vec<TraitFilter>> {
 	let thinking_enabled = inference.thinking == ThinkingMode::On;
 	model_select::filters(model_select::InvocationRequirements {
 		chat: true,
+		translation: false,
 		system_prompt: true,
 		agent: true,
 		image: false,
@@ -974,7 +975,7 @@ async fn run_interactive(
 	Ok(())
 }
 
-fn load_prompt_history(
+pub(crate) fn load_prompt_history(
 	editor: &mut Editor<PromptHelper, DefaultHistory>,
 	history_path: &Path,
 	temp_dir: &Path,
@@ -1035,7 +1036,7 @@ fn load_prompt_history(
 		.context("parse prompt history")
 }
 
-fn save_prompt_history(
+pub(crate) fn save_prompt_history(
 	editor: &mut Editor<PromptHelper, DefaultHistory>,
 	history_path: &Path,
 ) -> anyhow::Result<()> {
@@ -1071,7 +1072,7 @@ fn save_prompt_history(
 		.with_context(|| format!("sync prompt history directory {}", parent.display()))
 }
 
-fn report_history_warning(
+pub(crate) fn report_history_warning(
 	reported: &mut bool,
 	error: &anyhow::Error,
 	palette: Palette,
@@ -1638,7 +1639,7 @@ fn chat_tool_label(name: &str) -> String {
 	first.to_uppercase().chain(chars).collect()
 }
 
-fn slash_parts(line: &str) -> (String, &str) {
+pub(crate) fn slash_parts(line: &str) -> (String, &str) {
 	let (command, argument) = line
 		.split_once(char::is_whitespace)
 		.map_or((line, ""), |(command, argument)| (command, argument.trim()));

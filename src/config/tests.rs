@@ -159,6 +159,25 @@ fn no_project_config_uses_global_only() {
 }
 
 #[test]
+fn translate_language_pair_parses_and_is_project_scopeable() {
+	let temp = tempfile::tempdir().expect("temporary directory");
+	let root = temp.path().join("project");
+	fs::create_dir_all(root.join(".git")).expect("git marker");
+	let home = EmelexHome::prepare(&temp.path().join("home")).expect("home");
+	fs::write(
+		home.config_file(),
+		"[translate]\nsource = \"en\"\ntarget = \"fr\"\n",
+	)
+	.expect("global config");
+	// The language pair is not authority-bearing: a project may override it.
+	fs::write(root.join(".emelex.toml"), "[translate]\ntarget = \"de\"\n").expect("project config");
+
+	let (config, _) = Config::load(&home, &root, true).expect("config loads");
+	assert_eq!(config.translate.source.as_deref(), Some("en"));
+	assert_eq!(config.translate.target.as_deref(), Some("de"));
+}
+
+#[test]
 fn project_config_rejects_model_and_seed_authority() {
 	let temp = tempfile::tempdir().expect("temporary directory");
 	let root = temp.path().join("project");

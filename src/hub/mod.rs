@@ -126,6 +126,13 @@ pub const REMOTE_FILTERS: &[RemoteFilterHelp] = &[
 		example: "task:chat",
 	},
 	RemoteFilterHelp {
+		filter: "task:translation",
+		evidence: "inferred",
+		meaning: "runtime-selected template renders structured translation messages \
+		 with per-message language pairs",
+		example: "task:translation",
+	},
+	RemoteFilterHelp {
 		filter: "interaction:system_prompt",
 		evidence: "inferred",
 		meaning: "runtime-selected template independently preserves system instructions",
@@ -2586,23 +2593,45 @@ fn enrich_remote_model(
 				})
 				.unwrap_or_default()
 		};
-		let (capabilities, _tool_format) =
-			crate::engine::tokenizer::resolve_chat_templates_capabilities(
-				&templates,
-				(special("bos_token"), special("eos_token")),
-			)
-			.map_err(|error| {
-				HubError::Incompatible(format!("chat template cannot be compiled safely: {error}"))
-			})?;
-		traits.tasks.insert(Task::Chat);
-		traits
-			.confidence
-			.insert("task:chat".to_string(), TraitConfidence::Inferred);
-		traits.evidence.push(TraitEvidence {
-			trait_key: "task:chat".to_string(),
-			source: EvidenceSource::Tokenizer,
-			detail: "exact-revision chat template completed a bounded baseline render".to_string(),
-		});
+		// A template that renders neither plain chat nor structured
+		// translation is a soft incompatibility (diagnostic), not a hard
+		// error: the all-false default makes every capability block below
+		// a no-op and the no-supported-template diagnostic fires.
+		let capabilities = match crate::engine::tokenizer::resolve_chat_templates_capabilities(
+			&templates,
+			(special("bos_token"), special("eos_token")),
+		) {
+			Ok((capabilities, _tool_format)) => capabilities,
+			Err(error) => {
+				diagnostics.push(format!("chat template cannot be compiled safely: {error}"));
+				crate::engine::tokenizer::ChatTemplateCapabilities::default()
+			}
+		};
+		if capabilities.translation {
+			traits.tasks.insert(Task::Translation);
+			traits
+				.confidence
+				.insert("task:translation".to_string(), TraitConfidence::Inferred);
+			traits.evidence.push(TraitEvidence {
+				trait_key: "task:translation".to_string(),
+				source: EvidenceSource::Tokenizer,
+				detail: "exact-revision chat template rendered a structured translation \
+				 message with a per-message language pair"
+					.to_string(),
+			});
+		}
+		if capabilities.chat {
+			traits.tasks.insert(Task::Chat);
+			traits
+				.confidence
+				.insert("task:chat".to_string(), TraitConfidence::Inferred);
+			traits.evidence.push(TraitEvidence {
+				trait_key: "task:chat".to_string(),
+				source: EvidenceSource::Tokenizer,
+				detail: "exact-revision chat template completed a bounded baseline render"
+					.to_string(),
+			});
+		}
 		if capabilities.system_prompt {
 			traits.extras.insert(
 				"interaction:system_prompt".to_string(),
@@ -2679,7 +2708,7 @@ fn enrich_remote_model(
 			});
 		}
 	}
-	if !traits.tasks.contains(&Task::Chat) {
+	if !traits.tasks.contains(&Task::Chat) && !traits.tasks.contains(&Task::Translation) {
 		diagnostics.push(
 			"no supported chat template in chat_template.jinja, chat_templates/default.jinja, \
 			 tokenizer_config.json, or processor_config.json"
@@ -5330,6 +5359,50 @@ mod tests {
 	}
 
 	#[test]
+	fn enrich_marks_translation_only_template_compatible_with_translation_task() {
+		// TranslateGemma shape: plain-string content raises; a single
+		// translation mapping renders.
+		let model = enriched_with_template(
+			r"
+{%- for message in messages -%}
+{%- if message['content'] is string -%}
+{{ raise_exception('translation mapping required') }}
+{%- else -%}
+{{ message['content'][0]['text'] }}
+{%- endif -%}
+{%- endfor -%}
+",
+		);
+		assert!(model.compatible, "{:?}", model.diagnostics);
+		assert!(model.traits.tasks.contains(&Task::Translation));
+		assert!(!model.traits.tasks.contains(&Task::Chat));
+		assert!(
+			model
+				.traits
+				.evidence
+				.iter()
+				.any(|entry| entry.trait_key == "task:translation")
+		);
+	}
+
+	#[test]
+	fn enrich_reports_diagnostic_for_template_rejecting_both_shapes() {
+		let mut model = model();
+		let mut broken = artifacts();
+		broken.chat_template =
+			Some("{% if messages %}{{ raise_exception('always') }}{% endif %}".to_string());
+		enrich_remote_model(&mut model, &wire(), &broken, &enrichment_files(), None)
+			.expect("soft diagnostic, not a hard error");
+		assert!(!model.compatible);
+		assert!(
+			model
+				.diagnostics
+				.iter()
+				.any(|entry| entry.contains("chat template cannot be compiled safely"))
+		);
+	}
+
+	#[test]
 	fn remote_file_deserialization_rejects_traversal() {
 		let json = r#"{"path":"../escape.safetensors","size":1,"expected_sha256":null}"#;
 		assert!(serde_json::from_str::<RemoteFile>(json).is_err());
@@ -5893,6 +5966,7 @@ mod tests {
 			"output:text",
 			"task:text_generation",
 			"task:chat",
+			"task:translation",
 			"interaction:system_prompt",
 			"interaction:tools",
 			"interaction:reasoning",

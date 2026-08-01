@@ -523,6 +523,7 @@ fn checkpoint_plan_from_directory(
 		&& [
 			"vision_tower.patch_embed.proj.weight",
 			"vision_tower.patch_embedder.input_proj.weight",
+			"vision_tower.vision_model.embeddings.patch_embedding.weight",
 			"vision_embedder.patch_dense.weight",
 		]
 		.iter()
