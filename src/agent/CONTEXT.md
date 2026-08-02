@@ -93,12 +93,16 @@ Invariants:
 20. A loaded `Client` reports exact-template system-role, tool,
     reasoning-history, and thinking-toggle capabilities. Authority resolution
     fails closed before execution when configured or resumed state requires a
-    capability the checkpoint did not prove. Thinking-on agents require both
-    reasoning dimensions because generated reasoning becomes later-round
-    history. Per-turn overrides are revalidated before the input checkpoint.
-    Explicit `Off`/`Auto` clears a session reasoning budget. With thinking not
-    enabled, reasoning emitted by a template lacking history preservation stays
-    in presentation output but is stripped from committed replay messages.
+    capability the checkpoint did not prove. Thinking-on agents require only a
+    proven thinking toggle; disproven reasoning-history preservation is not an
+    error. Instead, reasoning is stripped from every outgoing request message
+    (resumed history included) and from committed replay messages, so it never
+    reaches the model's request boundary; the stored transcript keeps its
+    recorded reasoning. An unknown capability defers with no stripping.
+    Per-turn overrides are revalidated before the input checkpoint.
+    Explicit `Off`/`Auto` clears a session reasoning budget. Reasoning emitted
+    by a template lacking history preservation stays in presentation output
+    but is stripped from committed replay messages.
 21. Every resolved tool has one immutable `ToolCancellationPolicy` recorded in
     `AgentAuthoritySnapshot`. `FinishOnceStarted` is the default and stops the
     remaining batch after checkpointing one terminal result. `Interruptible`

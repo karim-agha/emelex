@@ -41,8 +41,10 @@ capabilities without redefining model identity.
 Reasoning is not one invocation capability. Exact template probes record
 `interaction:reasoning_history` and `interaction:thinking_toggle` separately.
 The broad `interaction:reasoning` trait is their union for discovery only.
-Raw thinking-on generation requires toggle support; an agent or chat turn also
-requires history preservation so later rounds cannot silently lose reasoning.
+Thinking-on generation and chat require toggle support only; history
+preservation is recorded but never required for invocation, because the agent
+strips prior-turn reasoning from each model request when the template does
+not preserve it.
 
 Trait filters parse into typed predicates. They support boolean capabilities,
 minimum evidence confidence, MTP state, and numeric sizing/context bounds.

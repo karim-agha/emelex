@@ -1882,12 +1882,15 @@ async fn historical_disabled_tool_remains_declared_for_replay() {
 }
 
 #[tokio::test]
-async fn per_turn_thinking_is_rejected_before_checkpoint_when_reasoning_history_is_unsupported() {
+async fn per_turn_thinking_proceeds_and_strips_reasoning_when_history_is_unsupported() {
 	let directory = tempfile::tempdir().expect("tempdir");
 	let requests = Arc::new(Mutex::new(Vec::new()));
 	let checkpoints = Arc::new(AtomicUsize::new(0));
-	let model = Arc::new(RecordingModel {
+	let mut terminal = response("answer", Vec::new(), FinishReason::Stop);
+	terminal.reasoning = Some("fresh thought".to_string());
+	let model = Arc::new(RecordingRoundsModel {
 		requests: Arc::clone(&requests),
+		rounds: Mutex::new(vec![vec![GenerationEvent::Completed(terminal)]].into()),
 	});
 	let mut session_builder = builder(model, directory.path());
 	session_builder.native_capabilities = Some(NativeModelCapabilities {
@@ -1897,9 +1900,9 @@ async fn per_turn_thinking_is_rejected_before_checkpoint_when_reasoning_history_
 		thinking_toggle: Some(true),
 		default_thinking: Some(false),
 	});
-	let mut session = session_builder.build().expect("non-thinking session");
+	let mut session = session_builder.build().expect("thinking-capable session");
 
-	let error = session
+	let turn = session
 		.run_message_core(
 			Message::user("think"),
 			GenerationOptions {
@@ -1913,16 +1916,78 @@ async fn per_turn_thinking_is_rejected_before_checkpoint_when_reasoning_history_
 			},
 		)
 		.await
-		.expect_err("unsupported reasoning history");
+		.expect("thinking-on turn without reasoning-history support");
 
-	assert!(matches!(
-		error,
-		AgentError::Configuration(message)
-			if message.contains("does not preserve reasoning")
-	));
-	assert!(requests.lock().expect("requests").is_empty());
-	assert_eq!(checkpoints.load(Ordering::Relaxed), 0);
-	assert!(session.history().is_empty());
+	let recorded = requests.lock().expect("requests");
+	assert_eq!(recorded.len(), 1);
+	assert_eq!(
+		recorded[0].options.thinking,
+		Some(crate::config::ThinkingMode::On)
+	);
+	assert!(
+		recorded[0]
+			.messages
+			.iter()
+			.all(|message| message.reasoning.is_none())
+	);
+	drop(recorded);
+	assert!(checkpoints.load(Ordering::Relaxed) > 0);
+	assert_eq!(turn.response.reasoning.as_deref(), Some("fresh thought"));
+	assert_eq!(session.history().len(), 2);
+	assert!(
+		session
+			.history()
+			.iter()
+			.all(|message| message.reasoning.is_none())
+	);
+}
+
+#[tokio::test]
+async fn resumed_reasoning_history_degrades_to_stripped_replay_for_unpreserving_model() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let requests = Arc::new(Mutex::new(Vec::new()));
+	let model = Arc::new(RecordingModel {
+		requests: Arc::clone(&requests),
+	});
+	let mut recorded = Message::assistant("earlier answer");
+	recorded.reasoning = Some("recorded by a reasoning-capable model".to_string());
+	let mut session_builder = builder(model, directory.path())
+		.history(vec![Message::user("earlier"), recorded])
+		.generation_options(GenerationOptions {
+			thinking: Some(crate::config::ThinkingMode::On),
+			..GenerationOptions::default()
+		});
+	session_builder.native_capabilities = Some(NativeModelCapabilities {
+		system_prompt: Some(true),
+		tools: Some(true),
+		reasoning_history: Some(false),
+		thinking_toggle: Some(true),
+		default_thinking: Some(false),
+	});
+	let mut session = session_builder.build().expect("resumed session");
+
+	session
+		.run_turn("continue", &AgentCancellation::new(), |_| {})
+		.await
+		.expect("stripped replay turn");
+
+	let requests = requests.lock().expect("requests");
+	assert_eq!(requests.len(), 1);
+	assert!(
+		requests[0]
+			.messages
+			.iter()
+			.all(|message| message.reasoning.is_none())
+	);
+	drop(requests);
+	// The stored transcript keeps its recorded reasoning; only the request
+	// boundary degrades, so resuming later on a capable model loses nothing.
+	assert!(
+		session
+			.history()
+			.iter()
+			.any(|message| message.reasoning.is_some())
+	);
 }
 
 #[tokio::test]

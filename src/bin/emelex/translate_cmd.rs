@@ -81,7 +81,6 @@ pub(crate) async fn run(
 		agent: false,
 		image: false,
 		audio: false,
-		reasoning_history: false,
 		thinking_toggle: false,
 		mtp: inference.mtp && inference.speculative_tokens > 0,
 	})?;

@@ -1257,13 +1257,7 @@ impl AgentSessionBuilder {
 				"web_response_bytes must be in 1..={MAX_WEB_RESPONSE_BYTES}"
 			)));
 		}
-		validate_native_generation_policy(
-			self.native_capabilities,
-			self.generation_options,
-			self.history
-				.iter()
-				.any(|message| message.reasoning.is_some()),
-		)?;
+		validate_native_generation_policy(self.native_capabilities, self.generation_options)?;
 		if self
 			.native_capabilities
 			.is_some_and(|capabilities| capabilities.system_prompt == Some(false))
@@ -1779,13 +1773,7 @@ impl AgentSession {
 	{
 		validate_user_message(&input)?;
 		let effective_options = merge_generation_options(self.generation_options, options);
-		validate_native_generation_policy(
-			self.native_capabilities,
-			effective_options,
-			self.history
-				.iter()
-				.any(|message| message.reasoning.is_some()),
-		)?;
+		validate_native_generation_policy(self.native_capabilities, effective_options)?;
 		let turn_id = Uuid::now_v7();
 		persist
 			.checkpoint(AgentCheckpoint::PreflightInput {
@@ -1970,7 +1958,18 @@ impl AgentSession {
 		let mut messages = Vec::with_capacity(self.history.len() + turn_messages.len());
 		messages.extend(self.history.iter().cloned());
 		messages.extend(turn_messages.iter().cloned());
-		let messages = coalesce_adjacent_user_messages(messages);
+		let mut messages = coalesce_adjacent_user_messages(messages);
+		if self
+			.native_capabilities
+			.is_some_and(|capabilities| capabilities.reasoning_history == Some(false))
+		{
+			// The loaded template cannot replay reasoning across turns; degrade
+			// to stripped replay so resumed history recorded by a capable model
+			// never reaches this model's request boundary.
+			for message in &mut messages {
+				message.reasoning = None;
+			}
+		}
 		let request = GenerationRequest {
 			messages,
 			tools: self
@@ -2842,7 +2841,6 @@ const fn merge_generation_options(
 fn validate_native_generation_policy(
 	capabilities: Option<NativeModelCapabilities>,
 	options: GenerationOptions,
-	history_has_reasoning: bool,
 ) -> Result<(), AgentError> {
 	options
 		.validate_shape()
@@ -2864,13 +2862,6 @@ fn validate_native_generation_policy(
 	{
 		return Err(AgentError::Configuration(
 			"loaded model does not support an explicit thinking toggle".to_string(),
-		));
-	}
-	if (effective_thinking == Some(true) || history_has_reasoning)
-		&& capabilities.is_some_and(|capabilities| capabilities.reasoning_history == Some(false))
-	{
-		return Err(AgentError::Configuration(
-			"loaded model does not preserve reasoning across agent rounds".to_string(),
 		));
 	}
 	Ok(())

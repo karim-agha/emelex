@@ -48,12 +48,14 @@ validated tools, and keeps one complete ordered in-memory conversation.
 - Loaded `Client` capabilities are checked during authority resolution.
   Builders fail before execution when the exact checkpoint template cannot
   preserve a configured system prompt, tool declarations, or resumed tool
-  history. Resumed reasoning requires proven reasoning-history preservation.
-  Thinking-on agent sessions require both a proven thinking toggle and
-  reasoning-history preservation because later rounds replay model reasoning.
-  If a non-thinking template nevertheless emits reasoning and the checkpoint
-  cannot preserve it, events and `AgentTurn::response` retain the presentation
-  span while committed/replayed assistant messages omit it.
+  history. Thinking-on agent sessions require a proven thinking toggle only.
+  Reasoning-history preservation is never required: when the checkpoint proves
+  it absent, reasoning is stripped from every outgoing request message —
+  including resumed history recorded by a capable model — and from
+  committed/replayed assistant messages, while events and
+  `AgentTurn::response` retain the presentation span. An unknown
+  reasoning-history capability (alternate `AgentModel` implementations)
+  defers: nothing is rejected and nothing is stripped.
 - `AgentTool` and `ApprovalPolicy` are asynchronous library extension points.
   `ToolCancellationPolicy::FinishOnceStarted` is the conservative default:
   after `ToolStarted`, the harness waits for one terminal result and then stops

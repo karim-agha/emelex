@@ -81,10 +81,12 @@
   materializes unresolved auto as on before snapshotting; explicit off remains
   off. Resume rejects semantic overrides and uses its exact stored mode, so a
   historical v2 auto is not migrated or reinterpreted and retains prior
-  auto/off behavior. New on semantics require both
-  `interaction:thinking_toggle` and `interaction:reasoning_history`; stored auto
-  does not. Each new or resumed chat load requests the largest model-declared
-  context that fits the active Metal budget. Missing exact weights, sizing, or
+  auto/off behavior. New on semantics require `interaction:thinking_toggle`;
+  stored auto does not. `interaction:reasoning_history` is never an invocation
+  requirement; the agent strips prior-turn reasoning from each model request
+  for models whose templates do not preserve it. Each new or resumed chat load
+  requests the largest model-declared context that fits the active Metal
+  budget. Missing exact weights, sizing, or
   a declared maximum retains configured context. The attended header uses load
   policy provenance to label the effective result `machine-fit` or `configured
   fallback`, never inferring provenance from the token count. Per-request max
@@ -165,9 +167,10 @@
   Redirected and JSON invocations never prompt. A selected model may combine
   positive current static inspection evidence with runtime-only manifest
   evidence; a real capability mismatch remains an error.
-- Raw thinking-on selection requires `interaction:thinking_toggle`. Agent and
-  chat thinking-on selection require both that trait and
-  `interaction:reasoning_history`; historical stored chat auto does not. A
+- Thinking-on selection (raw, agent, and chat) requires only
+  `interaction:thinking_toggle`; historical stored chat auto does not.
+  `interaction:reasoning_history` is never required at selection time — a
+  model without it runs with prior-turn reasoning stripped by the agent. A
   generate-command override reaches model selection, load policy, and request
   policy as one resolved value.
 - `doctor` records every independent facet result before returning aggregate

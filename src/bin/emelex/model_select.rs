@@ -696,7 +696,6 @@ pub(crate) struct InvocationRequirements {
 	pub agent: bool,
 	pub image: bool,
 	pub audio: bool,
-	pub reasoning_history: bool,
 	pub thinking_toggle: bool,
 	pub mtp: bool,
 }
@@ -721,9 +720,6 @@ pub(crate) fn filters(requirements: InvocationRequirements) -> anyhow::Result<Ve
 	}
 	if requirements.audio {
 		names.push("input:audio");
-	}
-	if requirements.reasoning_history {
-		names.push("interaction:reasoning_history");
 	}
 	if requirements.thinking_toggle {
 		names.push("interaction:thinking_toggle");

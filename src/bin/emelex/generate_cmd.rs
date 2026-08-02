@@ -76,7 +76,6 @@ pub(crate) async fn run(
 		agent: args.agent,
 		image: has_image,
 		audio: has_audio,
-		reasoning_history: args.agent && thinking.effective == ThinkingMode::On,
 		thinking_toggle: thinking.effective == ThinkingMode::On,
 		mtp: inference.mtp && inference.speculative_tokens > 0,
 	})?;

@@ -424,7 +424,6 @@ fn chat_model_filters(config: &Config) -> anyhow::Result<Vec<TraitFilter>> {
 		agent: true,
 		image: false,
 		audio: false,
-		reasoning_history: thinking_enabled,
 		thinking_toggle: thinking_enabled,
 		mtp: inference.mtp && inference.speculative_tokens > 0,
 	})
@@ -2199,8 +2198,11 @@ mod tests {
 				.any(|filter| filter == "interaction:thinking_toggle")
 		);
 		assert!(!stored.iter().any(|filter| filter == "acceleration:mtp"));
+		// Thinking-on requires only the toggle trait; reasoning_history is never
+		// an invocation requirement (the agent strips prior-turn reasoning for
+		// models whose templates do not preserve it).
 		assert!(
-			current
+			!current
 				.iter()
 				.any(|filter| filter == "interaction:reasoning_history")
 		);

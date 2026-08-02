@@ -167,17 +167,19 @@ bounded result page at a time while the user follows opaque Hub cursors, offers
 the next page explicitly, and can continue after a downloaded candidate fails
 certification.
 
-Model selection uses invocation-specific capabilities. Raw generation with
-thinking enabled requires `interaction:thinking_toggle`; agent generation and
-chat additionally require `interaction:reasoning_history`, because later
-rounds must preserve prior reasoning. One-shot `--thinking` overrides are
+Model selection uses invocation-specific capabilities. Generation and chat
+with thinking enabled require `interaction:thinking_toggle`.
+`interaction:reasoning_history` is never an invocation requirement: a model
+whose template does not preserve prior reasoning still runs in thinking mode;
+the agent strips prior-turn reasoning from each model request instead.
+One-shot `--thinking` overrides are
 resolved once and passed consistently to selection, model loading, and the
 request. A new chat materializes an unresolved `auto` default as `on` before
 writing immutable Session semantics, so reasoning is shown by default;
 explicit `off` remains off. A resumed Session keeps its exact stored mode:
 historical `auto` is neither migrated nor reinterpreted and retains its prior
-auto/off behavior. New default/on chat selection requires both
-`interaction:thinking_toggle` and `interaction:reasoning_history`, while stored
+auto/off behavior. New default/on chat selection requires
+`interaction:thinking_toggle`, while stored
 historical auto does not. For a new chat without `--model` or a configured
 default, selection groups healthy snapshots by stable model reference and keeps
 the newest from each group. One installed reference is automatic; multiple
