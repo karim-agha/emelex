@@ -2230,7 +2230,36 @@ pub(crate) fn revalidate_installed_snapshot(
 		));
 	}
 	let runtime = runtime_directory(&path, &stored)?;
-	verify_installed_files(&path, &runtime, &stored)
+	if verify_installed_files(&path, &runtime, &stored)? == InstalledVerification::Rehashed {
+		refresh_verification_stamp(&runtime, &stored)?;
+	}
+	Ok(())
+}
+
+/// Rewrite the verification stamp of a snapshot whose contents were just
+/// re-hashed against the manifest, recording the current file metadata.
+///
+/// The caller must hold [`crate::home::SnapshotMutationLock`]: the snapshot
+/// directory is briefly made writable while the stamp is replaced.
+fn refresh_verification_stamp(root: &Path, manifest: &ModelManifest) -> Result<(), ModelsError> {
+	let permissions = DirectoryRenamePermissions::prepare(root)?;
+	let replaced = (|| {
+		let target = root.join(VERIFIED_STAMP_NAME);
+		match fs::remove_file(&target) {
+			Ok(()) => {}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(source) => {
+				return Err(ModelsError::Io {
+					path: target,
+					source,
+				});
+			}
+		}
+		write_verification_stamp(root, manifest)?;
+		set_mode(&root.join(VERIFIED_STAMP_NAME), 0o400)
+	})();
+	let restored = permissions.map_or_else(|| Ok(()), DirectoryRenamePermissions::restore);
+	replaced.and(restored)
 }
 
 #[cfg(test)]
@@ -3022,12 +3051,41 @@ struct StampedFile {
 	path: String,
 	size: u64,
 	sha256: String,
-	device: u64,
+	/// Accepted from stamps written by earlier releases but never recorded or
+	/// compared: APFS assigns volume device IDs at mount time, so `st_dev`
+	/// changes across reboots without any file mutation.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	device: Option<u64>,
 	inode: u64,
 	mtime_seconds: i64,
 	mtime_nanoseconds: i64,
 	ctime_seconds: i64,
 	ctime_nanoseconds: i64,
+}
+
+/// Outcome of comparing a snapshot's verification stamp against the live
+/// filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampCheck {
+	/// The stamp is bound to the manifest and every runtime file's metadata
+	/// matches the stamped values.
+	Valid,
+	/// The stamp is bound to the manifest and agrees with its sizes and
+	/// digests, but at least one runtime file's filesystem metadata changed;
+	/// contents must be re-hashed before the snapshot is trusted.
+	MetadataDrift,
+	/// The stamp is missing, unreadable, or disagrees with the manifest.
+	Invalid,
+}
+
+/// How an installed snapshot's files were verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstalledVerification {
+	/// The verification stamp matched; contents were not re-hashed.
+	Stamped,
+	/// Metadata drift forced a full content re-hash, which passed. A caller
+	/// holding the snapshot-mutation lock should refresh the stamp.
+	Rehashed,
 }
 
 fn write_verification_stamp(root: &Path, manifest: &ModelManifest) -> Result<(), ModelsError> {
@@ -3064,7 +3122,7 @@ fn write_verification_stamp(root: &Path, manifest: &ModelManifest) -> Result<(),
 			path: expected.path().to_string(),
 			size,
 			sha256,
-			device: metadata.dev(),
+			device: None,
 			inode: metadata.ino(),
 			mtime_seconds: metadata.mtime(),
 			mtime_nanoseconds: metadata.mtime_nsec(),
@@ -3161,9 +3219,13 @@ fn verify_file_inventory(root: &Path, files: &[ModelFile]) -> Result<(), ModelsE
 
 fn verify_files(root: &Path, files: &[ModelFile]) -> Result<(), ModelsError> {
 	verify_file_inventory(root, files)?;
-	if verification_stamp_matches(root, files)? {
+	if verification_stamp_matches(root, files)? == StampCheck::Valid {
 		return Ok(());
 	}
+	hash_runtime_files(root, files)
+}
+
+fn hash_runtime_files(root: &Path, files: &[ModelFile]) -> Result<(), ModelsError> {
 	for expected in files {
 		let path = root.join(expected.path());
 		let mut file = open_contained(root, &path)?;
@@ -3329,20 +3391,25 @@ fn verify_installed_files(
 	install_directory: &Path,
 	runtime_directory: &Path,
 	manifest: &ModelManifest,
-) -> Result<(), ModelsError> {
+) -> Result<InstalledVerification, ModelsError> {
 	if matches!(manifest.source(), ModelSource::LocalSymlink { .. }) {
-		return verify_linked_files(install_directory, runtime_directory, manifest);
+		verify_linked_files(install_directory, runtime_directory, manifest)?;
+		return Ok(InstalledVerification::Stamped);
 	}
 	if install_directory != runtime_directory {
 		return Err(ModelsError::UnsafeInstall(runtime_directory.to_path_buf()));
 	}
 	verify_file_inventory(runtime_directory, manifest.files())?;
-	if !verification_stamp_matches(runtime_directory, manifest.files())? {
-		return Err(ModelsError::InvalidVerificationStamp(
+	match verification_stamp_matches(runtime_directory, manifest.files())? {
+		StampCheck::Valid => Ok(InstalledVerification::Stamped),
+		StampCheck::MetadataDrift => {
+			hash_runtime_files(runtime_directory, manifest.files())?;
+			Ok(InstalledVerification::Rehashed)
+		}
+		StampCheck::Invalid => Err(ModelsError::InvalidVerificationStamp(
 			manifest.snapshot_id().clone(),
-		));
+		)),
 	}
-	Ok(())
 }
 
 fn verify_runtime_files(
@@ -3356,7 +3423,7 @@ fn verify_runtime_files(
 	} else if force_hash {
 		verify_files(runtime_directory, manifest.files())
 	} else {
-		verify_installed_files(install_directory, runtime_directory, manifest)
+		verify_installed_files(install_directory, runtime_directory, manifest).map(drop)
 	}
 }
 
@@ -3368,14 +3435,14 @@ async fn verify_files_controlled(
 	check_download_cancellation(cancellation)?;
 	let inventory_root = root.to_path_buf();
 	let inventory_files = files.to_vec();
-	let stamp_matches = tokio::task::spawn_blocking(move || {
+	let stamp_check = tokio::task::spawn_blocking(move || {
 		verify_file_inventory(&inventory_root, &inventory_files)?;
 		verification_stamp_matches(&inventory_root, &inventory_files)
 	})
 	.await
 	.map_err(blocking_model_task_error)??;
 	check_download_cancellation(cancellation)?;
-	if stamp_matches {
+	if stamp_check == StampCheck::Valid {
 		return Ok(());
 	}
 	for expected in files {
@@ -3444,55 +3511,51 @@ fn blocking_model_task_error(error: tokio::task::JoinError) -> ModelsError {
 	ModelsError::Configuration(format!("blocking model task failed: {error}"))
 }
 
-fn verification_stamp_matches(root: &Path, files: &[ModelFile]) -> Result<bool, ModelsError> {
+fn verification_stamp_matches(root: &Path, files: &[ModelFile]) -> Result<StampCheck, ModelsError> {
 	let target = root.join(VERIFIED_STAMP_NAME);
-	let bytes = match read_bounded_regular(&target, MAX_VERIFICATION_STAMP_BYTES) {
-		Ok(bytes) => bytes,
-		Err(ModelsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-			return Ok(false);
-		}
-		Err(_) => return Ok(false),
+	let Ok(bytes) = read_bounded_regular(&target, MAX_VERIFICATION_STAMP_BYTES) else {
+		return Ok(StampCheck::Invalid);
 	};
 	let Ok(stamp) = serde_json::from_slice::<VerificationStamp>(&bytes) else {
-		return Ok(false);
+		return Ok(StampCheck::Invalid);
 	};
 	if stamp.schema_version != 1 || stamp.files.len() != files.len() {
-		return Ok(false);
+		return Ok(StampCheck::Invalid);
 	}
 	let manifest_bytes = read_bounded_regular(&root.join(MANIFEST_NAME), MAX_MANIFEST_BYTES)?;
 	if stamp.manifest_sha256 != hex::encode(sha2::Sha256::digest(&manifest_bytes)) {
-		return Ok(false);
+		return Ok(StampCheck::Invalid);
 	}
 	let expected = files
 		.iter()
 		.map(|file| (file.path(), file))
 		.collect::<std::collections::BTreeMap<_, _>>();
+	let mut check = StampCheck::Valid;
 	for stamped in stamp.files {
 		let Some(file) = expected.get(stamped.path.as_str()) else {
-			return Ok(false);
+			return Ok(StampCheck::Invalid);
 		};
 		if stamped.size != file.size() || stamped.sha256 != file.sha256() {
-			return Ok(false);
+			return Ok(StampCheck::Invalid);
 		}
 		let path = root.join(&stamped.path);
 		let Ok(opened) = open_regular(&path) else {
-			return Ok(false);
+			return Ok(StampCheck::Invalid);
 		};
 		let Ok(metadata) = opened.metadata() else {
-			return Ok(false);
+			return Ok(StampCheck::Invalid);
 		};
 		if metadata.len() != stamped.size
-			|| metadata.dev() != stamped.device
 			|| metadata.ino() != stamped.inode
 			|| metadata.mtime() != stamped.mtime_seconds
 			|| metadata.mtime_nsec() != stamped.mtime_nanoseconds
 			|| metadata.ctime() != stamped.ctime_seconds
 			|| metadata.ctime_nsec() != stamped.ctime_nanoseconds
 		{
-			return Ok(false);
+			check = StampCheck::MetadataDrift;
 		}
 	}
-	Ok(true)
+	Ok(check)
 }
 
 fn read_bounded_regular(path: &Path, limit: u64) -> Result<Vec<u8>, ModelsError> {

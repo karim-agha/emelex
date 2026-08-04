@@ -1148,6 +1148,43 @@ async fn max_round_limit_rolls_back_complete_tool_batch() {
 }
 
 #[tokio::test]
+async fn unlimited_model_rounds_run_past_the_bounded_ceiling() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let tool_rounds = MAX_AGENT_MODEL_ROUNDS + 5;
+	let mut rounds = Vec::with_capacity(tool_rounds + 1);
+	for index in 0..tool_rounds {
+		let raw_call = echo_call(&format!("call_{index}"), &serde_json::json!("hello"));
+		rounds.push(vec![
+			GenerationEvent::ToolCall(raw_call.clone()),
+			GenerationEvent::Completed(response("", vec![raw_call], FinishReason::ToolCalls)),
+		]);
+	}
+	rounds.push(vec![GenerationEvent::Completed(response(
+		"done",
+		Vec::new(),
+		FinishReason::Stop,
+	))]);
+	let model = Arc::new(FakeModel::new(rounds));
+	let invocations = Arc::new(AtomicUsize::new(0));
+	let mut session = builder(model, directory.path())
+		.tool(Arc::new(EchoTool {
+			invocations: Arc::clone(&invocations),
+			approval: false,
+		}))
+		.unlimited_model_rounds()
+		.build()
+		.expect("session");
+
+	let turn = session
+		.run_turn("go", &AgentCancellation::new(), |_| {})
+		.await
+		.expect("unbounded turn");
+
+	assert_eq!(turn.model_rounds, tool_rounds + 1);
+	assert_eq!(invocations.load(Ordering::Relaxed), tool_rounds);
+}
+
+#[tokio::test]
 async fn event_sink_failure_before_tool_invocation_rolls_back() {
 	let directory = tempfile::tempdir().expect("tempdir");
 	let raw_call = echo_call("call_0", &serde_json::json!("hello"));
@@ -1451,8 +1488,28 @@ fn authority_snapshot_matches_built_session_and_preserves_builder() {
 			.enabled_capabilities
 			.contains(&AgentBuiltinCapability::Datetime)
 	);
-	assert_eq!(snapshot.max_model_rounds, 7);
+	assert_eq!(snapshot.max_model_rounds, Some(7));
 	assert_eq!(snapshot.max_tool_output_bytes, 32 * 1024);
+}
+
+#[test]
+fn authority_snapshot_round_ceiling_is_optional_and_legacy_compatible() {
+	let directory = tempfile::tempdir().expect("tempdir");
+	let model = Arc::new(FakeModel::new(Vec::new()));
+	let snapshot = AgentSessionBuilder::from_model(model, directory.path())
+		.unlimited_model_rounds()
+		.authority_snapshot()
+		.expect("authority snapshot");
+	assert_eq!(snapshot.max_model_rounds, None);
+	let mut encoded = serde_json::to_value(&snapshot).expect("serialize snapshot");
+	assert!(
+		encoded.get("max_model_rounds").is_none(),
+		"unbounded sessions must omit the ceiling field"
+	);
+	encoded["max_model_rounds"] = serde_json::json!(7);
+	let decoded: AgentAuthoritySnapshot =
+		serde_json::from_value(encoded).expect("legacy numeric ceiling");
+	assert_eq!(decoded.max_model_rounds, Some(7));
 }
 
 #[test]

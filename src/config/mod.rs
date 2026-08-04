@@ -129,7 +129,8 @@ pub enum ThinkingMode {
 pub struct AgentConfig {
 	/// Optional generic system instruction appended after immutable policy.
 	pub system_prompt: Option<String>,
-	/// Maximum assistant/tool loop turns.
+	/// Maximum assistant/tool loop turns for non-interactive runs such as
+	/// `emelex generate`. Interactive `emelex chat` runs without a ceiling.
 	pub max_turns: usize,
 	/// Enable HTTP(S) tools.
 	pub web: bool,

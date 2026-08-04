@@ -484,7 +484,36 @@ fn verification_stamp_matches_post_chmod_file_metadata() {
 	write_verification_stamp(&root, &manifest).expect("verification stamp");
 	set_mode(&root.join(VERIFIED_STAMP_NAME), 0o400).expect("read-only stamp");
 	set_mode(&root, 0o500).expect("read-only root");
-	assert!(verification_stamp_matches(&root, manifest.files()).expect("stamp check"));
+	assert_eq!(
+		verification_stamp_matches(&root, manifest.files()).expect("stamp check"),
+		StampCheck::Valid
+	);
+	make_writable(&root).expect("restore fixture permissions");
+}
+
+#[test]
+fn verification_stamp_ignores_recorded_device_identity() {
+	let directory = tempfile::tempdir().expect("temporary directory");
+	let root = directory.path().join("snapshot");
+	fs::create_dir(&root).expect("snapshot directory");
+	let manifest = manifest(runtime_files(&root));
+	write_manifest(&root, &manifest).expect("manifest");
+	make_read_only_contents(&root).expect("read-only runtime files");
+	write_verification_stamp(&root, &manifest).expect("verification stamp");
+	let stamp_path = root.join(VERIFIED_STAMP_NAME);
+	let mut stamp: serde_json::Value =
+		serde_json::from_slice(&fs::read(&stamp_path).expect("read stamp")).expect("decode stamp");
+	for file in stamp["files"].as_array_mut().expect("stamped files") {
+		file["device"] = serde_json::Value::from(u64::MAX);
+	}
+	fs::write(&stamp_path, serde_json::to_vec(&stamp).expect("encode stamp"))
+		.expect("record legacy device identity");
+	set_mode(&stamp_path, 0o400).expect("read-only stamp");
+	set_mode(&root, 0o500).expect("read-only root");
+	assert_eq!(
+		verification_stamp_matches(&root, manifest.files()).expect("stamp check"),
+		StampCheck::Valid
+	);
 	make_writable(&root).expect("restore fixture permissions");
 }
 
@@ -502,8 +531,46 @@ fn verification_stamp_rejects_runtime_mutation() {
 	let weights = root.join("model.safetensors");
 	set_mode(&weights, 0o600).expect("make fixture mutable");
 	fs::write(&weights, b"changed").expect("mutate fixture");
-	assert!(!verification_stamp_matches(&root, manifest.files()).expect("stamp check"));
+	assert_eq!(
+		verification_stamp_matches(&root, manifest.files()).expect("stamp check"),
+		StampCheck::MetadataDrift
+	);
+	assert!(matches!(
+		verify_installed_files(&root, &root, &manifest).expect_err("mutated contents fail hashing"),
+		ModelsError::CorruptFile { .. }
+	));
 	make_writable(&root).expect("restore fixture permissions");
+}
+
+#[test]
+fn metadata_drift_rehashes_and_revalidation_refreshes_stamp() {
+	let (_directory, manager) = manager(Config::default());
+	let installed = install_test_snapshot(&manager.home).expect("test snapshot");
+	let weights = installed.path().join("model.safetensors");
+	let contents = fs::read(&weights).expect("read weights");
+	set_mode(&weights, 0o600).expect("make weights mutable");
+	fs::write(&weights, &contents).expect("rewrite identical weights");
+	set_mode(&weights, 0o400).expect("restore weights mode");
+	assert_eq!(
+		verification_stamp_matches(installed.path(), installed.manifest().files())
+			.expect("stamp check"),
+		StampCheck::MetadataDrift
+	);
+
+	let reloaded = manager
+		.load_installed_at(installed.path())
+		.expect("identical contents verify through re-hash");
+	assert_eq!(reloaded.snapshot_id(), installed.snapshot_id());
+
+	let _mutation_lock = manager
+		.snapshot_mutation_lock()
+		.expect("snapshot mutation lock");
+	revalidate_installed_snapshot(&manager.home, &installed).expect("revalidate and refresh");
+	assert_eq!(
+		verification_stamp_matches(installed.path(), installed.manifest().files())
+			.expect("stamp check after refresh"),
+		StampCheck::Valid
+	);
 }
 
 #[test]

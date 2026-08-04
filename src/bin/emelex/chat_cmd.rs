@@ -16,8 +16,8 @@ use anyhow::{Context as _, bail};
 use emelex::{
 	Emelex,
 	agent::{
-		AgentCancellation, AgentSession, AgentSessionBuilder, ApprovalContext, ApprovalDecision,
-		ApprovalPolicy,
+		AgentAuthoritySnapshot, AgentCancellation, AgentSession, AgentSessionBuilder,
+		ApprovalContext, ApprovalDecision, ApprovalPolicy,
 	},
 	config::{Config, ThinkingMode},
 	generation::{Content, GenerationOptions, Message, Role},
@@ -361,10 +361,15 @@ async fn prepare_chat(
 		report_model_loading(&installed, stderr_palette)?;
 	}
 	let (client, context_selection) = load_client(emelex, &installed, &semantics.config)?;
+	let model_rounds = match selected_session.as_ref() {
+		Some(session) => stored_model_rounds(&store, session)?,
+		None => None,
+	};
 	let builder = agent_builder(
 		emelex,
 		client.clone(),
 		&semantics,
+		model_rounds,
 		args.approve_all,
 		interactive,
 		stderr_palette,
@@ -405,6 +410,22 @@ async fn prepare_chat(
 		durable,
 		resumed: !created_session,
 	})
+}
+
+/// Model-round ceiling recorded in a resumed Session's immutable authority.
+///
+/// New chats run without a ceiling, but resumed Sessions must rebuild their
+/// stored authority exactly, including any ceiling recorded at creation.
+fn stored_model_rounds(store: &MemoryStore, session: &Session) -> anyhow::Result<Option<usize>> {
+	let Some(snapshot) = store
+		.session_snapshot(session.id)
+		.with_context(|| format!("load stored snapshot for session {}", session.id))?
+	else {
+		return Ok(None);
+	};
+	let authority: AgentAuthoritySnapshot = serde_json::from_value(snapshot.authority().clone())
+		.with_context(|| format!("decode stored agent authority for session {}", session.id))?;
+	Ok(authority.max_model_rounds)
 }
 
 fn report_model_loading(installed: &InstalledModel, palette: Palette) -> anyhow::Result<()> {
@@ -693,6 +714,7 @@ fn agent_builder(
 	emelex: &Emelex,
 	client: emelex::Client,
 	semantics: &ChatSemantics,
+	model_rounds: Option<usize>,
 	approve_all: bool,
 	terminal: bool,
 	stderr_palette: Palette,
@@ -717,8 +739,11 @@ fn agent_builder(
 		.shell_output_bytes(agent.shell_output_bytes)
 		.include_web_fetch(semantics.web_fetch_enabled)
 		.web_response_bytes(agent.web_response_bytes)
-		.include_datetime(true)
-		.max_model_rounds(agent.max_turns);
+		.include_datetime(true);
+	builder = match model_rounds {
+		Some(rounds) => builder.max_model_rounds(rounds),
+		None => builder.unlimited_model_rounds(),
+	};
 	if let Some(prompt) = &semantics.system_prompt {
 		builder = builder.system_prompt(prompt.clone());
 	}

@@ -36,7 +36,8 @@ use crate::{
 };
 
 const DEFAULT_MAX_MODEL_ROUNDS: usize = 16;
-/// Maximum model/tool cycles in one agent turn.
+/// Maximum bounded model/tool cycles in one agent turn. Sessions built with
+/// [`AgentSessionBuilder::unlimited_model_rounds`] have no ceiling.
 pub const MAX_AGENT_MODEL_ROUNDS: usize = 20;
 const MAX_TOOLS: usize = 256;
 pub(crate) const MAX_TOOL_CALLS_PER_ROUND: usize = 16;
@@ -843,8 +844,9 @@ pub struct AgentAuthoritySnapshot {
 	pub shell_output_bytes: usize,
 	/// Authoritative decoded HTTP response ceiling.
 	pub web_response_bytes: usize,
-	/// Authoritative model-round ceiling per turn.
-	pub max_model_rounds: usize,
+	/// Authoritative model-round ceiling per turn; absent when unbounded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub max_model_rounds: Option<usize>,
 	/// Authoritative tool-result ceiling before model history.
 	pub max_tool_output_bytes: usize,
 }
@@ -927,7 +929,7 @@ pub struct AgentSessionBuilder {
 	model_identity: Option<ModelSnapshotId>,
 	model_identity_authority: ModelIdentityAuthority,
 	generation_options: GenerationOptions,
-	max_model_rounds: usize,
+	max_model_rounds: Option<usize>,
 	max_tool_output_bytes: usize,
 }
 
@@ -970,7 +972,7 @@ impl AgentSessionBuilder {
 			model_identity: None,
 			model_identity_authority: ModelIdentityAuthority::AlternateModel,
 			generation_options: GenerationOptions::default(),
-			max_model_rounds: DEFAULT_MAX_MODEL_ROUNDS,
+			max_model_rounds: Some(DEFAULT_MAX_MODEL_ROUNDS),
 			max_tool_output_bytes: MAX_TOOL_OUTPUT_BYTES,
 		}
 	}
@@ -1130,7 +1132,17 @@ impl AgentSessionBuilder {
 	/// Bound model rounds consumed by one user turn.
 	#[must_use]
 	pub const fn max_model_rounds(mut self, rounds: usize) -> Self {
-		self.max_model_rounds = rounds;
+		self.max_model_rounds = Some(rounds);
+		self
+	}
+
+	/// Let one user turn consume model rounds without a ceiling.
+	///
+	/// Suits interactive front-ends where a human supervises the loop and can
+	/// cancel it; unattended callers should keep a bound.
+	#[must_use]
+	pub const fn unlimited_model_rounds(mut self) -> Self {
+		self.max_model_rounds = None;
 		self
 	}
 
@@ -1232,7 +1244,9 @@ impl AgentSessionBuilder {
 				"model_identity cannot override the loaded Client snapshot identity".to_string(),
 			));
 		}
-		if !(1..=MAX_AGENT_MODEL_ROUNDS).contains(&self.max_model_rounds) {
+		if let Some(rounds) = self.max_model_rounds
+			&& !(1..=MAX_AGENT_MODEL_ROUNDS).contains(&rounds)
+		{
 			return Err(AgentError::Configuration(format!(
 				"max_model_rounds must be in 1..={MAX_AGENT_MODEL_ROUNDS}"
 			)));
@@ -1803,7 +1817,9 @@ impl AgentSession {
 			}};
 		}
 
-		for round in 1..=self.authority.max_model_rounds {
+		let mut round = 0_usize;
+		loop {
+			round += 1;
 			emit.emit(AgentEvent::ModelStarted { turn_id, round })?;
 			let request = match self.generation_request(&pending_messages, effective_options) {
 				Ok(request) => request,
@@ -1885,10 +1901,8 @@ impl AgentSession {
 					"response carried tool calls without tool_calls finish reason".to_string(),
 				));
 			}
-			if round == self.authority.max_model_rounds {
-				fail_turn!(AgentError::MaxModelRounds {
-					limit: self.authority.max_model_rounds,
-				});
+			if Some(round) == self.authority.max_model_rounds {
+				fail_turn!(AgentError::MaxModelRounds { limit: round });
 			}
 			let mut planned_messages = pending_messages.clone();
 			planned_messages.push(assistant.clone());
@@ -1939,9 +1953,6 @@ impl AgentSession {
 				fail_turn!(error);
 			}
 		}
-		fail_turn!(AgentError::MaxModelRounds {
-			limit: self.authority.max_model_rounds,
-		})
 	}
 
 	fn generation_request(
