@@ -29,16 +29,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.next()
 		.expect("usage: translate <mlx-model-dir> [source-lang] [target-lang] [text]");
 	let source = args.next().unwrap_or_else(|| "en".to_string());
-	let target = args.next().unwrap_or_else(|| "de".to_string());
+	let target = args.next().unwrap_or_else(|| "pl".to_string());
+
 	let text = args
 		.next()
 		.unwrap_or_else(|| "The weather is beautiful today.".to_string());
 
 	let client = Client::from_path(model_dir)?;
+
 	assert!(
 		client.supports_translation(),
 		"this checkpoint's chat template does not accept structured translation \
-		 requests; install one with `emelex hub search --require task:translation`"
+ 			 requests; install one with `emelex hub search --require task:translation`"
 	);
 
 	// Translation templates usually embed their supported language table;
